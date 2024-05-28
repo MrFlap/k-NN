@@ -156,7 +156,21 @@ void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JN
 
     auto idVector = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
     faiss::IndexIDMap idMap = faiss::IndexIDMap(indexWriter.get());
-    idMap.add_with_ids(numVectors, inputVectors->data(), idVector.data());
+    //idMap.add_with_ids(numVectors, inputVectors->data(), idVector.data());
+
+    static size_t NUM_DIVISIONS = 10;
+
+    for(size_t i = 0; i < NUM_DIVISIONS; i++) {
+        size_t division_num_vecs = numVectors / NUM_DIVISIONS + (i < (numVectors % NUM_DIVISIONS));
+        size_t division_size = division_num_vecs * dim;
+        size_t start_index_input = inputVectors->size() - division_size;
+        size_t start_index_id = idVector.size() - division_num_vecs;
+        idMap.add_with_ids(division_num_vecs, &inputVectors->data()[start_index_input], &idVector.data()[start_index_id]);
+        inputVectors->resize(start_index_input);
+        idVector.resize(start_index_id);
+        inputVectors->shrink_to_fit();
+        idVector.shrink_to_fit();
+    }
 
     // Write the index to disk
     std::string indexPathCpp(jniUtil->ConvertJavaStringToCppString(env, indexPathJ));
@@ -164,7 +178,7 @@ void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JN
     // Releasing the vectorsAddressJ memory as that is not required once we have created the index.
     // This is not the ideal approach, please refer this gh issue for long term solution:
     // https://github.com/opensearch-project/k-NN/issues/1600
-    delete inputVectors;
+    //delete inputVectors;
 }
 
 void knn_jni::faiss_wrapper::CreateIndexFromTemplate(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ,
