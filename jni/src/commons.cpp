@@ -19,16 +19,33 @@
 
 jlong knn_jni::commons::storeVectorData(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong memoryAddressJ,
                                         jobjectArray dataJ, jlong initialCapacityJ) {
-    std::vector<float> *vect;
-    if ((long) memoryAddressJ == 0) {
-        vect = new std::vector<float>();
-        vect->reserve((long)initialCapacityJ);
-    } else {
-        vect = reinterpret_cast<std::vector<float>*>(memoryAddressJ);
-    }
     int dim = jniUtil->GetInnerDimensionOf2dJavaFloatArray(env, dataJ);
-    jniUtil->Convert2dJavaObjectArrayAndStoreToFloatVector(env, dataJ, dim, vect);
-
+    int numVectors = env->GetArrayLength(dataJ);
+    batch_list *vect;
+    size_t num_batches = 1;
+    if ((long) memoryAddressJ == 0) {
+        vect = new batch_list();
+        //num_batches = (size_t)sqrt((double)dim * numVectors * sizeof(float) / sizeof(std::vector<float>));
+        batch_list * runner = vect;
+        for(int i = 1; i < num_batches; i++) {
+            runner->next = new batch_list();
+            runner = runner->next;
+        }
+    } else {
+        vect = reinterpret_cast<batch_list*>(memoryAddressJ);
+        batch_list * runner = vect;
+        size_t found = 0;
+        while(runner != NULL) {
+            num_batches++;
+            found += runner->batch.size() / (size_t)dim;
+            if(found == numVectors) {
+                break;
+            }
+            runner = runner->next;
+        }
+    }
+    jniUtil->Convert2dJavaObjectArrayAndStoreToBatches(env, dataJ, dim, vect, num_batches);
+    printf("num_batches: %lu\n", num_batches);
     return (jlong) vect;
 }
 

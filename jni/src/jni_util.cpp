@@ -261,6 +261,47 @@ void knn_jni::JNIUtil::Convert2dJavaObjectArrayAndStoreToFloatVector(JNIEnv *env
     env->DeleteLocalRef(array2dJ);
 }
 
+void knn_jni::JNIUtil::Convert2dJavaObjectArrayAndStoreToBatches(JNIEnv *env, jobjectArray array2dJ,
+                                                                int dim,
+                                                                batch_list *vect,
+                                                                size_t num_batches) {
+
+    if (array2dJ == nullptr) {
+        throw std::runtime_error("Array cannot be null");
+    }
+
+    int numVectors = env->GetArrayLength(array2dJ);
+    this->HasExceptionInStack(env);
+
+    int total = 0;
+    batch_list * runner = vect;
+    for(int k = 0; k < num_batches; ++k) {
+        int batchSize = numVectors / num_batches + (k < (numVectors % num_batches));
+        for (int i = 0; i < batchSize; ++i) {
+            auto vectorArray = (jfloatArray)env->GetObjectArrayElement(array2dJ, i + total);
+            this->HasExceptionInStack(env, "Unable to get object array element");
+
+            if (dim != env->GetArrayLength(vectorArray)) {
+                throw std::runtime_error("Dimension of vectors is inconsistent");
+            }
+
+            float* vector = env->GetFloatArrayElements(vectorArray, nullptr);
+            if (vector == nullptr) {
+                this->HasExceptionInStack(env);
+                throw std::runtime_error("Unable to get float array elements");
+            }
+
+            for(int j = 0; j < dim; ++j) {
+                vect->batch.push_back(vector[j]);
+            }
+            env->ReleaseFloatArrayElements(vectorArray, vector, JNI_ABORT);
+        }
+        total += batchSize;
+    }
+    this->HasExceptionInStack(env);
+    env->DeleteLocalRef(array2dJ);
+}
+
 std::vector<int64_t> knn_jni::JNIUtil::ConvertJavaIntArrayToCppIntVector(JNIEnv *env, jintArray arrayJ) {
 
     if (arrayJ == nullptr) {

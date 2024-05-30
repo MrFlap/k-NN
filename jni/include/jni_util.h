@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <cstdint>
 
+#include "../src/batch_list.cpp"
+
 namespace knn_jni {
 
     // Interface for making calls to JNI
@@ -73,6 +75,9 @@ namespace knn_jni {
                                                                    int dim, std::vector<float> *vect ) = 0;
 
         virtual std::vector<int64_t> ConvertJavaIntArrayToCppIntVector(JNIEnv *env, jintArray arrayJ) = 0;
+
+        virtual void Convert2dJavaObjectArrayAndStoreToBatches(JNIEnv *env, jobjectArray array2dJ, 
+        int dim, batch_list *vect, size_t num_batches) = 0;
 
         // --------------------------------------------------------------------------
 
@@ -169,6 +174,8 @@ namespace knn_jni {
         void SetByteArrayRegion(JNIEnv *env, jbyteArray array, jsize start, jsize len, const jbyte * buf);
         void Convert2dJavaObjectArrayAndStoreToFloatVector(JNIEnv *env, jobjectArray array2dJ, int dim, std::vector<float> *vect);
 
+        void Convert2dJavaObjectArrayAndStoreToBatches(JNIEnv *env, jobjectArray array2dJ, int dim, batch_list *vect, size_t num_batches);
+
     private:
         std::unordered_map<std::string, jclass> cachedClasses;
         std::unordered_map<std::string, jmethodID> cachedMethods;
@@ -201,7 +208,6 @@ namespace knn_jni {
     extern const std::string EF_CONSTRUCTION;
     extern const std::string EF_CONSTRUCTION_NMSLIB;
     extern const std::string EF_SEARCH;
-
     // --------------------------------------------------------------------------
 }
 

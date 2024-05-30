@@ -83,6 +83,7 @@ faiss::IndexIVFPQ * extractIVFPQIndex(faiss::Index * index);
 
 void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
                                          jstring indexPathJ, jobject parametersJ) {
+    printf("???\n"); 
 
     if (idsJ == nullptr) {
         throw std::runtime_error("IDs cannot be null");
@@ -114,18 +115,26 @@ void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JN
     faiss::MetricType metric = TranslateSpaceToMetric(spaceTypeCpp);
 
     // Read vectors from memory address
-    auto *inputVectors = reinterpret_cast<std::vector<float>*>(vectorsAddressJ);
+    printf("Reading vectors from memory address %p\n", (void *)vectorsAddressJ);
+    auto *inputVectors = reinterpret_cast<batch_list*>(vectorsAddressJ);
+    auto *inputVectorsTest = reinterpret_cast<std::vector<float>*>(vectorsAddressJ);
+    printf("Read %lu vectors\n", inputVectors->batch.size());
+    printf("Test %lu vectors\n", inputVectorsTest->size());
     int dim = (int)dimJ;
+    printf("Dim: %d\n", dim);
     // The number of vectors can be int here because a lucene segment number of total docs never crosses INT_MAX value
+    /*
     int numVectors = (int) (inputVectors->size() / (uint64_t) dim);
     if(numVectors == 0) {
         throw std::runtime_error("Number of vectors cannot be 0");
     }
-
+    */
     int numIds = jniUtil->GetJavaIntArrayLength(env, idsJ);
+    /*
     if (numIds != numVectors) {
         throw std::runtime_error("Number of IDs does not match number of vectors");
     }
+    */
 
     // Create faiss index
     jobject indexDescriptionJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::INDEX_DESCRIPTION);
@@ -158,6 +167,7 @@ void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JN
     faiss::IndexIDMap idMap = faiss::IndexIDMap(indexWriter.get());
     //idMap.add_with_ids(numVectors, inputVectors->data(), idVector.data());
 
+    /*
     static size_t NUM_DIVISIONS = 10;
 
     for(size_t i = 0; i < NUM_DIVISIONS; i++) {
@@ -170,6 +180,22 @@ void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JN
         idVector.resize(start_index_id);
         inputVectors->shrink_to_fit();
         idVector.shrink_to_fit();
+    }
+    */
+
+    size_t vectors_sent = 0;
+    auto * runner = inputVectors;
+
+    while(true) {
+        size_t batch_size = runner->batch.size();
+        size_t num_vecs = batch_size / dim;
+        idMap.add_with_ids(num_vecs, runner->batch.data(), &idVector.data()[vectors_sent]);
+        printf("%lu vectors sent!\n", num_vecs);
+        vectors_sent += num_vecs;
+        if(vectors_sent == idVector.size()) {
+            break;
+        }
+        runner = runner->next;
     }
 
     // Write the index to disk
