@@ -26,6 +26,8 @@ namespace knn_jni {
          */
         jlong storeVectorData(knn_jni::JNIUtilInterface *, JNIEnv *, jlong , jobjectArray, jlong);
 
+        jlong storeVectorDataBatches(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong memoryAddressJ, jobjectArray dataJ, jlong initialCapacityJ);
+
         /**
          * Free up the memory allocated for the data stored in memory address. This function should be used with the memory
          * address returned by {@link JNICommons#storeVectorData(long, float[][], long, long)}

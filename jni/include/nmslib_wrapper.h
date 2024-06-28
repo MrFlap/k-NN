@@ -28,6 +28,8 @@ namespace knn_jni {
         void CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddress, jint dim,
                          jstring indexPathJ, jobject parametersJ);
 
+        void CreateIndexIteratively(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ, jstring indexPathJ, jobject parametersJ);
+
         // Load an index from indexPathJ into memory. Use parametersJ to set any query time parameters
         //
         // Return a pointer to the loaded index

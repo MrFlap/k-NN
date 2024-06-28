@@ -47,6 +47,18 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_NmslibService_createIndex(JNI
         jniUtil.CatchCppExceptionAndThrowJava(env);
     }
 }
+/*
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_NmslibService_createIndexIteratively(JNIEnv * env, jclass cls, jintArray idsJ,
+                                                                             jlong vectorsAddressJ, jint dimJ, jstring indexPathJ,
+                                                                             jobject parametersJ)
+{
+    try {
+        knn_jni::nmslib_wrapper::CreateIndexIteratively(&jniUtil, env, idsJ, vectorsAddressJ, dimJ, indexPathJ, parametersJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+}
+*/
 
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_NmslibService_loadIndex(JNIEnv * env, jclass cls,
                                                                             jstring indexPathJ, jobject parametersJ)

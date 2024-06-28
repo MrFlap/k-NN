@@ -34,6 +34,17 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_createIndex
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_createIndexFromTemplate
   (JNIEnv *, jclass, jintArray, jlong, jint, jstring, jbyteArray, jobject);
 
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_initIndexFromScratch
+  (JNIEnv *, jclass, jlong, jint, jobject);
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_initIndexFromTemplate
+  (JNIEnv *, jclass, jlong, jint, jbyteArray, jobject);
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_createIndexIteratively
+  (JNIEnv *, jclass, jintArray, jlong, jint, jobject, jlong);
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_writeIndex
+  (JNIEnv *, jclass, jstring, jlong);
 /*
  * Class:     org_opensearch_knn_jni_FaissService
  * Method:    loadIndex

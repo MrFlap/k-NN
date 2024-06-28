@@ -28,6 +28,14 @@ JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_JNICommons_storeVectorData
 
 /*
  * Class:     org_opensearch_knn_jni_JNICommons
+ * Method:    storeVectorDataBatches
+ * Signature: (J[[FJJ)
+ */
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_JNICommons_storeVectorDataBatches
+  (JNIEnv *, jclass, jlong, jobjectArray, jlong);
+
+/*
+ * Class:     org_opensearch_knn_jni_JNICommons
  * Method:    freeVectorData
  * Signature: (J)V
  */

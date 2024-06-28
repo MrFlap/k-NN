@@ -28,6 +28,15 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_NmslibService_createIndex
 
 /*
  * Class:     org_opensearch_knn_jni_NmslibService
+ * Method:    createIndexIteratively
+ * Signature: ([IJILjava/lang/String;Ljava/util/Map;)V
+ */
+/*
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_NmslibService_createIndexIteratively
+        (JNIEnv *, jclass, jintArray, jlong, jint, jstring, jobject);
+*/
+/*
+ * Class:     org_opensearch_knn_jni_NmslibService
  * Method:    loadIndex
  * Signature: (Ljava/lang/String;Ljava/util/Map;)J
  */

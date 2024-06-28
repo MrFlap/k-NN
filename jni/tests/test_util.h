@@ -46,6 +46,8 @@ namespace test_util {
                     (JNIEnv * env, jobjectArray array2dJ, int dim));
         MOCK_METHOD(void, Convert2dJavaObjectArrayAndStoreToFloatVector,
                     (JNIEnv * env, jobjectArray array2dJ, int dim, std::vector<float>*vect));
+        MOCK_METHOD(void, Convert2dJavaObjectArrayAndStoreToBatches,
+                    (JNIEnv * env, jobjectArray array2dJ, int dim, std::vector<std::vector<float>>*vect));
         MOCK_METHOD(std::vector<int64_t>, ConvertJavaIntArrayToCppIntVector,
                     (JNIEnv * env, jintArray arrayJ));
         MOCK_METHOD2(ConvertJavaMapToCppMap,

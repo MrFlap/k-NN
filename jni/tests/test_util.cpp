@@ -51,6 +51,12 @@ test_util::MockJNIUtil::MockJNIUtil() {
                         (*reinterpret_cast<std::vector<std::vector<float>> *>(array2dJ)))
                     for (auto item : v) data->push_back(item);
             });
+    ON_CALL(*this, Convert2dJavaObjectArrayAndStoreToBatches)
+            .WillByDefault([this](JNIEnv *env, jobjectArray array2dJ, int dim, std::vector<std::vector<float>>* data) {
+                for (const auto &v :
+                        (*reinterpret_cast<std::vector<std::vector<float>> *>(array2dJ)))
+                    for (auto item : v) data->back().push_back(item);
+            });
 
 
     // arrayJ is re-interpreted as std::vector<int64_t> *

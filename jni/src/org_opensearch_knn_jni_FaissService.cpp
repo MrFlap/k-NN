@@ -65,6 +65,49 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_createIndexFromT
     }
 }
 
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_initIndexFromScratch(JNIEnv * env, jclass cls, jlong numDocs,
+                                                                            jint dimJ, jobject parametersJ)
+{
+    try {
+        return knn_jni::faiss_wrapper::initIndexFromScratch(&jniUtil, env, numDocs, dimJ, parametersJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+    return -1;
+}
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_initIndexFromTemplate(JNIEnv * env, jclass cls, jlong numDocs,
+                                                                            jint dimJ,
+                                                                            jbyteArray templateIndexJ, jobject parametersJ)
+{
+    try {
+        return knn_jni::faiss_wrapper::initIndexFromTemplate(&jniUtil, env, numDocs, dimJ, templateIndexJ, parametersJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+    return -1;
+}
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_createIndexIteratively(JNIEnv * env, jclass cls, jintArray idsJ,
+                                                                            jlong vectorsAddressJ, jint dimJ,
+                                                                            jobject parametersJ, jlong indexAddressJ)
+{
+    try {
+        knn_jni::faiss_wrapper::createIndexIteratively(&jniUtil, env, idsJ, vectorsAddressJ, dimJ, parametersJ, indexAddressJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_writeIndex(JNIEnv * env, jclass cls, jstring indexPathJ, jlong indexAddressJ)
+{
+    try {
+        knn_jni::faiss_wrapper::writeIndex(&jniUtil, env, indexPathJ, indexAddressJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_loadIndex(JNIEnv * env, jclass cls, jstring indexPathJ)
 {
     try {
