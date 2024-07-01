@@ -87,6 +87,63 @@ public class JNIService {
         );
     }
 
+    public static long initIndexFromTemplate(
+        long numDocs,
+        int dim,
+        byte[] templateIndex,
+        Map<String, Object> parameters,
+        KNNEngine knnEngine
+    ) {
+        if (KNNEngine.FAISS == knnEngine) {
+            return FaissService.initIndexFromTemplate(numDocs, dim, templateIndex, parameters);
+        }
+
+        throw new IllegalArgumentException(
+            String.format("CreateIndexIteratively not supported for provided engine : %s", knnEngine.getName())
+        );
+    }
+
+    public static long initIndexFromScratch(long numDocs, int dim, Map<String, Object> parameters, KNNEngine knnEngine) {
+        if (KNNEngine.FAISS == knnEngine) {
+            return FaissService.initIndexFromScratch(numDocs, dim, parameters);
+        }
+
+        throw new IllegalArgumentException(
+            String.format("CreateIndexIteratively not supported for provided engine : %s", knnEngine.getName())
+        );
+    }
+
+    public static void createIndexIteratively(
+        int[] ids,
+        long vectorsAddress,
+        int dim,
+        Map<String, Object> parameters,
+        long indexAddress,
+        KNNEngine knnEngine
+    ) {
+
+        if (KNNEngine.FAISS == knnEngine) {
+            FaissService.createIndexIteratively(ids, vectorsAddress, dim, parameters, indexAddress);
+            return;
+        }
+
+        throw new IllegalArgumentException(
+            String.format("CreateIndexIteratively not supported for provided engine : %s", knnEngine.getName())
+        );
+    }
+
+    public static void writeIndex(String indexPath, long indexAddress, KNNEngine knnEngine) {
+
+        if (KNNEngine.FAISS == knnEngine) {
+            FaissService.writeIndex(indexPath, indexAddress);
+            return;
+        }
+
+        throw new IllegalArgumentException(
+            String.format("CreateIndexIteratively not supported for provided engine : %s", knnEngine.getName())
+        );
+    }
+
     /**
      * Load an index into memory
      *

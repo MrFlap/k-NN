@@ -81,4 +81,12 @@ class NmslibService {
      */
     public static native void initLibrary();
 
+    public static native void createIndexIteratively(
+        int[] ids,
+        long vectorsAddress,
+        int dim,
+        String indexPath,
+        Map<String, Object> parameters
+    );
+
 }

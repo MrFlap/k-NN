@@ -63,6 +63,20 @@ class FaissService {
      */
     public static native void createIndex(int[] ids, long vectorsAddress, int dim, String indexPath, Map<String, Object> parameters);
 
+    public static native long initIndexFromScratch(long numDocs, int dim, Map<String, Object> parameters);
+
+    public static native long initIndexFromTemplate(long numDocs, int dim, byte[] templateIndex, Map<String, Object> parameters);
+
+    public static native void createIndexIteratively(
+        int[] ids,
+        long vectorsAddress,
+        int dim,
+        Map<String, Object> parameters,
+        long indexAddress
+    );
+
+    public static native void writeIndex(String indexPath, long indexAddress);
+
     /**
      * Create an index for the native library with a provided template index
      *

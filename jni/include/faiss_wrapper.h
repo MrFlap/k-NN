@@ -27,6 +27,14 @@ namespace knn_jni {
         void CreateIndexFromTemplate(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ,
                                      jlong vectorsAddressJ, jint dimJ, jstring indexPathJ, jbyteArray templateIndexJ,
                                      jobject parametersJ);
+        
+        jlong InitIndexFromScratch(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong numDocs, jint dimJ, jobject parametersJ);
+
+        jlong InitIndexFromTemplate(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong numDocs, jint dimJ, jbyteArray templateIndexJ, jobject parametersJ);
+
+        void CreateIndexIteratively(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ, jobject parametersJ, jlong indexAddressJ);
+
+        void WriteIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jstring indexPathJ, jlong indexAddressJ);
 
         // Load an index from indexPathJ into memory.
         //

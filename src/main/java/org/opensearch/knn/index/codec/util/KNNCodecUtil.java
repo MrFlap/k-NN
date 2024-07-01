@@ -31,7 +31,7 @@ public class KNNCodecUtil {
     public static final int JAVA_ROUNDING_NUMBER = 8;
 
     @AllArgsConstructor
-    public static final class Pair {
+    public static final class VectorBatch {
         public int[] docs;
         @Getter
         @Setter
@@ -40,10 +40,10 @@ public class KNNCodecUtil {
         @Setter
         private int dimension;
         public SerializationMode serializationMode;
-
+        public boolean finished;
     }
 
-    public static KNNCodecUtil.Pair getFloats(BinaryDocValues values) throws IOException {
+    public static KNNCodecUtil.VectorBatch getFloats(BinaryDocValues values) throws IOException {
         List<float[]> vectorList = new ArrayList<>();
         List<Integer> docIdList = new ArrayList<>();
         long vectorAddress = 0;
@@ -88,7 +88,79 @@ public class KNNCodecUtil {
         if (vectorList.isEmpty() == false) {
             vectorAddress = JNICommons.storeVectorData(vectorAddress, vectorList.toArray(new float[][] {}), totalLiveDocs * dimension);
         }
-        return new KNNCodecUtil.Pair(docIdList.stream().mapToInt(Integer::intValue).toArray(), vectorAddress, dimension, serializationMode);
+        return new KNNCodecUtil.VectorBatch(
+            docIdList.stream().mapToInt(Integer::intValue).toArray(),
+            vectorAddress,
+            dimension,
+            serializationMode,
+            true
+        );
+    }
+
+    public static KNNCodecUtil.VectorBatch getFloatsBatch(BinaryDocValues values) throws IOException {
+        List<float[]> vectorList = new ArrayList<>();
+        List<Integer> docIdList = new ArrayList<>();
+        long vectorAddress = 0;
+        int dimension = 0;
+        SerializationMode serializationMode = SerializationMode.COLLECTION_OF_FLOATS;
+
+        long totalLiveDocs = getTotalLiveDocsCount(values);
+        System.err.print("Total live docs: ");
+        System.err.println(totalLiveDocs);
+        long vectorsStreamingMemoryLimit = KNNSettings.getVectorStreamingMemoryLimit().getBytes();
+        long vectorsPerTransfer = Integer.MIN_VALUE;
+
+        for (int doc = values.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
+            BytesRef bytesref = values.binaryValue();
+            try (ByteArrayInputStream byteStream = new ByteArrayInputStream(bytesref.bytes, bytesref.offset, bytesref.length)) {
+                serializationMode = KNNVectorSerializerFactory.serializerModeFromStream(byteStream);
+                final KNNVectorSerializer vectorSerializer = KNNVectorSerializerFactory.getSerializerByStreamContent(byteStream);
+                final float[] vector = vectorSerializer.byteToFloatArray(byteStream);
+                dimension = vector.length;
+
+                if (vectorsPerTransfer == Integer.MIN_VALUE) {
+                    vectorsPerTransfer = (dimension * Float.BYTES * totalLiveDocs) / vectorsStreamingMemoryLimit;
+                    // This condition comes if vectorsStreamingMemoryLimit is higher than total number floats to transfer
+                    // Doing this will reduce 1 extra trip to JNI layer.
+                    if (vectorsPerTransfer == 0) {
+                        vectorsPerTransfer = totalLiveDocs;
+                    }
+                }
+                vectorList.add(vector);
+                docIdList.add(doc);
+                if (vectorList.size() >= vectorsPerTransfer) {
+                    vectorAddress = JNICommons.storeVectorData(
+                        vectorAddress,
+                        vectorList.toArray(new float[][] {}),
+                        docIdList.size() * dimension
+                    );
+                    // We should probably come up with a better way to reuse the vectorList memory which we have
+                    // created. Problem here is doing like this can lead to a lot of list memory which is of no use and
+                    // will be garbage collected later on, but it creates pressure on JVM. We should revisit this.
+                    System.err.print("Ending batch at doc num");
+                    System.err.println(doc);
+                    return new KNNCodecUtil.VectorBatch(
+                        docIdList.stream().mapToInt(Integer::intValue).toArray(),
+                        vectorAddress,
+                        dimension,
+                        serializationMode,
+                        false
+                    );
+                }
+            }
+        }
+        if (vectorList.isEmpty() == false) {
+            vectorAddress = JNICommons.storeVectorData(vectorAddress, vectorList.toArray(new float[][] {}), docIdList.size() * dimension);
+        }
+        // System.err.print("Ending batch at last doc num");
+        // System.err.println(doc);
+        return new KNNCodecUtil.VectorBatch(
+            docIdList.stream().mapToInt(Integer::intValue).toArray(),
+            vectorAddress,
+            dimension,
+            serializationMode,
+            true
+        );
     }
 
     public static long calculateArraySize(int numVectors, int vectorLength, SerializationMode serializationMode) {
@@ -127,7 +199,7 @@ public class KNNCodecUtil {
         return String.format("_%s%s", fieldName, extension);
     }
 
-    private static long getTotalLiveDocsCount(final BinaryDocValues binaryDocValues) {
+    public static long getTotalLiveDocsCount(final BinaryDocValues binaryDocValues) {
         long totalLiveDocs;
         if (binaryDocValues instanceof KNN80BinaryDocValues) {
             totalLiveDocs = ((KNN80BinaryDocValues) binaryDocValues).getTotalLiveDocs();

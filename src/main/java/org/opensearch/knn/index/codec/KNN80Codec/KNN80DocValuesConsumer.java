@@ -109,17 +109,16 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
     public void addKNNBinaryField(FieldInfo field, DocValuesProducer valuesProducer, boolean isMerge, boolean isRefresh)
         throws IOException {
         // Get values to be indexed
-        BinaryDocValues values = valuesProducer.getBinary(field);
-        KNNCodecUtil.Pair pair = KNNCodecUtil.getFloats(values);
-        if (pair.getVectorAddress() == 0 || pair.docs.length == 0) {
-            logger.info("Skipping engine index creation as there are no vectors or docs in the segment");
+        if (field == null) {
+            logger.info("Field is null!\n");
             return;
         }
-        long arraySize = calculateArraySize(pair.docs.length, pair.getDimension(), pair.serializationMode);
+        BinaryDocValues values = valuesProducer.getBinary(field);
+        long num_docs = KNNCodecUtil.getTotalLiveDocsCount(values);
+        long totalArraySize = 0;
+        long totalDocsIncrement = 0;
         if (isMerge) {
             KNNGraphValue.MERGE_CURRENT_OPERATIONS.increment();
-            KNNGraphValue.MERGE_CURRENT_DOCS.incrementBy(pair.docs.length);
-            KNNGraphValue.MERGE_CURRENT_SIZE_IN_BYTES.incrementBy(arraySize);
         }
         // Increment counter for number of graph index requests
         KNNCounter.GRAPH_INDEX_REQUESTS.increment();
@@ -134,32 +133,64 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
             ((FSDirectory) (FilterDirectory.unwrap(state.directory))).getDirectory().toString(),
             engineFileName
         ).toString();
-        NativeIndexCreator indexCreator;
         // Create library index either from model or from scratch
+
+        // This is a bit of a hack. We have to create an output here and then immediately close it to ensure that
+        // engineFileName is added to the tracked files by Lucene's TrackingDirectoryWrapper. Otherwise, the file will
+        // not be marked as added to the directory.
+        state.directory.createOutput(engineFileName, state.context).close();
         if (field.attributes().containsKey(MODEL_ID)) {
             String modelId = field.attributes().get(MODEL_ID);
             Model model = ModelCache.getInstance().get(modelId);
             if (model.getModelBlob() == null) {
                 throw new RuntimeException(String.format("There is no trained model with id \"%s\"", modelId));
             }
-            indexCreator = () -> createKNNIndexFromTemplate(model.getModelBlob(), pair, knnEngine, indexPath);
+            KNNCodecUtil.VectorBatch pair = KNNCodecUtil.getFloatsBatch(values);
+            long indexAddress = initIndexFromTemplate(model.getModelBlob(), num_docs, pair.getDimension(), knnEngine);
+            while (true) {
+                if (pair.docs.length != 0) createIndexIteratively(pair, knnEngine, indexAddress);
+                if (isMerge) {
+                    totalArraySize += calculateArraySize(pair.docs.length, pair.getDimension(), pair.serializationMode);
+                    totalDocsIncrement += pair.docs.length;
+                }
+                if (pair.finished) {
+                    break;
+                }
+                pair = KNNCodecUtil.getFloatsBatch(values);
+            }
+            writeIndex(indexAddress, indexPath, knnEngine);
         } else {
-            indexCreator = () -> createKNNIndexFromScratch(field, pair, knnEngine, indexPath);
+            if (KNNEngine.FAISS == knnEngine) {
+                KNNCodecUtil.VectorBatch pair = KNNCodecUtil.getFloatsBatch(values);
+                long indexAddress = initIndexFromScratch(field, num_docs, pair.getDimension(), knnEngine);
+                while (true) {
+                    if (pair.docs.length != 0) createIndexIteratively(pair, knnEngine, indexAddress);
+                    if (isMerge) {
+                        totalArraySize += calculateArraySize(pair.docs.length, pair.getDimension(), pair.serializationMode);
+                        totalDocsIncrement += pair.docs.length;
+                    }
+                    if (pair.finished || pair.docs.length != 0) {
+                        break;
+                    }
+                    pair = KNNCodecUtil.getFloatsBatch(values);
+                }
+                writeIndex(indexAddress, indexPath, knnEngine);
+            } else {
+                // Note that iterative graph construction has not yet been implemented for nmslib
+                KNNCodecUtil.VectorBatch pair = KNNCodecUtil.getFloats(values);
+                createKNNIndexFromScratch(field, pair, knnEngine, indexPath);
+                totalDocsIncrement += pair.docs.length;
+                totalArraySize += calculateArraySize(pair.docs.length, pair.getDimension(), pair.serializationMode);
+            }
         }
-
         if (isMerge) {
-            recordMergeStats(pair.docs.length, arraySize);
+            KNNGraphValue.MERGE_CURRENT_DOCS.incrementBy(totalDocsIncrement);
+            KNNGraphValue.MERGE_CURRENT_SIZE_IN_BYTES.incrementBy(totalArraySize);
+            recordMergeStats((int) totalDocsIncrement, totalArraySize);
         }
-
         if (isRefresh) {
             recordRefreshStats();
         }
-
-        // This is a bit of a hack. We have to create an output here and then immediately close it to ensure that
-        // engineFileName is added to the tracked files by Lucene's TrackingDirectoryWrapper. Otherwise, the file will
-        // not be marked as added to the directory.
-        state.directory.createOutput(engineFileName, state.context).close();
-        indexCreator.createIndex();
         writeFooter(indexPath, engineFileName);
     }
 
@@ -176,7 +207,75 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
         KNNGraphValue.REFRESH_TOTAL_OPERATIONS.increment();
     }
 
-    private void createKNNIndexFromTemplate(byte[] model, KNNCodecUtil.Pair pair, KNNEngine knnEngine, String indexPath) {
+    private long initIndexFromScratch(FieldInfo fieldInfo, long size, int dim, KNNEngine knnEngine) throws IOException {
+        Map<String, Object> parameters = new HashMap<>();
+        Map<String, String> fieldAttributes = fieldInfo.attributes();
+        String parametersString = fieldAttributes.get(KNNConstants.PARAMETERS);
+
+        // parametersString will be null when legacy mapper is used
+        if (parametersString == null) {
+            parameters.put(KNNConstants.SPACE_TYPE, fieldAttributes.getOrDefault(KNNConstants.SPACE_TYPE, SpaceType.DEFAULT.getValue()));
+
+            String efConstruction = fieldAttributes.get(KNNConstants.HNSW_ALGO_EF_CONSTRUCTION);
+            Map<String, Object> algoParams = new HashMap<>();
+            if (efConstruction != null) {
+                algoParams.put(KNNConstants.METHOD_PARAMETER_EF_CONSTRUCTION, Integer.parseInt(efConstruction));
+            }
+
+            String m = fieldAttributes.get(KNNConstants.HNSW_ALGO_M);
+            if (m != null) {
+                algoParams.put(KNNConstants.METHOD_PARAMETER_M, Integer.parseInt(m));
+            }
+            parameters.put(PARAMETERS, algoParams);
+        } else {
+            parameters.putAll(
+                XContentHelper.createParser(
+                    NamedXContentRegistry.EMPTY,
+                    DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                    new BytesArray(parametersString),
+                    MediaTypeRegistry.getDefaultMediaType()
+                ).map()
+            );
+        }
+
+        // Used to determine how many threads to use when indexing
+        parameters.put(KNNConstants.INDEX_THREAD_QTY, KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY));
+
+        // Pass the path for the nms library to save the file
+        return AccessController.doPrivileged((PrivilegedAction<Long>) () -> {
+            return JNIService.initIndexFromScratch(size, dim, parameters, knnEngine);
+        });
+    }
+
+    private long initIndexFromTemplate(byte[] model, long size, int dim, KNNEngine knnEngine) {
+        Map<String, Object> parameters = ImmutableMap.of(
+            KNNConstants.INDEX_THREAD_QTY,
+            KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY)
+        );
+        return AccessController.doPrivileged((PrivilegedAction<Long>) () -> {
+            return JNIService.initIndexFromTemplate(size, dim, model, parameters, knnEngine);
+        });
+    }
+
+    private void createIndexIteratively(KNNCodecUtil.VectorBatch pair, KNNEngine knnEngine, long indexAddress) {
+        Map<String, Object> parameters = ImmutableMap.of(
+            KNNConstants.INDEX_THREAD_QTY,
+            KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY)
+        );
+        AccessController.doPrivileged((PrivilegedAction<Long>) () -> {
+            JNIService.createIndexIteratively(pair.docs, pair.getVectorAddress(), pair.getDimension(), parameters, indexAddress, knnEngine);
+            return null;
+        });
+    }
+
+    private void writeIndex(long indexAddress, String indexPath, KNNEngine knnEngine) {
+        AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+            JNIService.writeIndex(indexPath, indexAddress, knnEngine);
+            return null;
+        });
+    }
+
+    private void createKNNIndexFromTemplate(byte[] model, KNNCodecUtil.VectorBatch pair, KNNEngine knnEngine, String indexPath) {
         Map<String, Object> parameters = ImmutableMap.of(
             KNNConstants.INDEX_THREAD_QTY,
             KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY)
@@ -195,7 +294,7 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
         });
     }
 
-    private void createKNNIndexFromScratch(FieldInfo fieldInfo, KNNCodecUtil.Pair pair, KNNEngine knnEngine, String indexPath)
+    private void createKNNIndexFromScratch(FieldInfo fieldInfo, KNNCodecUtil.VectorBatch pair, KNNEngine knnEngine, String indexPath)
         throws IOException {
         Map<String, Object> parameters = new HashMap<>();
         Map<String, String> fieldAttributes = fieldInfo.attributes();
