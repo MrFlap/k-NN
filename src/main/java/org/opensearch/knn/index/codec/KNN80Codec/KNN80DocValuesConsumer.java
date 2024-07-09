@@ -169,7 +169,7 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
                         totalArraySize += calculateArraySize(pair.docs.length, pair.getDimension(), pair.serializationMode);
                         totalDocsIncrement += pair.docs.length;
                     }
-                    if (pair.finished || pair.docs.length != 0) {
+                    if (pair.finished) {
                         break;
                     }
                     pair = KNNCodecUtil.getFloatsBatch(values);
