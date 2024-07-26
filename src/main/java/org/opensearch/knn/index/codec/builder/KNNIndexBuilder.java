@@ -75,6 +75,7 @@ public class KNNIndexBuilder {
     protected Map<String, Object> parameters;
     protected byte[] modelBlob;
     protected long arraySize;
+    protected int dimension;
 
     @FunctionalInterface
     private interface NativeIndexCreator {
@@ -142,26 +143,31 @@ public class KNNIndexBuilder {
         KNNGraphValue.REFRESH_TOTAL_OPERATIONS.increment();
     }
 
-    private long initIndexFromScratch(long size, int dim, KNNEngine knnEngine, Map<String, Object> parameters) throws IOException {
-        // Pass the path for the nms library to save the file
-        return AccessController.doPrivileged((PrivilegedAction<Long>) () -> {
-            return JNIService.initIndexFromScratch(size, dim, parameters, knnEngine);
-        });
+    private long genIndexInfo(Map<String, Object> parameters) {
+        return AccessController.doPrivileged((PrivilegedAction<Long>) () -> { return JNIService.genIndexInfo(parameters); });
     }
 
-    private void insertToIndex(KNNCodecUtil.VectorBatch pair, KNNEngine knnEngine, long indexAddress, Map<String, Object> parameters)
-        throws IOException {
-        // Could be zero docs because of edge cases with batch creation
-        if (pair.docs.length == 0) return;
+    private void initIndexFromScratch(long indexInfoAddress) throws IOException {
+        // Pass the path for the nms library to save the file
         AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
-            JNIService.insertToIndex(pair.docs, pair.getVectorAddress(), pair.getDimension(), parameters, indexAddress, knnEngine);
+            JNIService.initIndexFromScratch(indexInfoAddress);
             return null;
         });
     }
 
-    private void writeIndex(long indexAddress, String indexPath, KNNEngine knnEngine, Map<String, Object> parameters) throws IOException {
+    private void insertToIndex(long indexInfoAddress, KNNCodecUtil.VectorBatch pair)
+        throws IOException {
+        // Could be zero docs because of edge cases with batch creation
+        if (pair.docs.length == 0) return;
         AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
-            JNIService.writeIndex(indexPath, indexAddress, knnEngine, parameters);
+            JNIService.insertToIndex(indexInfoAddress, pair.docs, pair.getVectorAddress());
+            return null;
+        });
+    }
+
+    private void writeIndex(long indexInfoAddress) throws IOException {
+        AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+            JNIService.writeIndex(indexInfoAddress);
             return null;
         });
     }
@@ -213,6 +219,8 @@ public class KNNIndexBuilder {
                 IndexUtil.updateVectorDataTypeToParameters(parameters, VectorDataType.BINARY);
             }
         }
+        parameters.put(KNNConstants.PLANNED_NUM_DOCS, numDocs);
+        parameters.put(KNNConstants.INDEX_PATH, indexPath);
         // Used to determine how many threads to use when indexing
         parameters.put(KNNConstants.INDEX_THREAD_QTY, KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY));
     }
@@ -237,6 +245,8 @@ public class KNNIndexBuilder {
         vectorTransfer = getVectorTransfer(vectorDataType);
         serializationMode = vectorTransfer.getSerializationMode(firstDoc);
         arraySize = numDocs * firstDoc.length;
+        dimension = firstDoc.length;
+        parameters.put(KNNConstants.DIMENSION, Integer.valueOf(dimension));
     }
 
     private void createKNNIndexFromTemplate() throws IOException {
@@ -265,13 +275,14 @@ public class KNNIndexBuilder {
     }
 
     private void createKNNIndexFromScratchIteratively() throws IOException {
+        long indexInfoAddress = genIndexInfo(parameters);
         KNNCodecUtil.VectorBatch batch = KNNCodecUtil.getVectorBatch(values, vectorTransfer, true);
-        long indexAddress = initIndexFromScratch(numDocs, batch.getDimension(), knnEngine, parameters);
+        initIndexFromScratch(indexInfoAddress);
         for (; !batch.finished; batch = KNNCodecUtil.getVectorBatch(values, vectorTransfer, true)) {
-            insertToIndex(batch, knnEngine, indexAddress, parameters);
+            insertToIndex(indexInfoAddress, batch);
         }
-        insertToIndex(batch, knnEngine, indexAddress, parameters);
-        writeIndex(indexAddress, indexPath, knnEngine, parameters);
+        insertToIndex(indexInfoAddress, batch);
+        writeIndex(indexInfoAddress);
     }
 
     private VectorTransfer getVectorTransfer(VectorDataType vectorDataType) {

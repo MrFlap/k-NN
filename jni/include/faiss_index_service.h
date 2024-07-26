@@ -23,6 +23,20 @@
 namespace knn_jni {
 namespace faiss_wrapper {
 
+class IndexService;
+
+struct IndexInfo {
+    jlong indexAddress;
+    std::string spaceType;
+    std::string indexDescription;
+    std::string indexPath;
+    faiss::MetricType metric;
+    int dimension;
+    int plannedDocs;
+    int threadCount;
+    IndexService * indexService;
+    std::unordered_map<std::string, jobject> parameters;
+};
 
 /**
  * A class to provide operations on index
@@ -44,7 +58,7 @@ public:
      * @param parameters parameters to be applied to faiss index
      * @return memory address of the native index object
      */
-    virtual jlong initIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, faiss::MetricType metric, std::string indexDescription, int dim, int numVectors, int threadCount, std::unordered_map<std::string, jobject> parameters);
+    virtual void initIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, knn_jni::faiss_wrapper::IndexInfo * indexInfo);
     /**
      * Add vectors to index
      *
@@ -59,7 +73,7 @@ public:
      * @param idMap a map of document id and vector id
      * @param parameters parameters to be applied to faiss index
      */
-    virtual void insertToIndex(int dim, int numIds, int threadCount, int64_t vectorsAddress, std::vector<int64_t> &ids, jlong idMapAddress);
+    virtual void insertToIndex(knn_jni::faiss_wrapper::IndexInfo * indexInfo, int64_t vectorsAddress, std::vector<int64_t> &ids);
     /**
      * Write index to disk
      *
@@ -72,7 +86,7 @@ public:
      * @param idMap a map of document id and vector id
      * @param parameters parameters to be applied to faiss index
      */
-    virtual void writeIndex(int threadCount, std::string indexPath, jlong idMapAddress);
+    virtual void writeIndex(knn_jni::faiss_wrapper::IndexInfo * indexInfo);
     // TODO Remove dependency on JNIUtilInterface and JNIEnv
     // TODO Reduce the number of parameters
 
@@ -130,7 +144,7 @@ public:
      * @param parameters parameters to be applied to faiss index
      * @return memory address of the native index object
      */
-    virtual jlong initIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, faiss::MetricType metric, std::string indexDescription, int dim, int numVectors, int threadCount, std::unordered_map<std::string, jobject> parameters) override;
+    virtual void initIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, knn_jni::faiss_wrapper::IndexInfo * indexInfo) override;
     /**
      * Add vectors to index
      *
@@ -145,7 +159,7 @@ public:
      * @param idMap a map of document id and vector id
      * @param parameters parameters to be applied to faiss index
      */
-    virtual void insertToIndex(int dim, int numIds, int threadCount, int64_t vectorsAddress, std::vector<int64_t> &ids, jlong idMapAddress) override;
+    virtual void insertToIndex(knn_jni::faiss_wrapper::IndexInfo * indexInfo, int64_t vectorsAddress, std::vector<int64_t> &ids) override;
     /**
      * Write index to disk
      *
@@ -158,7 +172,7 @@ public:
      * @param idMap a map of document id and vector id
      * @param parameters parameters to be applied to faiss index
      */
-    virtual void writeIndex(int threadCount, std::string indexPath, jlong idMapAddress) override;
+    virtual void writeIndex(knn_jni::faiss_wrapper::IndexInfo * indexInfo) override;
     /**
      * Create binary index
      *

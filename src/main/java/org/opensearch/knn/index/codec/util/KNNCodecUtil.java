@@ -55,7 +55,7 @@ public class KNNCodecUtil {
         boolean iterative
     ) throws IOException {
         List<Integer> docIdList = new ArrayList<>();
-        SerializationMode serializationMode = SerializationMode.COLLECTION_OF_FLOATS;
+        SerializationMode serializationMode = null;
         if (iterative) {
             // Initializing with a value of zero means to only allocate as much memory on JNI as
             // we have inserted for vectors in java side
@@ -70,7 +70,9 @@ public class KNNCodecUtil {
         }
         for (; doc != DocIdSetIterator.NO_MORE_DOCS; doc = values.nextDoc()) {
             BytesRef bytesref = values.binaryValue();
-            serializationMode = vectorTransfer.getSerializationMode(bytesref);
+            if(serializationMode == null) {
+                serializationMode = vectorTransfer.getSerializationMode(bytesref);
+            }
             vectorTransfer.transfer(bytesref);
             docIdList.add(doc);
             // Semi-hacky way to check if the streaming limit has been reached

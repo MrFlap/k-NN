@@ -17,6 +17,8 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
+
+import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.codec.util.SerializationMode;
 import org.opensearch.knn.index.util.KNNEngine;
@@ -26,6 +28,7 @@ import org.opensearch.knn.plugin.script.KNNScoringUtil;
 
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Random;
 import java.util.Set;
 import java.util.PriorityQueue;
@@ -391,10 +394,15 @@ public class TestUtils {
         if (engine != KNNEngine.FAISS) {
             JNIService.createIndex(ids, address, dimension, name, parameters, engine);
         } else {
+            Map<String, Object> mutableParams = new HashMap<>(parameters);
+            // Dimension now needs to be specified.
+            mutableParams.put(KNNConstants.DIMENSION, dimension);
+            mutableParams.put(KNNConstants.INDEX_PATH, name);
             // We can initialize numDocs as 0, this will just not reserve anything.
-            long indexAddress = JNIService.initIndexFromScratch(0, dimension, parameters, engine);
-            JNIService.insertToIndex(ids, address, dimension, parameters, indexAddress, engine);
-            JNIService.writeIndex(name, indexAddress, engine, parameters);
+            long indexInfoAddress = JNIService.genIndexInfo(mutableParams);
+            JNIService.initIndexFromScratch(indexInfoAddress);
+            JNIService.insertToIndex(indexInfoAddress, ids, address);
+            JNIService.writeIndex(indexInfoAddress);
         }
     }
 }

@@ -44,6 +44,8 @@ public class KNNConstants {
     public static final String MODEL_METADATA_FIELD = "knn-models";
     public static final Integer BYTES_PER_KILOBYTES = 1024;
     public static final String PREFERENCE_PARAMETER = "preference";
+    public static final String PLANNED_NUM_DOCS = "plannedNumDocs";
+    public static final String INDEX_PATH = "indexPath";
 
     public static final String MODEL_STATE = "state";
     public static final String MODEL_TIMESTAMP = "timestamp";

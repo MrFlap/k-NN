@@ -18,11 +18,13 @@
 
 namespace knn_jni {
     namespace faiss_wrapper {
-        jlong InitIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong numDocs, jint dimJ, jobject parametersJ, IndexService *indexService);
+        jlong GenIndexInfo(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jobject parametersJ, IndexService * indexService);
 
-        void InsertToIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ, jlong index_ptr, jint threadCount, IndexService *indexService);
+        void InitIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong indexInfoAddress);
 
-        void WriteIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jstring indexPathJ, jlong index_ptr, jint threadCount, IndexService *indexService);
+        void InsertToIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong indexInfoAddress, jintArray idsJ, jlong vectorsAddressJ);
+
+        void WriteIndex(knn_jni::JNIUtilInterface *jniUtil, JNIEnv *env, jlong indexInfoAddress);
 
         // Create an index with ids and vectors. Instead of creating a new index, this function creates the index
         // based off of the template index passed in. The index is serialized to indexPathJ.

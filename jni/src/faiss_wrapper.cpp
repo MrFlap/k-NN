@@ -88,16 +88,18 @@ bool isIndexIVFPQL2(faiss::Index * index);
 // IndexIDMap which has member that will point to underlying index that stores the data
 faiss::IndexIVFPQ * extractIVFPQIndex(faiss::Index * index);
 
-jlong knn_jni::faiss_wrapper::InitIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong numDocs, jint dimJ,
-                                         jobject parametersJ, IndexService* indexService) {
-
-    if(dimJ <= 0) {
-        throw std::runtime_error("Vectors dimensions cannot be less than or equal to 0");
-    }
-
+jlong knn_jni::faiss_wrapper::GenIndexInfo(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jobject parametersJ, IndexService * indexService) {
     if (parametersJ == nullptr) {
         throw std::runtime_error("Parameters cannot be null");
     }
+
+    if(indexService == nullptr) {
+        throw std::runtime_error("Index service cannot be null");
+    }
+
+    std::unique_ptr<knn_jni::faiss_wrapper::IndexInfo> info (new IndexInfo);
+
+    info->indexService = indexService;
 
     // parametersJ is a Java Map<String, Object>. ConvertJavaMapToCppMap converts it to a c++ map<string, jobject>
     // so that it is easier to access.
@@ -106,58 +108,67 @@ jlong knn_jni::faiss_wrapper::InitIndex(knn_jni::JNIUtilInterface * jniUtil, JNI
     // Parameters to pass
     // Metric type
     jobject spaceTypeJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::SPACE_TYPE);
-    std::string spaceTypeCpp(jniUtil->ConvertJavaObjectToCppString(env, spaceTypeJ));
-    faiss::MetricType metric = TranslateSpaceToMetric(spaceTypeCpp);
+    info->spaceType = jniUtil->ConvertJavaObjectToCppString(env, spaceTypeJ);
+    info->metric = TranslateSpaceToMetric(info->spaceType);
     jniUtil->DeleteLocalRef(env, spaceTypeJ);
 
     // Dimension
-    int dim = (int)dimJ;
-
-    // Number of docs
-    int docs = (int)numDocs;
+    jobject dimensionJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::DIMENSION);
+    info->dimension = jniUtil->ConvertJavaObjectToCppInteger(env, dimensionJ);
+    jniUtil->DeleteLocalRef(env, dimensionJ);
 
     // Index description
     jobject indexDescriptionJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::INDEX_DESCRIPTION);
-    std::string indexDescriptionCpp(jniUtil->ConvertJavaObjectToCppString(env, indexDescriptionJ));
+    info->indexDescription = jniUtil->ConvertJavaObjectToCppString(env, indexDescriptionJ);
     jniUtil->DeleteLocalRef(env, indexDescriptionJ);
 
-    // Thread count
-    int threadCount = 0;
-    if(parametersCpp.find(knn_jni::INDEX_THREAD_QUANTITY) != parametersCpp.end()) {
-        threadCount = jniUtil->ConvertJavaObjectToCppInteger(env, parametersCpp[knn_jni::INDEX_THREAD_QUANTITY]);
-    }
-
     // Extra parameters
-    // TODO: parse the entire map and remove jni object
     std::unordered_map<std::string, jobject> subParametersCpp;
     if(parametersCpp.find(knn_jni::PARAMETERS) != parametersCpp.end()) {
         subParametersCpp = jniUtil->ConvertJavaMapToCppMap(env, parametersCpp[knn_jni::PARAMETERS]);
     }
-    // end parameters to pass
+    info->parameters = subParametersCpp;
 
-    // Create index
-    return indexService->initIndex(jniUtil, env, metric, indexDescriptionCpp, dim, numDocs, threadCount, subParametersCpp);
+    // Thread count
+    info->threadCount = 0;
+    if(parametersCpp.find(knn_jni::INDEX_THREAD_QUANTITY) != parametersCpp.end()) {
+        info->threadCount = jniUtil->ConvertJavaObjectToCppInteger(env, parametersCpp[knn_jni::INDEX_THREAD_QUANTITY]);
+    }
+
+    // Planned number of docs
+
+    info->plannedDocs = 9;
+    if(parametersCpp.find(knn_jni::PLANNED_NUM_DOCS) != parametersCpp.end()) {
+        info->plannedDocs = jniUtil->ConvertJavaObjectToCppInteger(env, parametersCpp[knn_jni::PLANNED_NUM_DOCS]);
+    }
+
+    // Index path
+    jobject indexPathJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::INDEX_PATH);
+    info->indexPath = jniUtil->ConvertJavaObjectToCppString(env, indexPathJ);
+
+    // end parameters to pass
+    return reinterpret_cast<jlong>(info.release());
 }
 
-void knn_jni::faiss_wrapper::InsertToIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
-                                         jlong index_ptr, jint threadCount, IndexService* indexService) {
-    if (idsJ == nullptr) {
-        throw std::runtime_error("IDs cannot be null");
+void knn_jni::faiss_wrapper::InitIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexInfoAddress) {
+
+    IndexInfo* indexInfo = reinterpret_cast<IndexInfo*>(indexInfoAddress);
+
+    if(indexInfo == nullptr) {
+        throw std::runtime_error("indexInfo address cannot be null");
     }
 
-    if (vectorsAddressJ <= 0) {
-        throw std::runtime_error("VectorsAddress cannot be less than 0");
+    // Create index
+    indexInfo->indexService->initIndex(jniUtil, env, indexInfo);
+}
+
+void knn_jni::faiss_wrapper::InsertToIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexInfoAddress,
+                                           jintArray idsJ, jlong vectorsAddressJ) {
+    IndexInfo* indexInfo = reinterpret_cast<IndexInfo*>(indexInfoAddress);
+
+    if(indexInfo == nullptr) {
+        throw std::runtime_error("indexInfo address cannot be null");
     }
-
-    if(dimJ <= 0) {
-        throw std::runtime_error("Vectors dimensions cannot be less than or equal to 0");
-    }
-
-    // Dimension
-    int dim = (int)dimJ;
-
-    // Number of vectors
-    int numIds = jniUtil->GetJavaIntArrayLength(env, idsJ);
 
     // Vectors address
     int64_t vectorsAddress = (int64_t)vectorsAddressJ;
@@ -166,21 +177,20 @@ void knn_jni::faiss_wrapper::InsertToIndex(knn_jni::JNIUtilInterface * jniUtil, 
     auto ids = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
 
     // Create index
-    indexService->insertToIndex(dim, numIds, threadCount, vectorsAddress, ids, index_ptr);
+    indexInfo->indexService->insertToIndex(indexInfo, vectorsAddress, ids);
 }
 
 void knn_jni::faiss_wrapper::WriteIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env,
-                                         jstring indexPathJ, jlong index_ptr, jint threadCount, IndexService* indexService) {
+                                         jlong indexInfoAddress) {
 
-    if (indexPathJ == nullptr) {
-        throw std::runtime_error("Index path cannot be null");
+    IndexInfo* indexInfo = reinterpret_cast<IndexInfo*>(indexInfoAddress);
+
+    if(indexInfo == nullptr) {
+        throw std::runtime_error("indexInfo address cannot be null");
     }
 
-    // Index path
-    std::string indexPathCpp(jniUtil->ConvertJavaStringToCppString(env, indexPathJ));
-
     // Create index
-    indexService->writeIndex(threadCount, indexPathCpp, index_ptr);
+    indexInfo->indexService->writeIndex(indexInfo);
 }
 
 void knn_jni::faiss_wrapper::CreateIndexFromTemplate(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ,

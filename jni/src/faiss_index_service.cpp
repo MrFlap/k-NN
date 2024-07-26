@@ -57,26 +57,21 @@ void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
 
 IndexService::IndexService(std::unique_ptr<FaissMethods> faissMethods) : faissMethods(std::move(faissMethods)) {}
 
-jlong IndexService::initIndex(
+void IndexService::initIndex(
         knn_jni::JNIUtilInterface * jniUtil,
         JNIEnv * env,
-        faiss::MetricType metric,
-        std::string indexDescription,
-        int dim,
-        int numVectors,
-        int threadCount,
-        std::unordered_map<std::string, jobject> parameters
+        IndexInfo * indexInfo
     ) {
     // Create index using Faiss factory method
-    std::unique_ptr<faiss::Index> indexWriter(faissMethods->indexFactory(dim, indexDescription.c_str(), metric));
+    std::unique_ptr<faiss::Index> indexWriter(faissMethods->indexFactory(indexInfo->dimension, indexInfo->indexDescription.c_str(), indexInfo->metric));
 
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
     // Add extra parameters that cant be configured with the index factory
-    SetExtraParameters<faiss::Index, faiss::IndexIVF, faiss::IndexHNSW>(jniUtil, env, parameters, indexWriter.get());
+    SetExtraParameters<faiss::Index, faiss::IndexIVF, faiss::IndexHNSW>(jniUtil, env, indexInfo->parameters, indexWriter.get());
 
     // Check that the index does not need to be trained
     if(!indexWriter->is_trained) {
@@ -101,59 +96,48 @@ jlong IndexService::initIndex(
         if(storage != NULL) {
             // Allocate enough memory for all of the vectors we plan on inserting
             // We do this to avoid unnecessary memory allocations during insert
-            storage->codes.reserve(dim * numVectors * 4);
+            storage->codes.reserve(indexInfo->dimension * indexInfo->plannedDocs * 4);
         }
     }
     indexWriter.release();
-    return reinterpret_cast<jlong>(idMap.release());
+    indexInfo->indexAddress = reinterpret_cast<jlong>(idMap.release());
 }
 
 void IndexService::insertToIndex(
-        int dim,
-        int numIds,
-        int threadCount,
+        IndexInfo * indexInfo,
         int64_t vectorsAddress,
-        std::vector<int64_t> & ids,
-        jlong idMapAddress
+        std::vector<int64_t> & ids
     ) {
     // Read vectors from memory address (unique ptr since we want to remove from memory after use)
     std::vector<float> * inputVectors = reinterpret_cast<std::vector<float>*>(vectorsAddress);
 
     // The number of vectors can be int here because a lucene segment number of total docs never crosses INT_MAX value
-    int numVectors = (int) (inputVectors->size() / (uint64_t) dim);
+    int numVectors = (int) (inputVectors->size() / (uint64_t) indexInfo->dimension);
     if(numVectors == 0) {
         throw std::runtime_error("Number of vectors cannot be 0");
     }
 
-    if (numIds != numVectors) {
-        throw std::runtime_error("Number of IDs does not match number of vectors");
-    }
-
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
-    faiss::IndexIDMap * idMap = reinterpret_cast<faiss::IndexIDMap *> (idMapAddress);
+    faiss::IndexIDMap * idMap = reinterpret_cast<faiss::IndexIDMap *> (indexInfo->indexAddress);
 
     // Add vectors
     idMap->add_with_ids(numVectors, inputVectors->data(), ids.data());
 }
 
-void IndexService::writeIndex(
-        int threadCount,
-        std::string indexPath,
-        jlong idMapAddress
-    ) {
+void IndexService::writeIndex(IndexInfo * indexInfo) {
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
-    std::unique_ptr<faiss::IndexIDMap> idMap (reinterpret_cast<faiss::IndexIDMap *> (idMapAddress));
+    std::unique_ptr<faiss::IndexIDMap> idMap (reinterpret_cast<faiss::IndexIDMap *> (indexInfo->indexAddress));
 
     // Write the index to disk
-    faissMethods->writeIndex(idMap.get(), indexPath.c_str());
+    faissMethods->writeIndex(idMap.get(), indexInfo->indexPath.c_str());
 
     // Free the memory used by the index
     delete idMap->index;
@@ -211,26 +195,21 @@ void IndexService::createIndex(
 
 BinaryIndexService::BinaryIndexService(std::unique_ptr<FaissMethods> faissMethods) : IndexService(std::move(faissMethods)) {}
 
-jlong BinaryIndexService::initIndex(
+void BinaryIndexService::initIndex(
         knn_jni::JNIUtilInterface * jniUtil,
         JNIEnv * env,
-        faiss::MetricType metric,
-        std::string indexDescription,
-        int dim,
-        int numVectors,
-        int threadCount,
-        std::unordered_map<std::string, jobject> parameters
+        IndexInfo * indexInfo
     ) {
     // Create index using Faiss factory method
-    std::unique_ptr<faiss::IndexBinary> indexWriter(faissMethods->indexBinaryFactory(dim, indexDescription.c_str()));
+    std::unique_ptr<faiss::IndexBinary> indexWriter(faissMethods->indexBinaryFactory(indexInfo->dimension, indexInfo->indexDescription.c_str()));
 
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
     // Add extra parameters that cant be configured with the index factory
-    SetExtraParameters<faiss::IndexBinary, faiss::IndexBinaryIVF, faiss::IndexBinaryHNSW>(jniUtil, env, parameters, indexWriter.get());
+    SetExtraParameters<faiss::IndexBinary, faiss::IndexBinaryIVF, faiss::IndexBinaryHNSW>(jniUtil, env, indexInfo->parameters, indexWriter.get());
 
     // Check that the index does not need to be trained
     if(!indexWriter->is_trained) {
@@ -255,59 +234,50 @@ jlong BinaryIndexService::initIndex(
         if(storage != NULL) {
             // Allocate enough memory for all of the vectors we plan on inserting
             // We do this to avoid unnecessary memory allocations during insert
-            storage->xb.reserve(dim / 8 * numVectors);
+            storage->xb.reserve(indexInfo->dimension / 8 * indexInfo->plannedDocs);
         }
     }
     indexWriter.release();
-    return reinterpret_cast<jlong>(idMap.release());
+    indexInfo->indexAddress = reinterpret_cast<jlong>(idMap.release());
 }
 
 void BinaryIndexService::insertToIndex(
-        int dim,
-        int numIds,
-        int threadCount,
+        IndexInfo * indexInfo,
         int64_t vectorsAddress,
-        std::vector<int64_t> & ids,
-        jlong idMapAddress
+        std::vector<int64_t> & ids
     ) {
     // Read vectors from memory address (unique ptr since we want to remove from memory after use)
     std::vector<uint8_t> * inputVectors = reinterpret_cast<std::vector<uint8_t>*>(vectorsAddress);
 
     // The number of vectors can be int here because a lucene segment number of total docs never crosses INT_MAX value
-    int numVectors = (int) (inputVectors->size() / (uint64_t) (dim / 8));
+    int numVectors = (int) (inputVectors->size() / (uint64_t) (indexInfo->dimension / 8));
     if(numVectors == 0) {
         throw std::runtime_error("Number of vectors cannot be 0");
     }
 
-    if (numIds != numVectors) {
-        throw std::runtime_error("Number of IDs does not match number of vectors");
-    }
-
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
-    faiss::IndexBinaryIDMap * idMap = reinterpret_cast<faiss::IndexBinaryIDMap *> (idMapAddress);
+    faiss::IndexBinaryIDMap * idMap = reinterpret_cast<faiss::IndexBinaryIDMap *> (indexInfo->indexAddress);
 
     // Add vectors
     idMap->add_with_ids(numVectors, inputVectors->data(), ids.data());
 }
 
 void BinaryIndexService::writeIndex(
-        int threadCount,
-        std::string indexPath,
-        jlong idMapAddress
+        IndexInfo * indexInfo
     ) {
     // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
-    if(threadCount != 0) {
-        omp_set_num_threads(threadCount);
+    if(indexInfo->threadCount != 0) {
+        omp_set_num_threads(indexInfo->threadCount);
     }
 
-    std::unique_ptr<faiss::IndexBinaryIDMap> idMap (reinterpret_cast<faiss::IndexBinaryIDMap *> (idMapAddress));
+    std::unique_ptr<faiss::IndexBinaryIDMap> idMap (reinterpret_cast<faiss::IndexBinaryIDMap *> (indexInfo->indexAddress));
 
     // Write the index to disk
-    faissMethods->writeIndexBinary(idMap.get(), indexPath.c_str());
+    faissMethods->writeIndexBinary(idMap.get(), indexInfo->indexPath.c_str());
 
     // Free the memory used by the index
     delete idMap->index;

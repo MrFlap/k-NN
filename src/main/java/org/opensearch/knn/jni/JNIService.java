@@ -26,60 +26,41 @@ import java.util.Map;
  */
 public class JNIService {
     /**
-     * Initialize an index for the native library. Takes in numDocs to
+     * Generate faiss index informaton.
+     *
+     * @param parameters parameters used to specify index
+     * @return memory address of index info
+     */
+    public static long genIndexInfo(Map<String, Object> parameters) {
+        if(IndexUtil.isBinaryIndex(KNNEngine.FAISS, parameters)) {
+            return FaissService.genIndexInfoBinary(parameters);
+        } else {
+            return FaissService.genIndexInfo(parameters);
+        }
+    }
+    /**
+     * Initialize a faiss index. Takes in numDocs to
      * allocate the correct amount of memory.
      *
-     * @param numDocs number of documents to be added
-     * @param dim dimension of the vector to be indexed
-     * @param parameters parameters to build index
-     * @param knnEngine knn engine
-     * @return address of the index in memory
+     * @param indexInfoAddress memory address of index info
      */
-    public static long initIndexFromScratch(long numDocs, int dim, Map<String, Object> parameters, KNNEngine knnEngine) {
-        if (KNNEngine.FAISS == knnEngine) {
-            if (IndexUtil.isBinaryIndex(knnEngine, parameters)) {
-                return FaissService.initBinaryIndex(numDocs, dim, parameters);
-            } else {
-                return FaissService.initIndex(numDocs, dim, parameters);
-            }
-        }
-
-        throw new IllegalArgumentException(
-            String.format(Locale.ROOT, "initIndexFromScratch not supported for provided engine : %s", knnEngine.getName())
-        );
+    public static void initIndexFromScratch(long indexInfoAddress) {
+        FaissService.initIndex(indexInfoAddress);
     }
 
     /**
      * Inserts to a faiss index.
      *
+     * @param indexInfoAddress address of native memory where index information is stored
      * @param docs ids of documents
      * @param vectorsAddress address of native memory where vectors are stored
-     * @param dimension dimension of the vector to be indexed
-     * @param parameters parameters to build index
-     * @param indexAddress address of native memory where index is stored
-     * @param knnEngine knn engine
      */
     public static void insertToIndex(
+        long indexInfoAddress,
         int[] docs,
-        long vectorsAddress,
-        int dimension,
-        Map<String, Object> parameters,
-        long indexAddress,
-        KNNEngine knnEngine
+        long vectorsAddress
     ) {
-        int threadCount = (int) parameters.getOrDefault(KNNConstants.INDEX_THREAD_QTY, 0);
-        if (KNNEngine.FAISS == knnEngine) {
-            if (IndexUtil.isBinaryIndex(knnEngine, parameters)) {
-                FaissService.insertToBinaryIndex(docs, vectorsAddress, dimension, indexAddress, threadCount);
-            } else {
-                FaissService.insertToIndex(docs, vectorsAddress, dimension, indexAddress, threadCount);
-            }
-            return;
-        }
-
-        throw new IllegalArgumentException(
-            String.format(Locale.ROOT, "insertToIndex not supported for provided engine : %s", knnEngine.getName())
-        );
+        FaissService.insertToIndex(indexInfoAddress, docs, vectorsAddress);
     }
 
     /**
@@ -90,20 +71,8 @@ public class JNIService {
      * @param knnEngine knn engine
      * @param parameters parameters to build index
      */
-    public static void writeIndex(String indexPath, long indexAddress, KNNEngine knnEngine, Map<String, Object> parameters) {
-        int threadCount = (int) parameters.getOrDefault(KNNConstants.INDEX_THREAD_QTY, 0);
-        if (KNNEngine.FAISS == knnEngine) {
-            if (IndexUtil.isBinaryIndex(knnEngine, parameters)) {
-                FaissService.writeBinaryIndex(indexAddress, indexPath, threadCount);
-            } else {
-                FaissService.writeIndex(indexAddress, indexPath, threadCount);
-            }
-            return;
-        }
-
-        throw new IllegalArgumentException(
-            String.format(Locale.ROOT, "writeIndex not supported for provided engine : %s", knnEngine.getName())
-        );
+    public static void writeIndex(long indexInfoAddress) {
+        FaissService.writeIndex(indexInfoAddress);
     }
 
     /**

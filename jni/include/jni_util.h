@@ -192,6 +192,9 @@ namespace knn_jni {
     extern const std::string PARAMETERS;
     extern const std::string TRAINING_DATASET_SIZE_LIMIT;
     extern const std::string INDEX_THREAD_QUANTITY;
+    extern const std::string PLANNED_NUM_DOCS;
+    extern const std::string DIMENSION;
+    extern const std::string INDEX_PATH;
 
     extern const std::string L2;
     extern const std::string L1;
