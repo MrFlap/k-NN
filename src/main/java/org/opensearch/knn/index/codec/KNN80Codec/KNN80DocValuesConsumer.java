@@ -7,7 +7,6 @@ package org.opensearch.knn.index.codec.KNN80Codec;
 
 import lombok.NonNull;
 import lombok.extern.log4j.Log4j2;
-import org.apache.lucene.store.ChecksumIndexInput;
 import org.opensearch.common.StopWatch;
 import org.opensearch.knn.index.util.KNNEngine;
 import org.opensearch.knn.indices.ModelCache;
@@ -26,14 +25,7 @@ import org.opensearch.knn.plugin.stats.KNNGraphValue;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 
-import static org.apache.lucene.codecs.CodecUtil.FOOTER_MAGIC;
 import static org.opensearch.knn.common.KNNConstants.MODEL_ID;
 
 /**
@@ -46,8 +38,6 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
 
     private final DocValuesConsumer delegatee;
     private final SegmentWriteState state;
-
-    private static final Long CRC32_CHECKSUM_SANITY = 0xFFFFFFFF00000000L;
 
     KNN80DocValuesConsumer(DocValuesConsumer delegatee, SegmentWriteState state) {
         this.delegatee = delegatee;
