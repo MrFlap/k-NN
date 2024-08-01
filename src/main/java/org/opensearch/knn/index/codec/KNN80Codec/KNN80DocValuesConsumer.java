@@ -87,7 +87,7 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
 
     public void addKNNBinaryField(FieldInfo field, DocValuesProducer valuesProducer, boolean isMerge, boolean isRefresh)
         throws IOException {
-        NativeIndexWriter.getWriter(field).createKNNIndex(field, valuesProducer, state, isMerge, isRefresh);
+        NativeIndexWriter.createKNNIndex(field, valuesProducer, state, isMerge, isRefresh);
     }
 
     /**

@@ -19,6 +19,9 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.IndexUtil;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.IndexBuilderMethods;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.NativeIndexInfo;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.NativeVectorInfo;
 import org.opensearch.knn.index.codec.transfer.VectorTransfer;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 import org.opensearch.knn.index.util.KNNEngine;
@@ -29,14 +32,15 @@ import org.opensearch.knn.jni.JNIService;
 import lombok.extern.log4j.Log4j2;
 
 import static org.opensearch.knn.common.KNNConstants.MODEL_ID;
+import static org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.getVectorTransfer;
 
 /**
  * Abstract class to build the KNN index from a template model and write it to disk
  */
 @Log4j2
-public class NativeIndexWriterTemplate extends NativeIndexWriter {
+public class NativeIndexWriterTemplate implements IndexBuilderMethods {
 
-    protected void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException {
+    public void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException {
         String modelId = indexInfo.getFieldInfo().attributes().get(MODEL_ID);
         Model model = ModelCache.getInstance().get(modelId);
         if (model.getModelBlob() == null) {
@@ -66,8 +70,7 @@ public class NativeIndexWriterTemplate extends NativeIndexWriter {
         });
     }
 
-    @Override
-    protected Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException {
+    public Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException {
         Map<String, Object> parameters = new HashMap<>();
         parameters.put(KNNConstants.INDEX_THREAD_QTY, KNNSettings.state().getSettingValue(KNNSettings.KNN_ALGO_PARAM_INDEX_THREAD_QTY));
         String modelId = fieldInfo.attributes().get(MODEL_ID);
@@ -78,9 +81,8 @@ public class NativeIndexWriterTemplate extends NativeIndexWriter {
         IndexUtil.updateVectorDataTypeToParameters(parameters, model.getModelMetadata().getVectorDataType());
         return parameters;
     }
-
-    @Override
-    protected NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException {
+    
+    public NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException {
         BinaryDocValues testValues = valuesProducer.getBinary(fieldInfo);
         testValues.nextDoc();
         BytesRef firstDoc = testValues.binaryValue();

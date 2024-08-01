@@ -25,6 +25,9 @@ import org.opensearch.knn.index.IndexUtil;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.IndexBuilderMethods;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.NativeIndexInfo;
+import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.NativeVectorInfo;
 import org.opensearch.knn.index.codec.transfer.VectorTransfer;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 import org.opensearch.knn.index.util.KNNEngine;
@@ -35,13 +38,15 @@ import lombok.extern.log4j.Log4j2;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
 import static org.opensearch.knn.index.util.Faiss.FAISS_BINARY_INDEX_DESCRIPTION_PREFIX;
 
+import static org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter.getVectorTransfer;
+
 /**
  * Class to build the KNN index from scratch and write it to disk
  */
 @Log4j2
-public class NativeIndexWriterScratch extends NativeIndexWriter {
+public class NativeIndexWriterScratch implements IndexBuilderMethods {
 
-    protected NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException {
+    public NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException {
         // Hack to get the data metrics from the first document. We account for this in KNNCodecUtil.
         BinaryDocValues testValues = valuesProducer.getBinary(fieldInfo);
         testValues.nextDoc();
@@ -64,7 +69,7 @@ public class NativeIndexWriterScratch extends NativeIndexWriter {
         return vectorInfo;
     }
 
-    protected Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException {
+    public Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException {
         Map<String, Object> parameters = new HashMap<>();
         Map<String, String> fieldAttributes = fieldInfo.attributes();
         String parametersString = fieldAttributes.get(KNNConstants.PARAMETERS);
@@ -111,7 +116,7 @@ public class NativeIndexWriterScratch extends NativeIndexWriter {
         return parameters;
     }
 
-    protected void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException {
+    public void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException {
         VectorTransfer vectorTransfer = getVectorTransfer(indexInfo.getVectorInfo().getVectorDataType());
         KNNCodecUtil.VectorBatch batch = KNNCodecUtil.getVectorBatch(values, vectorTransfer, false);
         AccessController.doPrivileged((PrivilegedAction<Void>) () -> {

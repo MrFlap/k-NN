@@ -54,7 +54,7 @@ public abstract class NativeIndexWriter {
      */
     @Builder
     @Value
-    protected static class NativeVectorInfo {
+    public static class NativeVectorInfo {
         private VectorDataType vectorDataType;
         private int dimension;
         private SerializationMode serializationMode;
@@ -65,7 +65,7 @@ public abstract class NativeIndexWriter {
      */
     @Builder
     @Value
-    protected static class NativeIndexInfo {
+    public static class NativeIndexInfo {
         private FieldInfo fieldInfo;
         private KNNEngine knnEngine;
         private int numDocs;
@@ -75,13 +75,41 @@ public abstract class NativeIndexWriter {
         private String indexPath;
     }
 
+    protected static interface IndexBuilderMethods {
+        /**
+         * Method that gets the native vector info
+         * @param fieldInfo
+         * @param valuesProducer
+         * @return native vector info
+         * @throws IOException
+         */
+        public NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException;
+
+        /**
+         * Method that generates extra index parameters to be passed to the native library
+         * @param fieldInfo
+         * @param knnEngine
+         * @return extra index parameters to be passed to the native library
+         * @throws IOException
+         */
+        public Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException;
+
+        /**
+         * Method that makes a native index given the parameters from indexInfo
+         * @param indexInfo
+         * @param values
+         * @throws IOException
+         */
+        public void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException;
+    }
+
     /**
      * Gets the correct writer type from fieldInfo
      *
      * @param fieldInfo
      * @return correct NativeIndexWriter to make index specified in fieldInfo
      */
-    public static NativeIndexWriter getWriter(FieldInfo fieldInfo) {
+    public static IndexBuilderMethods getBuilderMethods(FieldInfo fieldInfo) {
         final KNNEngine knnEngine = getKNNEngine(fieldInfo);
         boolean fromScratch = !fieldInfo.attributes().containsKey(MODEL_ID);
         boolean iterative = fromScratch && KNNEngine.FAISS == knnEngine;
@@ -95,6 +123,19 @@ public abstract class NativeIndexWriter {
     }
 
     /**
+     * Gets the correct transfer type given a vector data type.
+     * 
+     * @param vectorDataType
+     * @return vector transfer
+     */
+    public static VectorTransfer getVectorTransfer(VectorDataType vectorDataType) {
+        if (VectorDataType.BINARY == vectorDataType) {
+            return new VectorTransferByte(KNNSettings.getVectorStreamingMemoryLimit().getBytes());
+        }
+        return new VectorTransferFloat(KNNSettings.getVectorStreamingMemoryLimit().getBytes());
+    }
+
+    /**
      * Method for creating a KNN index in the specified native library
      *
      * @param fieldInfo
@@ -104,7 +145,7 @@ public abstract class NativeIndexWriter {
      * @param isRefresh
      * @throws IOException
      */
-    public void createKNNIndex(
+    public static void createKNNIndex(
         FieldInfo fieldInfo,
         DocValuesProducer valuesProducer,
         SegmentWriteState state,
@@ -112,6 +153,7 @@ public abstract class NativeIndexWriter {
         boolean isRefresh
     ) throws IOException {
         BinaryDocValues values = valuesProducer.getBinary(fieldInfo);
+        IndexBuilderMethods builderMethods = getBuilderMethods(fieldInfo);
         if (KNNCodecUtil.getTotalLiveDocsCount(values) == 0) {
             log.debug("No live docs for field " + fieldInfo.name);
             return;
@@ -129,51 +171,18 @@ public abstract class NativeIndexWriter {
         ).toString();
 
         state.directory.createOutput(engineFileName, state.context).close();
-        NativeIndexInfo indexInfo = getIndexInfo(fieldInfo, valuesProducer, indexPath);
+        NativeIndexInfo indexInfo = getIndexInfo(fieldInfo, valuesProducer, indexPath, builderMethods);
         if (isMerge) {
             startMergeStats(indexInfo.numDocs, indexInfo.arraySize);
         }
         if (isRefresh) {
             recordRefreshStats();
         }
-        createIndex(indexInfo, values);
+        builderMethods.createIndex(indexInfo, values);
         if (isMerge) {
             endMergeStats(indexInfo.numDocs, indexInfo.arraySize);
         }
         writeFooter(indexPath, engineFileName, state);
-    }
-
-    /**
-     * Method that makes a native index given the parameters from indexInfo
-     * @param indexInfo
-     * @param values
-     * @throws IOException
-     */
-    protected abstract void createIndex(NativeIndexInfo indexInfo, BinaryDocValues values) throws IOException;
-
-    /**
-     * Method that generates extra index parameters to be passed to the native library
-     * @param fieldInfo
-     * @param knnEngine
-     * @return extra index parameters to be passed to the native library
-     * @throws IOException
-     */
-    protected abstract Map<String, Object> getParameters(FieldInfo fieldInfo, KNNEngine knnEngine) throws IOException;
-
-    /**
-     * Method that gets the native vector info
-     * @param fieldInfo
-     * @param valuesProducer
-     * @return native vector info
-     * @throws IOException
-     */
-    protected abstract NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException;
-
-    protected VectorTransfer getVectorTransfer(VectorDataType vectorDataType) {
-        if (VectorDataType.BINARY == vectorDataType) {
-            return new VectorTransferByte(KNNSettings.getVectorStreamingMemoryLimit().getBytes());
-        }
-        return new VectorTransferFloat(KNNSettings.getVectorStreamingMemoryLimit().getBytes());
     }
 
     /**
@@ -184,9 +193,9 @@ public abstract class NativeIndexWriter {
      * @return native index info
      * @throws IOException
      */
-    private NativeIndexInfo getIndexInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer, String indexPath) throws IOException {
+    private static NativeIndexInfo getIndexInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer, String indexPath, IndexBuilderMethods builderMethods) throws IOException {
         int numDocs = (int) KNNCodecUtil.getTotalLiveDocsCount(valuesProducer.getBinary(fieldInfo));
-        NativeVectorInfo vectorInfo = getVectorInfo(fieldInfo, valuesProducer);
+        NativeVectorInfo vectorInfo = builderMethods.getVectorInfo(fieldInfo, valuesProducer);
         KNNEngine knnEngine = getKNNEngine(fieldInfo);
         NativeIndexInfo indexInfo = NativeIndexInfo.builder()
             .fieldInfo(fieldInfo)
@@ -194,13 +203,13 @@ public abstract class NativeIndexWriter {
             .numDocs((int) numDocs)
             .vectorInfo(vectorInfo)
             .arraySize(numDocs * getBytesPerVector(vectorInfo))
-            .parameters(getParameters(fieldInfo, knnEngine))
+            .parameters(builderMethods.getParameters(fieldInfo, knnEngine))
             .indexPath(indexPath)
             .build();
         return indexInfo;
     }
 
-    private long getBytesPerVector(NativeVectorInfo vectorInfo) {
+    private static long getBytesPerVector(NativeVectorInfo vectorInfo) {
         if (vectorInfo.vectorDataType == VectorDataType.BINARY) {
             return vectorInfo.dimension / 8;
         } else {
@@ -218,7 +227,7 @@ public abstract class NativeIndexWriter {
         return KNNEngine.getEngine(engineName);
     }
 
-    private void startMergeStats(int numDocs, long arraySize) {
+    private static void startMergeStats(int numDocs, long arraySize) {
         KNNGraphValue.MERGE_CURRENT_OPERATIONS.increment();
         KNNGraphValue.MERGE_CURRENT_DOCS.incrementBy(numDocs);
         KNNGraphValue.MERGE_CURRENT_SIZE_IN_BYTES.incrementBy(arraySize);
@@ -227,23 +236,23 @@ public abstract class NativeIndexWriter {
         KNNGraphValue.MERGE_TOTAL_SIZE_IN_BYTES.incrementBy(arraySize);
     }
 
-    private void endMergeStats(int numDocs, long arraySize) {
+    private static void endMergeStats(int numDocs, long arraySize) {
         KNNGraphValue.MERGE_CURRENT_OPERATIONS.decrement();
         KNNGraphValue.MERGE_CURRENT_DOCS.decrementBy(numDocs);
         KNNGraphValue.MERGE_CURRENT_SIZE_IN_BYTES.decrementBy(arraySize);
     }
 
-    private void recordRefreshStats() {
+    private static void recordRefreshStats() {
         KNNGraphValue.REFRESH_TOTAL_OPERATIONS.increment();
     }
 
-    private boolean isChecksumValid(long value) {
+    private static boolean isChecksumValid(long value) {
         // Check pulled from
         // https://github.com/apache/lucene/blob/branch_9_0/lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java#L644-L647
         return (value & CRC32_CHECKSUM_SANITY) != 0;
     }
-    
-    private void writeFooter(String indexPath, String engineFileName, SegmentWriteState state) throws IOException {
+
+    private static void writeFooter(String indexPath, String engineFileName, SegmentWriteState state) throws IOException {
         // Opens the engine file that was created and appends a footer to it. The footer consists of
         // 1. A Footer magic number (int - 4 bytes)
         // 2. A checksum algorithm id (int - 4 bytes)
