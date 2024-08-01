@@ -81,7 +81,7 @@ public class NativeIndexWriterTemplate implements IndexBuilderMethods {
         IndexUtil.updateVectorDataTypeToParameters(parameters, model.getModelMetadata().getVectorDataType());
         return parameters;
     }
-    
+
     public NativeVectorInfo getVectorInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer) throws IOException {
         BinaryDocValues testValues = valuesProducer.getBinary(fieldInfo);
         testValues.nextDoc();

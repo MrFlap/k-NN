@@ -124,7 +124,7 @@ public abstract class NativeIndexWriter {
 
     /**
      * Gets the correct transfer type given a vector data type.
-     * 
+     *
      * @param vectorDataType
      * @return vector transfer
      */
@@ -193,7 +193,12 @@ public abstract class NativeIndexWriter {
      * @return native index info
      * @throws IOException
      */
-    private static NativeIndexInfo getIndexInfo(FieldInfo fieldInfo, DocValuesProducer valuesProducer, String indexPath, IndexBuilderMethods builderMethods) throws IOException {
+    private static NativeIndexInfo getIndexInfo(
+        FieldInfo fieldInfo,
+        DocValuesProducer valuesProducer,
+        String indexPath,
+        IndexBuilderMethods builderMethods
+    ) throws IOException {
         int numDocs = (int) KNNCodecUtil.getTotalLiveDocsCount(valuesProducer.getBinary(fieldInfo));
         NativeVectorInfo vectorInfo = builderMethods.getVectorInfo(fieldInfo, valuesProducer);
         KNNEngine knnEngine = getKNNEngine(fieldInfo);
