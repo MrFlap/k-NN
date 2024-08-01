@@ -142,40 +142,4 @@ class KNN80DocValuesConsumer extends DocValuesConsumer implements Closeable {
     public void close() throws IOException {
         delegatee.close();
     }
-
-    private void writeFooter(String indexPath, String engineFileName) throws IOException {
-        // Opens the engine file that was created and appends a footer to it. The footer consists of
-        // 1. A Footer magic number (int - 4 bytes)
-        // 2. A checksum algorithm id (int - 4 bytes)
-        // 3. A checksum (long - bytes)
-        // The checksum is computed on all the bytes written to the file up to that point.
-        // Logic where footer is written in Lucene can be found here:
-        // https://github.com/apache/lucene/blob/branch_9_0/lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java#L390-L412
-        OutputStream os = Files.newOutputStream(Paths.get(indexPath), StandardOpenOption.APPEND);
-        ByteBuffer byteBuffer = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
-        byteBuffer.putInt(FOOTER_MAGIC);
-        byteBuffer.putInt(0);
-        os.write(byteBuffer.array());
-        os.flush();
-
-        ChecksumIndexInput checksumIndexInput = state.directory.openChecksumInput(engineFileName, state.context);
-        checksumIndexInput.seek(checksumIndexInput.length());
-        long value = checksumIndexInput.getChecksum();
-        checksumIndexInput.close();
-
-        if (isChecksumValid(value)) {
-            throw new IllegalStateException("Illegal CRC-32 checksum: " + value + " (resource=" + os + ")");
-        }
-
-        // Write the CRC checksum to the end of the OutputStream and close the stream
-        byteBuffer.putLong(0, value);
-        os.write(byteBuffer.array());
-        os.close();
-    }
-
-    private boolean isChecksumValid(long value) {
-        // Check pulled from
-        // https://github.com/apache/lucene/blob/branch_9_0/lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java#L644-L647
-        return (value & CRC32_CHECKSUM_SANITY) != 0;
-    }
 }
