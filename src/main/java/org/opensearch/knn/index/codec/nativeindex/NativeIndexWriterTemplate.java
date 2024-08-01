@@ -99,11 +99,7 @@ public class NativeIndexWriterTemplate implements IndexBuilderMethods {
         } else {
             dimension = firstDoc.length / 4;
         }
-        NativeVectorInfo vectorInfo = NativeVectorInfo.builder()
-            .vectorDataType(vectorDataType)
-            .dimension(dimension)
-            .serializationMode(vectorTransfer.getSerializationMode(firstDoc))
-            .build();
+        NativeVectorInfo vectorInfo = NativeVectorInfo.builder().vectorDataType(vectorDataType).dimension(dimension).build();
         return vectorInfo;
     }
 }
