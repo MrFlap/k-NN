@@ -58,11 +58,10 @@ public:
     /**
      * Write index to disk
      *
-     * @param threadCount number of thread count to be used while adding data
      * @param indexPath path to write index
      * @param idMap memory address of the native index object
      */
-    virtual void writeIndex(int threadCount, std::string indexPath, jlong idMapAddress);
+    virtual void writeIndex(std::string indexPath, jlong idMapAddress);
     virtual ~IndexService() = default;
 protected:
     std::unique_ptr<FaissMethods> faissMethods;
@@ -103,22 +102,16 @@ public:
      * @param threadCount number of thread count to be used while adding data
      * @param vectorsAddress memory address which is holding vector data
      * @param idMap a map of document id and vector id
-     * @param parameters parameters to be applied to faiss index
      */
     virtual void insertToIndex(int dim, int numIds, int threadCount, int64_t vectorsAddress, std::vector<int64_t> &ids, jlong idMapAddress) override;
     /**
      * Write index to disk
      *
-     * @param jniUtil jni util
-     * @param env jni environment
-     * @param metric space type for distance calculation
-     * @param indexDescription index description to be used by faiss index factory
-     * @param threadCount number of thread count to be used while adding data
      * @param indexPath path to write index
-     * @param idMap a map of document id and vector id
+     * @param idMapAddress the address of the native index object
      * @param parameters parameters to be applied to faiss index
      */
-    virtual void writeIndex(int threadCount, std::string indexPath, jlong idMapAddress) override;
+    virtual void writeIndex(std::string indexPath, jlong idMapAddress) override;
     virtual ~BinaryIndexService() = default;
 };
 
