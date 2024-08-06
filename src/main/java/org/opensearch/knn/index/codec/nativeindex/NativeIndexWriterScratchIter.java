@@ -56,6 +56,9 @@ public class NativeIndexWriterScratchIter extends NativeIndexWriterScratch {
                 break;
             }
         }
+        if (future != null) {
+            future.join();
+        }
         writeIndex(indexAddress, indexInfo.getIndexPath(), indexInfo.getKnnEngine(), indexInfo.getParameters());
     }
 
