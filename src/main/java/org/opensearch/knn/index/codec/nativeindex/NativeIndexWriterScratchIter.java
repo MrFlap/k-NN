@@ -40,7 +40,7 @@ public class NativeIndexWriterScratchIter extends NativeIndexWriterScratch {
                 getVectorTransfer(indexInfo.getVectorInfo().getVectorDataType()),
                 true
             );
-            if(future != null) {
+            if (future != null) {
                 future.join();
             }
             // https://stackoverflow.com/questions/44409962/throwing-exception-from-completablefuture
