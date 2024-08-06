@@ -9,6 +9,8 @@ import java.io.IOException;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 import org.apache.lucene.index.BinaryDocValues;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
@@ -31,13 +33,25 @@ public class NativeIndexWriterScratchIter extends NativeIndexWriterScratch {
             indexInfo.getKnnEngine(),
             indexInfo.getParameters()
         );
+        CompletableFuture<Integer> future = null;
         while (true) {
             KNNCodecUtil.VectorBatch batch = KNNCodecUtil.getVectorBatch(
                 values,
                 getVectorTransfer(indexInfo.getVectorInfo().getVectorDataType()),
                 true
             );
-            insertToIndex(batch, indexInfo.getKnnEngine(), indexAddress, indexInfo.getParameters());
+            if(future != null) {
+                future.join();
+            }
+            // https://stackoverflow.com/questions/44409962/throwing-exception-from-completablefuture
+            future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    insertToIndex(batch, indexInfo.getKnnEngine(), indexAddress, indexInfo.getParameters());
+                } catch (IOException e) {
+                    throw new CompletionException(e);
+                }
+                return 1;
+            });
             if (batch.finished) {
                 break;
             }
