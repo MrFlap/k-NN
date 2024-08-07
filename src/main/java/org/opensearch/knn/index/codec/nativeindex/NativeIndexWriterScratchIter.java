@@ -33,7 +33,7 @@ public class NativeIndexWriterScratchIter extends NativeIndexWriterScratch {
             indexInfo.getKnnEngine(),
             indexInfo.getParameters()
         );
-        CompletableFuture<Integer> future = null;
+        CompletableFuture<Void> future = null;
         while (true) {
             KNNCodecUtil.VectorBatch batch = KNNCodecUtil.getVectorBatch(
                 values,
@@ -44,13 +44,12 @@ public class NativeIndexWriterScratchIter extends NativeIndexWriterScratch {
                 future.join();
             }
             // https://stackoverflow.com/questions/44409962/throwing-exception-from-completablefuture
-            future = CompletableFuture.supplyAsync(() -> {
+            future = CompletableFuture.runAsync(() -> {
                 try {
                     insertToIndex(batch, indexInfo.getKnnEngine(), indexAddress, indexInfo.getParameters());
                 } catch (IOException e) {
                     throw new CompletionException(e);
                 }
-                return 1;
             });
             if (batch.finished) {
                 break;
