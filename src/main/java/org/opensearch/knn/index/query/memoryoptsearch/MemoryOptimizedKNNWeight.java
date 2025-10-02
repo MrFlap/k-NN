@@ -55,7 +55,7 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
             // ANN Search
             if (query.getParentsFilter() == null) {
                 // Non-nested case
-                this.knnCollectorManager = new TopKnnCollectorManager(k, searcher);
+                this.knnCollectorManager = new TuningTopKnnCollectorManager(k, searcher);
             } else {
                 // Nested case
                 this.knnCollectorManager = new DiversifyingNearestChildrenKnnCollectorManager(k, query.getParentsFilter(), searcher);
