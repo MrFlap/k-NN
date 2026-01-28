@@ -53,6 +53,7 @@ public enum StatNames {
     GRAPH_STATS("graph_stats"),
     REFRESH("refresh"),
     MERGE("merge"),
+    CLUMPING("clumping"),
     REMOTE_VECTOR_INDEX_BUILD_STATS("remote_vector_index_build_stats"),
     CLIENT_STATS("client_stats"),
     REPOSITORY_STATS("repository_stats"),

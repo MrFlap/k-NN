@@ -9,6 +9,7 @@ import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.store.IndexOutput;
 import org.opensearch.common.Nullable;
@@ -102,7 +103,7 @@ public class NativeIndexWriter {
      * @throws IOException
      */
     public void flushIndex(final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier, int totalLiveDocs) throws IOException {
-        buildAndWriteIndex(knnVectorValuesSupplier, totalLiveDocs, true);
+        buildAndWriteIndex(knnVectorValuesSupplier, totalLiveDocs, true, null);
         recordRefreshStats();
     }
 
@@ -112,6 +113,18 @@ public class NativeIndexWriter {
      * @throws IOException
      */
     public void mergeIndex(final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier, int totalLiveDocs) throws IOException {
+        mergeIndex(knnVectorValuesSupplier, totalLiveDocs, null);
+    }
+
+    /**
+     * Merges kNN index with merge state for clumping support
+     * @param knnVectorValuesSupplier
+     * @param totalLiveDocs
+     * @param mergeState The merge state containing source segment information (for clumping)
+     * @throws IOException
+     */
+    public void mergeIndex(final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier, int totalLiveDocs, MergeState mergeState)
+        throws IOException {
         KNNVectorValues<?> knnVectorValues = knnVectorValuesSupplier.get();
         initializeVectorValues(knnVectorValues);
         if (knnVectorValues.docId() == NO_MORE_DOCS) {
@@ -122,12 +135,16 @@ public class NativeIndexWriter {
 
         long bytesPerVector = knnVectorValues.bytesPerVector();
         startMergeStats(totalLiveDocs, bytesPerVector);
-        buildAndWriteIndex(knnVectorValuesSupplier, totalLiveDocs, false);
+        buildAndWriteIndex(knnVectorValuesSupplier, totalLiveDocs, false, mergeState);
         endMergeStats(totalLiveDocs, bytesPerVector);
     }
 
-    private void buildAndWriteIndex(final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier, int totalLiveDocs, boolean isFlush)
-        throws IOException {
+    private void buildAndWriteIndex(
+        final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier,
+        int totalLiveDocs,
+        boolean isFlush,
+        MergeState mergeState
+    ) throws IOException {
         if (totalLiveDocs == 0) {
             log.debug("No live docs for field {}", fieldInfo.name);
             return;
@@ -148,7 +165,8 @@ public class NativeIndexWriter {
                 knnEngine,
                 knnVectorValuesSupplier,
                 totalLiveDocs,
-                isFlush
+                isFlush,
+                mergeState
             );
             NativeIndexBuildStrategy indexBuilder = indexBuilderFactory.getBuildStrategy(
                 fieldInfo,
@@ -170,7 +188,8 @@ public class NativeIndexWriter {
         KNNEngine knnEngine,
         Supplier<KNNVectorValues<?>> knnVectorValuesSupplier,
         int totalLiveDocs,
-        boolean isFlush
+        boolean isFlush,
+        MergeState mergeState
     ) throws IOException {
         final Map<String, Object> parameters;
         VectorDataType vectorDataType;
@@ -197,6 +216,7 @@ public class NativeIndexWriter {
             .totalLiveDocs(totalLiveDocs)
             .segmentWriteState(state)
             .isFlush(isFlush)
+            .mergeState(mergeState)
             .build();
     }
 

@@ -61,6 +61,7 @@ import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createSto
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.useFullFieldNameValidation;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.validateIfCircuitBreakerIsNotTriggered;
 import static org.opensearch.knn.index.mapper.ModelFieldMapper.UNSET_MODEL_DIMENSION_IDENTIFIER;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 
 /**
  * Field Mapper for KNN vector type. Implementations of this class define what needs to be stored in Lucene's fieldType.
@@ -201,6 +202,53 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             KNNEngine.UNDEFINED.getName()
         ).setValidator(KNNEngine::getEngine);
 
+        /**
+         * clumpingFactor parameter allows a user to enable clumping optimization for the k-NN field.
+         * When set, only a subset of vectors (marker vectors) are indexed in the main k-NN index,
+         * while the remaining vectors (hidden vectors) are stored in a separate file on disk.
+         * The clumping factor determines the ratio of total vectors to marker vectors.
+         * A clumping factor of N means approximately 1/N vectors become markers.
+         * Valid range is 2-100. Null means clumping is disabled.
+         * 
+         * Mapping format: { "clumping": { "factor": 8 } }
+         */
+        protected final Parameter<Integer> clumpingFactor = new Parameter<>(
+            KNNConstants.CLUMPING_PARAMETER,
+            false,
+            () -> null,  // null means disabled
+            (n, c, o) -> {
+                if (o == null) {
+                    return null;
+                }
+                // Handle nested clumping object: { "clumping": { "factor": 8 } }
+                if (o instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> clumpingMap = (Map<String, Object>) o;
+                    Object factorValue = clumpingMap.get(KNNConstants.CLUMPING_FACTOR);
+                    if (factorValue == null) {
+                        throw new IllegalArgumentException(
+                            String.format(Locale.ROOT, "Clumping configuration must contain '%s' parameter", KNNConstants.CLUMPING_FACTOR)
+                        );
+                    }
+                    o = factorValue;
+                }
+                int value = XContentMapValues.nodeIntegerValue(o);
+                if (value < ClumpingContext.MIN_CLUMPING_FACTOR || value > ClumpingContext.MAX_CLUMPING_FACTOR) {
+                    throw new IllegalArgumentException(
+                        String.format(
+                            Locale.ROOT,
+                            "Clumping factor must be between %d and %d, got %d",
+                            ClumpingContext.MIN_CLUMPING_FACTOR,
+                            ClumpingContext.MAX_CLUMPING_FACTOR,
+                            value
+                        )
+                    );
+                }
+                return value;
+            },
+            m -> toType(m).originalMappingParameters.getClumpingFactor()
+        );
+
         protected final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         protected ModelDao modelDao;
@@ -255,7 +303,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 mode,
                 compressionLevel,
                 topLevelSpaceType,
-                topLevelEngine
+                topLevelEngine,
+                clumpingFactor
             );
         }
 

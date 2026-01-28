@@ -16,6 +16,7 @@ import org.opensearch.core.xcontent.XContentLocation;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
@@ -35,10 +36,13 @@ import static org.opensearch.index.query.AbstractQueryBuilder.NAME_FIELD;
 import static org.opensearch.index.query.AbstractQueryBuilder.parseInnerQueryBuilder;
 import static org.opensearch.knn.common.KNNConstants.EXPAND_NESTED;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER;
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_PARAMETER;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.EXPAND_NESTED_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.RESCORE_FIELD;
+import static org.opensearch.knn.index.query.KNNQueryBuilder.CLUMPING_FIELD;
 import static org.opensearch.knn.index.query.parser.RescoreParser.RESCORE_PARAMETER;
 import static org.opensearch.knn.index.query.rescore.RescoreContext.EXPLICITLY_DISABLED_RESCORE_CONTEXT;
+import static org.opensearch.knn.index.query.clumping.ClumpingContext.EXPLICITLY_DISABLED_CLUMPING_CONTEXT;
 import static org.opensearch.knn.index.util.IndexUtil.isClusterOnOrAfterMinRequiredVersion;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.FILTER_FIELD;
 import static org.opensearch.knn.index.query.KNNQueryBuilder.IGNORE_UNMAPPED_FIELD;
@@ -106,6 +110,24 @@ public final class KNNQueryBuilderParser {
             }
         }, RESCORE_FIELD, ObjectParser.ValueType.OBJECT_OR_BOOLEAN);
 
+        // Clumping parameter parsing - follows the same pattern as rescore
+        internalParser.declareField((p, v, c) -> {
+            BiConsumer<KNNQueryBuilder.Builder, ClumpingContext> consumer = KNNQueryBuilder.Builder::clumpingContext;
+            BiFunction<XContentParser, Void, ClumpingContext> objectParser = (_p, _v) -> ClumpingParser.fromXContent(_p);
+            Supplier<ClumpingContext> defaultValue = ClumpingContext::getDefault;
+            if (p.currentToken() == XContentParser.Token.VALUE_BOOLEAN) {
+                if (p.booleanValue()) {
+                    consumer.accept(v, defaultValue.get());
+                } else {
+                    // If the user specifies false, we explicitly set to null so we don't
+                    // accidentally resolve.
+                    consumer.accept(v, EXPLICITLY_DISABLED_CLUMPING_CONTEXT);
+                }
+            } else {
+                consumer.accept(v, objectParser.apply(p, c));
+            }
+        }, CLUMPING_FIELD, ObjectParser.ValueType.OBJECT_OR_BOOLEAN);
+
         internalParser.declareBoolean(KNNQueryBuilder.Builder::expandNested, EXPAND_NESTED_FIELD);
 
         // Declare fields that cannot be set at the same time. Right now, rescore and radial is not supported
@@ -151,6 +173,10 @@ public final class KNNQueryBuilderParser {
             builder.rescoreContext(RescoreParser.streamInput(in));
         }
 
+        if (minClusterVersionCheck.apply(CLUMPING_PARAMETER)) {
+            builder.clumpingContext(ClumpingParser.streamInput(in));
+        }
+
         if (minClusterVersionCheck.apply(EXPAND_NESTED)) {
             builder.expandNested(in.readOptionalBoolean());
         }
@@ -190,6 +216,9 @@ public final class KNNQueryBuilderParser {
         }
         if (minClusterVersionCheck.apply(RESCORE_PARAMETER)) {
             RescoreParser.streamOutput(out, builder.getRescoreContext());
+        }
+        if (minClusterVersionCheck.apply(CLUMPING_PARAMETER)) {
+            ClumpingParser.streamOutput(out, builder.getClumpingContext());
         }
         if (minClusterVersionCheck.apply(EXPAND_NESTED)) {
             out.writeOptionalBoolean(builder.getExpandNested());
@@ -264,6 +293,9 @@ public final class KNNQueryBuilderParser {
         }
         if (knnQueryBuilder.getRescoreContext() != null) {
             RescoreParser.doXContent(builder, knnQueryBuilder.getRescoreContext());
+        }
+        if (knnQueryBuilder.getClumpingContext() != null) {
+            ClumpingParser.doXContent(builder, knnQueryBuilder.getClumpingContext());
         }
 
         builder.field(BOOST_FIELD.getPreferredName(), knnQueryBuilder.boost());

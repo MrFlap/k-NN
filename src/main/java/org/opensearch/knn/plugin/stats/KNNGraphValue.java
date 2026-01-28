@@ -20,7 +20,12 @@ public enum KNNGraphValue {
     MERGE_TOTAL_OPERATIONS("total"),
     MERGE_TOTAL_TIME_IN_MILLIS("total_time_in_millis"),
     MERGE_TOTAL_DOCS("total_docs"),
-    MERGE_TOTAL_SIZE_IN_BYTES("total_size_in_bytes");
+    MERGE_TOTAL_SIZE_IN_BYTES("total_size_in_bytes"),
+    // Clumping statistics
+    CLUMPING_TOTAL_MARKER_COUNT("total_marker_count"),
+    CLUMPING_TOTAL_HIDDEN_VECTOR_COUNT("total_hidden_vector_count"),
+    CLUMPING_TOTAL_FILE_SIZE_IN_BYTES("total_file_size_in_bytes"),
+    CLUMPING_TOTAL_SEGMENTS("total_segments");
 
     private String name;
     private AtomicLong value;

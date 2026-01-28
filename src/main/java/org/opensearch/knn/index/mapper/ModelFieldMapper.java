@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.MODEL_ID;
 import static org.opensearch.knn.common.KNNConstants.QFRAMEWORK_CONFIG;
 
@@ -115,6 +116,11 @@ public class ModelFieldMapper extends KNNVectorFieldMapper {
                 return indexCreatedVersion;
             }
 
+            @Override
+            public Optional<Integer> getClumpingFactor() {
+                return Optional.ofNullable(originalMappingParameters.getClumpingFactor());
+            }
+
             // ModelMetadata relies on cluster state which may not be available during field mapper creation. Thus,
             // we lazily initialize it.
             private void initFromModelMetadata() {
@@ -174,6 +180,13 @@ public class ModelFieldMapper extends KNNVectorFieldMapper {
 
         this.fieldType = new FieldType(KNNVectorFieldMapper.Defaults.FIELD_TYPE);
         this.fieldType.putAttribute(MODEL_ID, modelId);
+        
+        // Conditionally add clumping factor if enabled
+        Integer clumpingFactor = originalMappingParameters.getClumpingFactor();
+        if (clumpingFactor != null) {
+            this.fieldType.putAttribute(CLUMPING_PARAMETER, String.valueOf(clumpingFactor));
+        }
+        
         this.useLuceneBasedVectorField = KNNVectorFieldMapperUtil.useLuceneKNNVectorsFormat(this.indexCreatedVersion);
     }
 

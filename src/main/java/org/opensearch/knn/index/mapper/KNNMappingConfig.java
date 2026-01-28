@@ -76,4 +76,15 @@ public interface KNNMappingConfig {
     default KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
         return null;
     }
+
+    /**
+     * Returns the clumping factor if clumping is enabled for this field.
+     * Clumping is an optimization technique that reduces the main k-NN index size
+     * by only indexing a subset of vectors (marker vectors).
+     *
+     * @return Optional containing the clumping factor if clumping is enabled, otherwise empty
+     */
+    default Optional<Integer> getClumpingFactor() {
+        return Optional.empty();
+    }
 }

@@ -171,7 +171,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             doAnswer(answer -> {
                 Thread.sleep(2); // Need this for KNNGraph value assertion, removing this will fail the assertion
                 return null;
-            }).when(nativeIndexWriter).mergeIndex(any(), anyInt());
+            }).when(nativeIndexWriter).mergeIndex(any(), anyInt(), any());
 
             // When
             objectUnderTest.mergeOneField(fieldInfo, mergeState);
@@ -180,7 +180,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             verify(flatVectorsWriter).mergeOneField(fieldInfo, mergeState);
             assertEquals(0, knn990QuantWriterMockedConstruction.constructed().size());
             if (!mergedVectors.isEmpty()) {
-                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size());
+                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size(), mergeState);
                 assertTrue(KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.getValue() > 0L);
                 knnVectorValuesFactoryMockedStatic.verify(
                     () -> KNNVectorValuesFactory.getKNNVectorValuesSupplierForMerge(VectorDataType.FLOAT, fieldInfo, mergeState),
@@ -242,7 +242,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             doAnswer(answer -> {
                 Thread.sleep(2); // Need this for KNNGraph value assertion, removing this will fail the assertion
                 return null;
-            }).when(nativeIndexWriter).mergeIndex(any(), anyInt());
+            }).when(nativeIndexWriter).mergeIndex(any(), anyInt(), any());
 
             // When
             nativeEngineWriter.mergeOneField(fieldInfo, mergeState);
@@ -304,7 +304,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             doAnswer(answer -> {
                 Thread.sleep(2); // Need this for KNNGraph value assertion, removing this will fail the assertion
                 return null;
-            }).when(nativeIndexWriter).mergeIndex(any(), anyInt());
+            }).when(nativeIndexWriter).mergeIndex(any(), anyInt(), any());
 
             // When
             nativeEngineWriter.mergeOneField(fieldInfo, mergeState);
@@ -313,7 +313,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             verify(flatVectorsWriter).mergeOneField(fieldInfo, mergeState);
             assertEquals(0, knn990QuantWriterMockedConstruction.constructed().size());
             if (!mergedVectors.isEmpty()) {
-                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size());
+                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size(), mergeState);
             } else {
                 verifyNoInteractions(nativeIndexWriter);
             }
@@ -376,7 +376,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             doAnswer(answer -> {
                 Thread.sleep(2); // Need this for KNNGraph value assertion, removing this will fail the assertion
                 return null;
-            }).when(nativeIndexWriter).mergeIndex(any(), anyInt());
+            }).when(nativeIndexWriter).mergeIndex(any(), anyInt(), any());
 
             // When
             objectUnderTest.mergeOneField(fieldInfo, mergeState);
@@ -386,7 +386,7 @@ public class NativeEngines990KnnVectorsWriterMergeTests extends OpenSearchTestCa
             if (!mergedVectors.isEmpty()) {
                 verify(knn990QuantWriterMockedConstruction.constructed().get(0)).writeHeader(segmentWriteState);
                 verify(knn990QuantWriterMockedConstruction.constructed().get(0)).writeState(0, quantizationState);
-                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size());
+                verify(nativeIndexWriter).mergeIndex(knnVectorValuesSupplier, mergedVectors.size(), mergeState);
                 assertTrue(KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.getValue() > 0L);
                 knnVectorValuesFactoryMockedStatic.verify(
                     () -> KNNVectorValuesFactory.getKNNVectorValuesSupplierForMerge(VectorDataType.FLOAT, fieldInfo, mergeState),

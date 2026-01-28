@@ -8,6 +8,7 @@ package org.opensearch.knn.index.codec.nativeindex.model;
 import lombok.Builder;
 import lombok.ToString;
 import lombok.Value;
+import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.VectorDataType;
@@ -20,7 +21,7 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 @Value
-@Builder
+@Builder(toBuilder = true)
 @ToString
 public class BuildIndexParams {
     String fieldName;
@@ -37,4 +38,10 @@ public class BuildIndexParams {
     int totalLiveDocs;
     SegmentWriteState segmentWriteState;
     boolean isFlush;
+    /**
+     * The merge state for merge operations. This is null for flush operations.
+     * Used by ClumpingIndexBuildStrategy to read hidden vectors from source segments.
+     */
+    @Nullable
+    MergeState mergeState;
 }

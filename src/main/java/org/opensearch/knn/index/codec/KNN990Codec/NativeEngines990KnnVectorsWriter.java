@@ -169,7 +169,8 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
 
         StopWatch stopWatch = new StopWatch().start();
 
-        writer.mergeIndex(knnVectorValuesSupplier, totalLiveDocs);
+        // Pass mergeState to support clumping file merge
+        writer.mergeIndex(knnVectorValuesSupplier, totalLiveDocs, mergeState);
 
         long time_in_millis = stopWatch.stop().totalTime().millis();
         KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(time_in_millis);

@@ -206,9 +206,21 @@ public class KNNStats {
         Map<String, Object> refreshMap = new HashMap<>();
         refreshMap.put(KNNGraphValue.REFRESH_TOTAL_OPERATIONS.getName(), KNNGraphValue.REFRESH_TOTAL_OPERATIONS.getValue());
         refreshMap.put(KNNGraphValue.REFRESH_TOTAL_TIME_IN_MILLIS.getName(), KNNGraphValue.REFRESH_TOTAL_TIME_IN_MILLIS.getValue());
+        Map<String, Object> clumpingMap = new HashMap<>();
+        clumpingMap.put(KNNGraphValue.CLUMPING_TOTAL_MARKER_COUNT.getName(), KNNGraphValue.CLUMPING_TOTAL_MARKER_COUNT.getValue());
+        clumpingMap.put(
+            KNNGraphValue.CLUMPING_TOTAL_HIDDEN_VECTOR_COUNT.getName(),
+            KNNGraphValue.CLUMPING_TOTAL_HIDDEN_VECTOR_COUNT.getValue()
+        );
+        clumpingMap.put(
+            KNNGraphValue.CLUMPING_TOTAL_FILE_SIZE_IN_BYTES.getName(),
+            KNNGraphValue.CLUMPING_TOTAL_FILE_SIZE_IN_BYTES.getValue()
+        );
+        clumpingMap.put(KNNGraphValue.CLUMPING_TOTAL_SEGMENTS.getName(), KNNGraphValue.CLUMPING_TOTAL_SEGMENTS.getValue());
         Map<String, Map<String, Object>> graphStatsMap = new HashMap<>();
         graphStatsMap.put(StatNames.MERGE.getName(), mergeMap);
         graphStatsMap.put(StatNames.REFRESH.getName(), refreshMap);
+        graphStatsMap.put(StatNames.CLUMPING.getName(), clumpingMap);
         return graphStatsMap;
     }
 

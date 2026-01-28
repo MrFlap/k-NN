@@ -37,6 +37,8 @@ import org.opensearch.knn.index.engine.model.QueryContext;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
+import org.opensearch.knn.index.query.parser.ClumpingParser;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.query.parser.RescoreParser;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
@@ -85,6 +87,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     public static final ParseField METHOD_PARAMS_FIELD = new ParseField(METHOD_PARAMETER);
     public static final ParseField RESCORE_FIELD = new ParseField(RESCORE_PARAMETER);
     public static final ParseField RESCORE_OVERSAMPLE_FIELD = new ParseField(RESCORE_OVERSAMPLE_PARAMETER);
+    public static final ParseField CLUMPING_FIELD = new ParseField(ClumpingParser.CLUMPING_PARAMETER);
 
     public static final int K_MAX = 10000;
     /**
@@ -111,6 +114,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     private boolean ignoreUnmapped;
     @Getter
     private RescoreContext rescoreContext;
+    @Getter
+    private ClumpingContext clumpingContext;
     @Getter
     private Boolean expandNested;
 
@@ -154,6 +159,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         private String queryName;
         private float boost = DEFAULT_BOOST;
         private RescoreContext rescoreContext;
+        private ClumpingContext clumpingContext;
         private Boolean expandNested;
 
         public Builder() {}
@@ -213,6 +219,11 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             return this;
         }
 
+        public Builder clumpingContext(ClumpingContext clumpingContext) {
+            this.clumpingContext = clumpingContext;
+            return this;
+        }
+
         public Builder expandNested(Boolean expandNested) {
             this.expandNested = expandNested;
             return this;
@@ -230,6 +241,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 filter,
                 ignoreUnmapped,
                 rescoreContext,
+                clumpingContext,
                 expandNested
             ).boost(boost).queryName(queryName);
         }
@@ -355,6 +367,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         minScore = builder.minScore;
         methodParameters = builder.methodParameters;
         rescoreContext = builder.rescoreContext;
+        clumpingContext = builder.clumpingContext;
         expandNested = builder.expandNested;
     }
 
@@ -405,6 +418,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .filter(filterToBeAdded)
                 .ignoreUnmapped(ignoreUnmapped)
                 .rescoreContext(rescoreContext)
+                .clumpingContext(clumpingContext)
                 .expandNested(expandNested)
                 .build();
         }
@@ -419,6 +433,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             .filter(filter.filter(filterToBeAdded))
             .ignoreUnmapped(ignoreUnmapped)
             .rescoreContext(rescoreContext)
+            .clumpingContext(clumpingContext)
             .expandNested(expandNested)
             .build();
     }
@@ -567,6 +582,21 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         }
 
         if (k != null && k != 0) {
+            // Requirement 9.3: When both oversampling and clumping are enabled, oversampling is applied
+            // to the marker search phase. When only clumping is enabled, the clumping expansion factor
+            // is applied to the marker search to ensure sufficient candidates after expansion.
+            // 
+            // The first-pass k for marker search is determined as follows:
+            // 1. If oversampling (rescore) is enabled: oversampling handles the first-pass k
+            // 2. If only clumping is enabled: apply clumping expansion factor to k
+            // 3. If neither is enabled: use k as-is
+            int markerSearchK = calculateMarkerSearchK(
+                this.k,
+                processedRescoreContext,
+                clumpingContext,
+                hasClumpingEnabled(knnMappingConfig)
+            );
+
             KNNQueryFactory.CreateQueryRequest createQueryRequest = KNNQueryFactory.CreateQueryRequest.builder()
                 .knnEngine(knnEngine)
                 .indexName(indexName)
@@ -575,7 +605,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .originalVector(vector)
                 .byteVector(getByteVectorForCreatingQueryRequest(vectorDataType, knnEngine, byteVector, memoryOptimizedSearchEnabled))
                 .vectorDataType(vectorDataType)
-                .k(this.k)
+                .k(markerSearchK)
                 .methodParameters(this.methodParameters)
                 .filter(this.filter)
                 .context(context)
@@ -583,7 +613,11 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .expandNested(expandNested == null ? false : expandNested)
                 .memoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
                 .build();
-            return KNNQueryFactory.create(createQueryRequest);
+            Query baseQuery = KNNQueryFactory.create(createQueryRequest);
+
+            // Wrap with ClumpingKNNVectorQuery if clumping should be applied
+            // Requirements: 5.2, 5.3, 5.4
+            return wrapWithClumpingIfNeeded(baseQuery, knnMappingConfig, spaceType, context.getShardId(), context);
         }
         if (radius != null) {
             RNNQueryFactory.CreateQueryRequest createQueryRequest = RNNQueryFactory.CreateQueryRequest.builder()
@@ -628,6 +662,173 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         }
 
         throw new IllegalArgumentException(String.format(Locale.ROOT, "Field '%s' is not built for ANN search.", this.fieldName));
+    }
+
+    /**
+     * Wraps the base query with ClumpingKNNVectorQuery if clumping should be applied.
+     * 
+     * Clumping is applied when:
+     * 1. The query has clumping enabled (clumpingContext != null and enabled)
+     * 2. The index has clumping enabled (has clumping configuration in mapping)
+     * 
+     * If the query enables clumping but the index doesn't support it, a warning is logged
+     * and the base query is returned without clumping.
+     * 
+     * Requirements: 5.2, 5.3, 5.4
+     *
+     * @param baseQuery       The base k-NN query to potentially wrap
+     * @param knnMappingConfig The mapping configuration for the k-NN field
+     * @param spaceType       The space type for distance calculation
+     * @param shardId         The shard ID (for logging purposes)
+     * @param context         The query shard context (for filter conversion)
+     * @return The wrapped query if clumping should be applied, otherwise the base query
+     */
+    private Query wrapWithClumpingIfNeeded(
+        Query baseQuery,
+        KNNMappingConfig knnMappingConfig,
+        SpaceType spaceType,
+        int shardId,
+        QueryShardContext context
+    ) {
+        // Requirement 5.2: If clumping is explicitly disabled in the query, skip clumping
+        if (clumpingContext != null && !clumpingContext.isEnabled()) {
+            log.debug("Clumping explicitly disabled in query for field {}", fieldName);
+            return baseQuery;
+        }
+
+        // Check if the index has clumping enabled
+        boolean indexHasClumping = hasClumpingEnabled(knnMappingConfig);
+
+        // Requirement 5.4: If query specifies clumping but index doesn't have it, log warning and proceed without clumping
+        if (clumpingContext != null && clumpingContext.isEnabled() && !indexHasClumping) {
+            log.warn(
+                "Clumping requested in query for field {} but index does not have clumping enabled. Proceeding without clumping.",
+                fieldName
+            );
+            return baseQuery;
+        }
+
+        // Requirement 5.3: If clumping is not specified but index has clumping, use default clumping behavior
+        // This means we apply clumping when the index has it, unless explicitly disabled
+        if (!indexHasClumping) {
+            return baseQuery;
+        }
+
+        // Resolve the clumping context - use provided context or default
+        ClumpingContext resolvedClumpingContext = clumpingContext != null ? clumpingContext : ClumpingContext.getDefault();
+
+        log.debug(
+            "Wrapping query with ClumpingKNNVectorQuery for field {}, k={}, expansionFactor={}",
+            fieldName,
+            k,
+            resolvedClumpingContext.getExpansionFactor()
+        );
+
+        // Get the filter query to pass to ClumpingKNNVectorQuery
+        // Requirement 9.1: Apply filter to both marker search and hidden vector expansion
+        // The filter is already applied to the baseQuery (marker search), but we also need
+        // to pass it to ClumpingKNNVectorQuery so it can filter hidden vectors during expansion
+        Query filterQueryForClumping = null;
+        if (filter != null) {
+            try {
+                filterQueryForClumping = filter.toQuery(context);
+            } catch (IOException e) {
+                log.warn("Failed to convert filter to query for clumping, proceeding without filter on hidden vectors", e);
+            }
+        }
+
+        // Requirement 9.2: Get the parent filter for nested field support
+        // The parent filter is used to maintain parent-child relationships in nested documents
+        org.apache.lucene.search.join.BitSetProducer parentFilter = context.getParentFilter();
+
+        return new ClumpingKNNVectorQuery(
+            baseQuery,
+            fieldName,
+            k,
+            vector,
+            shardId,
+            resolvedClumpingContext,
+            spaceType,
+            filterQueryForClumping,
+            parentFilter
+        );
+    }
+
+    /**
+     * Checks if the index has clumping enabled for this field.
+     * 
+     * Clumping is enabled if the field mapping contains a clumping factor configuration.
+     *
+     * @param knnMappingConfig The mapping configuration for the k-NN field
+     * @return true if clumping is enabled for this field, false otherwise
+     */
+    private boolean hasClumpingEnabled(KNNMappingConfig knnMappingConfig) {
+        // Check if the mapping has clumping factor configured
+        // The clumping factor is stored in OriginalMappingParameters during mapping creation
+        // and is written to field attributes during indexing
+        // At query time, we check if the mapping configuration indicates clumping is enabled
+        return knnMappingConfig.getClumpingFactor().isPresent();
+    }
+
+    /**
+     * Calculates the k value to use for marker search when clumping is enabled.
+     * 
+     * Requirement 9.3: When both oversampling and clumping are enabled, oversampling is applied
+     * to the marker search phase before clumping expansion. When only clumping is enabled,
+     * the clumping expansion factor is applied to ensure sufficient candidates after expansion.
+     * 
+     * The logic is:
+     * 1. If oversampling (rescore) is enabled: return the original k, as oversampling will handle
+     *    the first-pass k calculation internally (via RescoreKNNVectorQuery or NativeEngineKnnVectorQuery)
+     * 2. If only clumping is enabled (no oversampling): apply clumping expansion factor to k
+     * 3. If neither is enabled: return the original k
+     *
+     * @param finalK              The final number of results desired
+     * @param rescoreContext      The rescore context (may be null)
+     * @param clumpingContext     The clumping context (may be null)
+     * @param indexHasClumping    Whether the index has clumping enabled
+     * @return The k value to use for marker search
+     */
+    private int calculateMarkerSearchK(
+        int finalK,
+        RescoreContext rescoreContext,
+        ClumpingContext clumpingContext,
+        boolean indexHasClumping
+    ) {
+        // Check if oversampling (rescore) is enabled
+        boolean rescoreEnabled = rescoreContext != null && rescoreContext.isRescoreEnabled();
+
+        // Check if clumping is enabled (either from query or index default)
+        boolean clumpingEnabled = indexHasClumping && (clumpingContext == null || clumpingContext.isEnabled());
+
+        // If oversampling is enabled, it will handle the first-pass k internally
+        // The RescoreKNNVectorQuery or NativeEngineKnnVectorQuery will apply the oversample factor
+        if (rescoreEnabled) {
+            log.debug(
+                "Oversampling is enabled, using original k={} for marker search (oversampling will be applied internally)",
+                finalK
+            );
+            return finalK;
+        }
+
+        // If only clumping is enabled (no oversampling), apply clumping expansion factor
+        // Requirement 6.2: Request k * expansion_factor results to ensure sufficient candidates
+        if (clumpingEnabled) {
+            ClumpingContext resolvedClumpingContext = clumpingContext != null ? clumpingContext : ClumpingContext.getDefault();
+            int markerSearchK = resolvedClumpingContext.getFirstPassK(finalK);
+            // Cap at K_MAX to avoid excessive results
+            markerSearchK = Math.min(markerSearchK, K_MAX);
+            log.debug(
+                "Clumping enabled without oversampling, using markerSearchK={} (finalK={}, expansionFactor={})",
+                markerSearchK,
+                finalK,
+                resolvedClumpingContext.getExpansionFactor()
+            );
+            return markerSearchK;
+        }
+
+        // Neither oversampling nor clumping is enabled, use original k
+        return finalK;
     }
 
     /**
@@ -720,6 +921,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             && Objects.equals(filter, other.filter)
             && Objects.equals(ignoreUnmapped, other.ignoreUnmapped)
             && Objects.equals(rescoreContext, other.rescoreContext)
+            && Objects.equals(clumpingContext, other.clumpingContext)
             && Objects.equals(expandNested, other.expandNested);
     }
 
@@ -735,6 +937,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             maxDistance,
             minScore,
             rescoreContext,
+            clumpingContext,
             expandNested
         );
     }
@@ -760,6 +963,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                     .filter(rewrittenFilter)
                     .ignoreUnmapped(this.ignoreUnmapped)
                     .rescoreContext(this.rescoreContext)
+                    .clumpingContext(this.clumpingContext)
                     .expandNested(this.expandNested)
                     .build();
                 return rewrittenQueryBuilder;

@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
@@ -112,6 +113,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
                 @Override
                 public KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
                     return libraryContext;
+                }
+
+                @Override
+                public Optional<Integer> getClumpingFactor() {
+                    return Optional.ofNullable(originalMappingParameters.getClumpingFactor());
                 }
             },
             indexCreatedVersion
@@ -198,6 +204,12 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
                 );
             } catch (IOException ioe) {
                 throw new RuntimeException(String.format("Unable to create KNNVectorFieldMapper: %s", ioe), ioe);
+            }
+
+            // Conditionally add clumping factor if enabled
+            Integer clumpingFactor = originalMappingParameters.getClumpingFactor();
+            if (clumpingFactor != null) {
+                this.fieldType.putAttribute(CLUMPING_PARAMETER, String.valueOf(clumpingFactor));
             }
 
             if (useLuceneBasedVectorField) {

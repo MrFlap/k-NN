@@ -46,6 +46,7 @@ public final class OriginalMappingParameters {
     private final String modelId;
     private final String topLevelSpaceType;
     private final String topLevelEngine;
+    private final Integer clumpingFactor;
 
     /**
      * Initialize the parameters from the builder
@@ -62,6 +63,7 @@ public final class OriginalMappingParameters {
         this.modelId = builder.modelId.get();
         this.topLevelSpaceType = builder.topLevelSpaceType.get();
         this.topLevelEngine = builder.topLevelEngine.get();
+        this.clumpingFactor = builder.clumpingFactor.get();
     }
 
     /**
