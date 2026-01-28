@@ -18,8 +18,11 @@ import org.opensearch.knn.index.query.lucenelib.OSKnnFloatVectorQuery;
 import org.opensearch.knn.index.query.lucenelib.NestedKnnVectorQueryFactory;
 import org.opensearch.knn.index.query.lucene.LuceneEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.nativelib.NativeEngineKnnVectorQuery;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
+import org.opensearch.knn.index.query.clumping.ClumpingKnnVectorQuery;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.index.util.IndexHyperParametersUtil;
+import org.opensearch.knn.indices.ModelDao;
 
 import java.util.Locale;
 import java.util.Map;
@@ -32,6 +35,16 @@ import static org.opensearch.knn.index.engine.KNNEngine.ENGINES_SUPPORTING_NESTE
  */
 @Log4j2
 public class KNNQueryFactory extends BaseQueryFactory {
+    private static ModelDao modelDao;
+
+    /**
+     * Initialize the factory with required dependencies.
+     * @param modelDao the model DAO for accessing model metadata
+     */
+    public static void initialize(ModelDao modelDao) {
+        KNNQueryFactory.modelDao = modelDao;
+    }
+
     /**
      * Creates a Lucene query for a particular engine.
      * @param createQueryRequest request object that has all required fields to construct the query
@@ -52,6 +65,13 @@ public class KNNQueryFactory extends BaseQueryFactory {
         final RescoreContext rescoreContext = createQueryRequest.getRescoreContext().orElse(null);
         final boolean expandNested = createQueryRequest.isExpandNested();
         final boolean memoryOptimizedSearchEnabled = createQueryRequest.isMemoryOptimizedSearchEnabled();
+
+        // Log clumping context for debugging
+        ClumpingContext requestClumpingContext = createQueryRequest.getClumpingContext().orElse(null);
+        if (requestClumpingContext != null && requestClumpingContext.isEffectivelyEnabled()) {
+            log.info("KNNQueryFactory received clumping context for field:{}, clumpingFactor:{}", 
+                fieldName, requestClumpingContext.getClumpingFactor());
+        }
 
         BitSetProducer parentFilter = null;
         int shardId = -1;
@@ -122,7 +142,23 @@ public class KNNQueryFactory extends BaseQueryFactory {
             if (memoryOptimizedSearchEnabled
                 || createQueryRequest.getRescoreContext().isPresent()
                 || (ENGINES_SUPPORTING_NESTED_FIELDS.contains(createQueryRequest.getKnnEngine()) && expandNested)) {
-                return new NativeEngineKnnVectorQuery(knnQuery, QueryUtils.getInstance(), expandNested);
+                Query query = new NativeEngineKnnVectorQuery(knnQuery, QueryUtils.getInstance(), expandNested);
+                // Wrap with clumping query if clumping is enabled
+                ClumpingContext clumpingContext = createQueryRequest.getClumpingContext().orElse(null);
+                if (clumpingContext != null && clumpingContext.isEffectivelyEnabled()) {
+                    log.debug("Wrapping query with ClumpingKnnVectorQuery for field:{}, clumpingFactor:{}", 
+                        fieldName, clumpingContext.getClumpingFactor());
+                    return new ClumpingKnnVectorQuery(knnQuery, QueryUtils.getInstance(), clumpingContext, modelDao);
+                }
+                return query;
+            }
+
+            // Check if clumping is enabled for non-wrapped queries
+            ClumpingContext clumpingContext = createQueryRequest.getClumpingContext().orElse(null);
+            if (clumpingContext != null && clumpingContext.isEffectivelyEnabled()) {
+                log.debug("Wrapping KNNQuery with ClumpingKnnVectorQuery for field:{}, clumpingFactor:{}", 
+                    fieldName, clumpingContext.getClumpingFactor());
+                return new ClumpingKnnVectorQuery(knnQuery, QueryUtils.getInstance(), clumpingContext, modelDao);
             }
 
             return knnQuery;

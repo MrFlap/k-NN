@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_KEY;
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
@@ -95,6 +96,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
                 @Override
                 public CompressionLevel getCompressionLevel() {
                     return knnMethodConfigContext.getCompressionLevel();
+                }
+
+                @Override
+                public int getClumpingFactor() {
+                    return originalMappingParameters.getClumpingFactor();
                 }
 
                 @Override
@@ -191,6 +197,13 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
 
             this.fieldType.putAttribute(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue());
             this.fieldType.putAttribute(KNN_ENGINE, knnEngine.getName());
+            
+            // Add clumping factor if enabled
+            int clumpingFactor = knnMappingConfig.getClumpingFactor();
+            if (clumpingFactor > 1) {
+                this.fieldType.putAttribute(CLUMPING_KEY, String.valueOf(clumpingFactor));
+            }
+            
             try {
                 this.fieldType.putAttribute(
                     PARAMETERS,

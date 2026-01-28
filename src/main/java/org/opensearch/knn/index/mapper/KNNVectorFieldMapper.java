@@ -185,6 +185,38 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             MAPPING_COMPRESSION_NAMES_ARRAY
         ).acceptsNull();
 
+        /**
+         * clumpingFactor parameter enables clumping optimization where only 1/N vectors are stored as "markers"
+         * in the main index, with remaining "hidden" vectors stored separately on disk.
+         * A clumping factor of N means 1/N vectors are markers, (N-1)/N are hidden.
+         * Default is 1 (no clumping - all vectors are markers).
+         */
+        protected final Parameter<Integer> clumpingFactor = new Parameter<>(
+            KNNConstants.CLUMPING_KEY,
+            false,
+            () -> 1,
+            (n, c, o) -> {
+                if (o == null) {
+                    return 1;
+                }
+                int value;
+                try {
+                    value = XContentMapValues.nodeIntegerValue(o);
+                } catch (Exception exception) {
+                    throw new IllegalArgumentException(
+                        String.format(Locale.ROOT, "Unable to parse [clumping] from provided value [%s] for vector [%s]", o, name)
+                    );
+                }
+                if (value < 1 || value > 100) {
+                    throw new IllegalArgumentException(
+                        String.format(Locale.ROOT, "Clumping factor must be between 1 and 100 for vector: %s, got %d", name, value)
+                    );
+                }
+                return value;
+            },
+            m -> toType(m).originalMappingParameters.getClumpingFactor()
+        );
+
         // A top level space Type field.
         protected final Parameter<String> topLevelSpaceType = Parameter.stringParam(
             KNNConstants.TOP_LEVEL_PARAMETER_SPACE_TYPE,
@@ -254,6 +286,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 modelId,
                 mode,
                 compressionLevel,
+                clumpingFactor,
                 topLevelSpaceType,
                 topLevelEngine
             );
@@ -419,6 +452,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 // Also, validate that the index created version is on or after 2.17 as mode and compression are not supported for
                 // the indices that are created before 2.17.
                 validateModeAndCompression(builder, parserContext.indexVersionCreated());
+                // Validate clumping configuration
+                validateClumping(builder, parserContext.indexVersionCreated());
                 // If the original knnMethodContext is not null, resolve its space type and engine from the rest of the
                 // configuration. This is consistent with the existing behavior for space type in 2.16 where we modify the
                 // parsed value
@@ -503,6 +538,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             }
             validateDimensionSet(builder);
             validateCompressionAndModeNotSet(builder, builder.name(), "flat");
+            validateClumpingNotSet(builder, builder.name(), "flat");
         }
 
         private void validateFromModel(KNNVectorFieldMapper.Builder builder) {
@@ -516,6 +552,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             }
 
             validateCompressionAndModeNotSet(builder, builder.name(), "model");
+            validateClumpingNotSet(builder, builder.name(), "model");
         }
 
         private void validateFromKNNMethod(KNNVectorFieldMapper.Builder builder) {
@@ -549,6 +586,36 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                         "Compression and mode can not be specified in a %s mapping configuration for field: %s",
                         context,
                         name
+                    )
+                );
+            }
+        }
+
+        private void validateClumpingNotSet(KNNVectorFieldMapper.Builder builder, String name, String context) {
+            if (builder.clumpingFactor.isConfigured() && builder.clumpingFactor.get() > 1) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "Clumping can not be specified in a %s mapping configuration for field: %s",
+                        context,
+                        name
+                    )
+                );
+            }
+        }
+
+        private void validateClumping(KNNVectorFieldMapper.Builder builder, Version indexCreatedVersion) {
+            if (!builder.clumpingFactor.isConfigured() || builder.clumpingFactor.get() <= 1) {
+                return;
+            }
+
+            // Clumping only supported for float data type
+            if (builder.vectorDataType.getValue() != VectorDataType.FLOAT) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "Clumping can only be used with float data type for field %s",
+                        builder.name
                     )
                 );
             }

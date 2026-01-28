@@ -52,6 +52,26 @@ public interface KNNMappingConfig {
     }
 
     /**
+     * Return the clumping factor for this field.
+     * A clumping factor of N means 1/N vectors are stored as markers in the main index,
+     * with (N-1)/N vectors stored as hidden vectors on disk.
+     *
+     * @return clumping factor (1 means no clumping)
+     */
+    default int getClumpingFactor() {
+        return 1;
+    }
+
+    /**
+     * Check if clumping is enabled for this field.
+     *
+     * @return true if clumping factor is greater than 1
+     */
+    default boolean isClumpingEnabled() {
+        return getClumpingFactor() > 1;
+    }
+
+    /**
      * Returns quantization config
      * @return
      */

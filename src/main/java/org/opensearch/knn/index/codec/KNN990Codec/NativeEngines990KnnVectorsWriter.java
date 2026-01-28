@@ -23,23 +23,32 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.opensearch.common.StopWatch;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
+import org.opensearch.knn.index.query.clumping.ClumpingIndexWriter;
 import org.opensearch.knn.index.quantizationservice.QuantizationService;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
+import org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory;
 import org.opensearch.knn.plugin.stats.KNNGraphValue;
 import org.opensearch.knn.quantization.models.quantizationParams.QuantizationParams;
 import org.opensearch.knn.quantization.models.quantizationState.QuantizationState;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 
+import static org.opensearch.knn.common.FieldInfoExtractor.extractClumpingFactor;
 import static org.opensearch.knn.common.FieldInfoExtractor.extractVectorDataType;
+import static org.opensearch.knn.common.FieldInfoExtractor.getSpaceType;
 import static org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory.getKNNVectorValuesSupplierForMerge;
 import static org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory.getVectorValuesSupplier;
+import static org.opensearch.knn.indices.ModelDao.OpenSearchKNNModelDao;
 
 /**
  * A KNNVectorsWriter class for writing the vector data strcutures and flat vectors for Native Engines.
@@ -101,18 +110,57 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
                 log.debug("[Flush] No live docs for field {}", fieldInfo.getName());
                 continue;
             }
-            final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier = getVectorValuesSupplier(
-                vectorDataType,
-                field.getFlatFieldVectorsWriter().getDocsWithFieldSet(),
-                field.getVectors()
-            );
-            final QuantizationState quantizationState = train(field.getFieldInfo(), knnVectorValuesSupplier, totalLiveDocs);
+            
+            // Check if clumping is enabled for this field
+            int clumpingFactor = extractClumpingFactor(fieldInfo);
+            boolean clumpingEnabled = clumpingFactor > 1;
+            
+            Supplier<KNNVectorValues<?>> knnVectorValuesSupplier;
+            int docsToIndex = totalLiveDocs;
+            
+            if (clumpingEnabled) {
+                // Process vectors with clumping - select markers and write hidden vectors
+                Map<Integer, float[]> processedVectors = processVectorsWithClumping(
+                    field,
+                    fieldInfo,
+                    vectorDataType,
+                    clumpingFactor
+                );
+                docsToIndex = processedVectors.size();
+                
+                if (docsToIndex == 0) {
+                    log.debug("[Flush] No marker vectors after clumping for field {}", fieldInfo.getName());
+                    continue;
+                }
+                
+                // Create supplier for marker vectors only
+                knnVectorValuesSupplier = () -> KNNVectorValuesFactory.getVectorValues(
+                    vectorDataType,
+                    field.getFlatFieldVectorsWriter().getDocsWithFieldSet(),
+                    processedVectors
+                );
+                
+                log.info(
+                    "[Flush] Clumping enabled for field {}: {} total vectors -> {} markers indexed",
+                    fieldInfo.getName(),
+                    totalLiveDocs,
+                    docsToIndex
+                );
+            } else {
+                knnVectorValuesSupplier = getVectorValuesSupplier(
+                    vectorDataType,
+                    field.getFlatFieldVectorsWriter().getDocsWithFieldSet(),
+                    field.getVectors()
+                );
+            }
+            
+            final QuantizationState quantizationState = train(fieldInfo, knnVectorValuesSupplier, docsToIndex);
             // should skip graph building only for non quantization use case and if threshold is met
-            if (quantizationState == null && shouldSkipBuildingVectorDataStructure(totalLiveDocs)) {
+            if (quantizationState == null && shouldSkipBuildingVectorDataStructure(docsToIndex)) {
                 log.debug(
                     "Skip building vector data structure for field: {}, as liveDoc: {} is less than the threshold {} during flush",
                     fieldInfo.name,
-                    totalLiveDocs,
+                    docsToIndex,
                     approximateThreshold
                 );
                 continue;
@@ -125,7 +173,7 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             );
 
             StopWatch stopWatch = new StopWatch().start();
-            writer.flushIndex(knnVectorValuesSupplier, totalLiveDocs);
+            writer.flushIndex(knnVectorValuesSupplier, docsToIndex);
             long time_in_millis = stopWatch.stop().totalTime().millis();
             KNNGraphValue.REFRESH_TOTAL_TIME_IN_MILLIS.incrementBy(time_in_millis);
             log.debug("Flush took {} ms for vector field [{}]", time_in_millis, fieldInfo.getName());
@@ -149,13 +197,51 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             return;
         }
 
-        final QuantizationState quantizationState = train(fieldInfo, knnVectorValuesSupplier, totalLiveDocs);
+        // Check if clumping is enabled for this field
+        int clumpingFactor = extractClumpingFactor(fieldInfo);
+        boolean clumpingEnabled = clumpingFactor > 1;
+        
+        Supplier<KNNVectorValues<?>> finalVectorValuesSupplier;
+        int docsToIndex = totalLiveDocs;
+        
+        if (clumpingEnabled) {
+            // For merge, we need to collect all vectors first, then process with clumping
+            Map<Integer, float[]> allVectors = collectVectorsFromSupplier(knnVectorValuesSupplier, vectorDataType);
+            
+            // Process vectors with clumping
+            Map<Integer, float[]> markerVectors = processVectorsWithClumpingForMerge(
+                allVectors,
+                fieldInfo,
+                vectorDataType,
+                clumpingFactor
+            );
+            docsToIndex = markerVectors.size();
+            
+            if (docsToIndex == 0) {
+                log.debug("[Merge] No marker vectors after clumping for field {}", fieldInfo.getName());
+                return;
+            }
+            
+            // Create supplier for marker vectors only
+            finalVectorValuesSupplier = () -> KNNVectorValuesFactory.getVectorValues(vectorDataType, markerVectors);
+            
+            log.info(
+                "[Merge] Clumping enabled for field {}: {} total vectors -> {} markers indexed",
+                fieldInfo.getName(),
+                totalLiveDocs,
+                docsToIndex
+            );
+        } else {
+            finalVectorValuesSupplier = getKNNVectorValuesSupplierForMerge(vectorDataType, fieldInfo, mergeState);
+        }
+
+        final QuantizationState quantizationState = train(fieldInfo, finalVectorValuesSupplier, docsToIndex);
         // should skip graph building only for non quantization use case and if threshold is met
-        if (quantizationState == null && shouldSkipBuildingVectorDataStructure(totalLiveDocs)) {
+        if (quantizationState == null && shouldSkipBuildingVectorDataStructure(docsToIndex)) {
             log.debug(
                 "Skip building vector data structure for field: {}, as liveDoc: {} is less than the threshold {} during merge",
                 fieldInfo.name,
-                totalLiveDocs,
+                docsToIndex,
                 approximateThreshold
             );
             return;
@@ -169,7 +255,7 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
 
         StopWatch stopWatch = new StopWatch().start();
 
-        writer.mergeIndex(knnVectorValuesSupplier, totalLiveDocs);
+        writer.mergeIndex(finalVectorValuesSupplier, docsToIndex);
 
         long time_in_millis = stopWatch.stop().totalTime().millis();
         KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(time_in_millis);
@@ -267,5 +353,153 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             return true;
         }
         return docCount < approximateThreshold;
+    }
+
+    /**
+     * Processes vectors with clumping during flush.
+     * Selects marker vectors and writes hidden vectors to disk.
+     * 
+     * @param field the field vectors writer containing all vectors
+     * @param fieldInfo the field info
+     * @param vectorDataType the vector data type
+     * @param clumpingFactor the clumping factor
+     * @return map of marker doc IDs to their vectors
+     */
+    private Map<Integer, float[]> processVectorsWithClumping(
+        NativeEngineFieldVectorsWriter<?> field,
+        FieldInfo fieldInfo,
+        VectorDataType vectorDataType,
+        int clumpingFactor
+    ) throws IOException {
+        // Convert vectors to float[] map
+        Map<Integer, float[]> docIdToVector = new HashMap<>();
+        Map<Integer, ?> vectors = field.getVectors();
+        
+        for (Map.Entry<Integer, ?> entry : vectors.entrySet()) {
+            int docId = entry.getKey();
+            Object vector = entry.getValue();
+            
+            if (vector instanceof float[]) {
+                docIdToVector.put(docId, (float[]) vector);
+            } else if (vector instanceof byte[]) {
+                // Convert byte[] to float[] for clumping processing
+                byte[] byteVector = (byte[]) vector;
+                float[] floatVector = new float[byteVector.length];
+                for (int i = 0; i < byteVector.length; i++) {
+                    floatVector[i] = byteVector[i];
+                }
+                docIdToVector.put(docId, floatVector);
+            }
+        }
+        
+        if (docIdToVector.isEmpty()) {
+            return docIdToVector;
+        }
+        
+        // Get space type for distance calculation
+        SpaceType spaceType = getSpaceTypeFromFieldInfo(fieldInfo);
+        
+        // Create clumping context and index writer
+        ClumpingContext clumpingContext = ClumpingContext.withFactor(clumpingFactor);
+        ClumpingIndexWriter clumpingWriter = new ClumpingIndexWriter(
+            clumpingContext,
+            segmentWriteState.directory,
+            segmentWriteState.segmentInfo.name,
+            fieldInfo.name
+        );
+        
+        // Process vectors - this selects markers and writes hidden vectors to disk
+        return clumpingWriter.processVectors(
+            docIdToVector,
+            spaceType,
+            vectorDataType,
+            fieldInfo.getVectorDimension()
+        );
+    }
+
+    /**
+     * Processes vectors with clumping during merge.
+     * 
+     * @param allVectors all vectors collected from the merge
+     * @param fieldInfo the field info
+     * @param vectorDataType the vector data type
+     * @param clumpingFactor the clumping factor
+     * @return map of marker doc IDs to their vectors
+     */
+    private Map<Integer, float[]> processVectorsWithClumpingForMerge(
+        Map<Integer, float[]> allVectors,
+        FieldInfo fieldInfo,
+        VectorDataType vectorDataType,
+        int clumpingFactor
+    ) throws IOException {
+        if (allVectors.isEmpty()) {
+            return allVectors;
+        }
+        
+        // Get space type for distance calculation
+        SpaceType spaceType = getSpaceTypeFromFieldInfo(fieldInfo);
+        
+        // Create clumping context and index writer
+        ClumpingContext clumpingContext = ClumpingContext.withFactor(clumpingFactor);
+        ClumpingIndexWriter clumpingWriter = new ClumpingIndexWriter(
+            clumpingContext,
+            segmentWriteState.directory,
+            segmentWriteState.segmentInfo.name,
+            fieldInfo.name
+        );
+        
+        // Process vectors - this selects markers and writes hidden vectors to disk
+        return clumpingWriter.processVectors(
+            allVectors,
+            spaceType,
+            vectorDataType,
+            fieldInfo.getVectorDimension()
+        );
+    }
+
+    /**
+     * Collects all vectors from a supplier into a map.
+     * 
+     * @param supplier the vector values supplier
+     * @param vectorDataType the vector data type
+     * @return map of doc IDs to vectors
+     */
+    private Map<Integer, float[]> collectVectorsFromSupplier(
+        Supplier<KNNVectorValues<?>> supplier,
+        VectorDataType vectorDataType
+    ) throws IOException {
+        Map<Integer, float[]> result = new HashMap<>();
+        KNNVectorValues<?> vectorValues = supplier.get();
+        
+        while (vectorValues.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+            int docId = vectorValues.docId();
+            Object vector = vectorValues.getVector();
+            
+            if (vector instanceof float[]) {
+                result.put(docId, ((float[]) vector).clone());
+            } else if (vector instanceof byte[]) {
+                byte[] byteVector = (byte[]) vector;
+                float[] floatVector = new float[byteVector.length];
+                for (int i = 0; i < byteVector.length; i++) {
+                    floatVector[i] = byteVector[i];
+                }
+                result.put(docId, floatVector);
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * Gets the space type from field info.
+     */
+    private SpaceType getSpaceTypeFromFieldInfo(FieldInfo fieldInfo) {
+        try {
+            return getSpaceType(OpenSearchKNNModelDao.getInstance(), fieldInfo);
+        } catch (Exception e) {
+            // Default to L2 if space type cannot be determined
+            log.warn("Could not determine space type for field {}, defaulting to L2", fieldInfo.name);
+            return SpaceType.L2;
+        }
     }
 }

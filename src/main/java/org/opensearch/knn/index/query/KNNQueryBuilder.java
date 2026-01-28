@@ -37,6 +37,7 @@ import org.opensearch.knn.index.engine.model.QueryContext;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.query.parser.RescoreParser;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
@@ -567,6 +568,15 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         }
 
         if (k != null && k != 0) {
+            // Get clumping context from mapping config
+            ClumpingContext clumpingContext = null;
+            if (knnMappingConfig.isClumpingEnabled()) {
+                clumpingContext = ClumpingContext.withFactor(knnMappingConfig.getClumpingFactor());
+                log.info("Clumping enabled for field:{}, clumpingFactor:{}", this.fieldName, knnMappingConfig.getClumpingFactor());
+            } else {
+                log.debug("Clumping not enabled for field:{}, clumpingFactor:{}", this.fieldName, knnMappingConfig.getClumpingFactor());
+            }
+
             KNNQueryFactory.CreateQueryRequest createQueryRequest = KNNQueryFactory.CreateQueryRequest.builder()
                 .knnEngine(knnEngine)
                 .indexName(indexName)
@@ -582,6 +592,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .rescoreContext(processedRescoreContext)
                 .expandNested(expandNested == null ? false : expandNested)
                 .memoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
+                .clumpingContext(clumpingContext)
                 .build();
             return KNNQueryFactory.create(createQueryRequest);
         }

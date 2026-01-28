@@ -96,6 +96,23 @@ public final class KNNVectorValuesFactory {
     }
 
     /**
+     * Returns a {@link KNNVectorValues} for the given Map of docId and vectors.
+     * Creates a DocsWithFieldSet from the map keys.
+     *
+     * @param vectorDataType {@link VectorDataType}
+     * @param vectors Map of docId to vector
+     * @return {@link KNNVectorValues}
+     */
+    public static <T> KNNVectorValues<T> getVectorValues(
+        final VectorDataType vectorDataType,
+        final Map<Integer, T> vectors
+    ) {
+        DocsWithFieldSet docsWithFieldSet = new DocsWithFieldSet();
+        vectors.keySet().stream().sorted().forEach(docsWithFieldSet::add);
+        return getVectorValues(vectorDataType, docsWithFieldSet, vectors);
+    }
+
+    /**
      * Returns a {@link KNNVectorValues} for the given {@link FieldInfo} and {@link LeafReader}
      *
      * @param fieldInfo {@link FieldInfo}

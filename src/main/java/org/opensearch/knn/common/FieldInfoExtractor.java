@@ -27,6 +27,7 @@ import org.opensearch.knn.indices.ModelDao;
 
 import java.util.Locale;
 
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_KEY;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
 
 /**
@@ -127,5 +128,19 @@ public class FieldInfoExtractor {
      */
     public static @Nullable FieldInfo getFieldInfo(final LeafReader leafReader, final String fieldName) {
         return leafReader.getFieldInfos().fieldInfo(fieldName);
+    }
+
+    /**
+     * Extracts the clumping factor from FieldInfo.
+     * 
+     * @param fieldInfo {@link FieldInfo}
+     * @return the clumping factor, or 1 if not set (no clumping)
+     */
+    public static int extractClumpingFactor(final FieldInfo fieldInfo) {
+        String clumpingStr = fieldInfo.getAttribute(CLUMPING_KEY);
+        if (StringUtils.isEmpty(clumpingStr)) {
+            return 1; // Default: no clumping
+        }
+        return Integer.parseInt(clumpingStr);
     }
 }

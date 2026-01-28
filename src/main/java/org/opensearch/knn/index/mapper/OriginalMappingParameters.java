@@ -6,7 +6,6 @@
 package org.opensearch.knn.index.mapper;
 
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import org.opensearch.core.common.Strings;
 import org.opensearch.knn.index.VectorDataType;
@@ -17,7 +16,6 @@ import org.opensearch.knn.index.engine.KNNMethodContext;
  * kept around for when a {@link KNNVectorFieldMapper} is built from merge
  */
 @Getter
-@RequiredArgsConstructor
 public final class OriginalMappingParameters {
     private final VectorDataType vectorDataType;
     private final int dimension;
@@ -43,9 +41,52 @@ public final class OriginalMappingParameters {
     private KNNMethodContext resolvedKnnMethodContext;
     private final String mode;
     private final String compressionLevel;
+    private final int clumpingFactor;
     private final String modelId;
     private final String topLevelSpaceType;
     private final String topLevelEngine;
+
+    /**
+     * Full constructor with all parameters including clumping factor.
+     */
+    public OriginalMappingParameters(
+        VectorDataType vectorDataType,
+        int dimension,
+        KNNMethodContext knnMethodContext,
+        String mode,
+        String compressionLevel,
+        int clumpingFactor,
+        String modelId,
+        String topLevelSpaceType,
+        String topLevelEngine
+    ) {
+        this.vectorDataType = vectorDataType;
+        this.dimension = dimension;
+        this.knnMethodContext = knnMethodContext;
+        this.resolvedKnnMethodContext = knnMethodContext;
+        this.mode = mode;
+        this.compressionLevel = compressionLevel;
+        this.clumpingFactor = clumpingFactor;
+        this.modelId = modelId;
+        this.topLevelSpaceType = topLevelSpaceType;
+        this.topLevelEngine = topLevelEngine;
+    }
+
+    /**
+     * Backward-compatible constructor without clumping factor (defaults to 1 - no clumping).
+     */
+    public OriginalMappingParameters(
+        VectorDataType vectorDataType,
+        int dimension,
+        KNNMethodContext knnMethodContext,
+        String mode,
+        String compressionLevel,
+        String modelId,
+        String topLevelSpaceType,
+        String topLevelEngine
+    ) {
+        this(vectorDataType, dimension, knnMethodContext, mode, compressionLevel, 1, modelId, topLevelSpaceType, topLevelEngine);
+    }
 
     /**
      * Initialize the parameters from the builder
@@ -59,6 +100,7 @@ public final class OriginalMappingParameters {
         this.dimension = builder.dimension.get();
         this.mode = builder.mode.get();
         this.compressionLevel = builder.compressionLevel.get();
+        this.clumpingFactor = builder.clumpingFactor.get();
         this.modelId = builder.modelId.get();
         this.topLevelSpaceType = builder.topLevelSpaceType.get();
         this.topLevelEngine = builder.topLevelEngine.get();
@@ -81,5 +123,14 @@ public final class OriginalMappingParameters {
         }
 
         return Strings.isEmpty(mode) && Strings.isEmpty(compressionLevel);
+    }
+
+    /**
+     * Check if clumping is enabled for this field mapping.
+     *
+     * @return true if clumping factor is greater than 1
+     */
+    public boolean isClumpingEnabled() {
+        return clumpingFactor > 1;
     }
 }
