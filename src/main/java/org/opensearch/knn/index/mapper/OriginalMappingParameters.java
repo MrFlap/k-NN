@@ -12,6 +12,8 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 
+import java.util.Optional;
+
 /**
  * Utility class to store the original mapping parameters for a KNNVectorFieldMapper. These parameters need to be
  * kept around for when a {@link KNNVectorFieldMapper} is built from merge
@@ -46,6 +48,7 @@ public final class OriginalMappingParameters {
     private final String modelId;
     private final String topLevelSpaceType;
     private final String topLevelEngine;
+    private final Integer clumpingFactor;
 
     /**
      * Initialize the parameters from the builder
@@ -62,6 +65,14 @@ public final class OriginalMappingParameters {
         this.modelId = builder.modelId.get();
         this.topLevelSpaceType = builder.topLevelSpaceType.get();
         this.topLevelEngine = builder.topLevelEngine.get();
+        this.clumpingFactor = builder.clumpingFactor.get();
+    }
+
+    /**
+     * @return Optional containing the clumping factor if configured (>= 2), otherwise empty
+     */
+    public Optional<Integer> getOptionalClumpingFactor() {
+        return Optional.ofNullable(clumpingFactor).filter(f -> f >= 2);
     }
 
     /**

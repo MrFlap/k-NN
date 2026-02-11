@@ -49,6 +49,7 @@ import org.opensearch.knn.index.VectorField;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.index.engine.SpaceTypeResolver;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.indices.ModelDao;
 import static org.opensearch.knn.common.KNNConstants.DEFAULT_VECTOR_DATA_TYPE_FIELD;
@@ -201,6 +202,40 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             KNNEngine.UNDEFINED.getName()
         ).setValidator(KNNEngine::getEngine);
 
+        /**
+         * clumping_factor controls how many vectors are grouped per marker in the native index.
+         * When set to n (>= 2), only every nth vector is indexed as a marker; the rest are stored
+         * in a sidecar .clump file and expanded at query time. Only valid for native engines.
+         */
+        protected final Parameter<Integer> clumpingFactor = new Parameter<>(
+            KNNConstants.CLUMPING_FACTOR,
+            false,
+            () -> null,
+            (n, c, o) -> {
+                if (o == null) {
+                    return null;
+                }
+                int value;
+                try {
+                    value = XContentMapValues.nodeIntegerValue(o);
+                } catch (Exception exception) {
+                    throw new IllegalArgumentException(
+                        String.format(Locale.ROOT, "Unable to parse [%s] from provided value [%s] for vector [%s]",
+                            KNNConstants.CLUMPING_FACTOR, o, name)
+                    );
+                }
+                if (value < ClumpingContext.MIN_CLUMPING_FACTOR || value > ClumpingContext.MAX_CLUMPING_FACTOR) {
+                    throw new IllegalArgumentException(
+                        String.format(Locale.ROOT, "[%s] must be between %d and %d, got %d for vector [%s]",
+                            KNNConstants.CLUMPING_FACTOR, ClumpingContext.MIN_CLUMPING_FACTOR,
+                            ClumpingContext.MAX_CLUMPING_FACTOR, value, name)
+                    );
+                }
+                return value;
+            },
+            m -> toType(m).originalMappingParameters.getClumpingFactor()
+        ).acceptsNull();
+
         protected final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         protected ModelDao modelDao;
@@ -255,7 +290,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 mode,
                 compressionLevel,
                 topLevelSpaceType,
-                topLevelEngine
+                topLevelEngine,
+                clumpingFactor
             );
         }
 
@@ -503,6 +539,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             }
             validateDimensionSet(builder);
             validateCompressionAndModeNotSet(builder, builder.name(), "flat");
+            validateClumpingNotSet(builder, "flat");
         }
 
         private void validateFromModel(KNNVectorFieldMapper.Builder builder) {
@@ -516,6 +553,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             }
 
             validateCompressionAndModeNotSet(builder, builder.name(), "model");
+            validateClumpingNotSet(builder, "model");
         }
 
         private void validateFromKNNMethod(KNNVectorFieldMapper.Builder builder) {
@@ -533,6 +571,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 }
             }
             validateDimensionSet(builder);
+            validateClumpingEngine(builder);
         }
 
         private void validateDimensionSet(KNNVectorFieldMapper.Builder builder) {
@@ -549,6 +588,38 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                         "Compression and mode can not be specified in a %s mapping configuration for field: %s",
                         context,
                         name
+                    )
+                );
+            }
+        }
+
+        private void validateClumpingNotSet(KNNVectorFieldMapper.Builder builder, String context) {
+            if (builder.clumpingFactor.get() != null) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] cannot be specified in a %s mapping configuration for field: %s",
+                        KNNConstants.CLUMPING_FACTOR,
+                        context,
+                        builder.name()
+                    )
+                );
+            }
+        }
+
+        private void validateClumpingEngine(KNNVectorFieldMapper.Builder builder) {
+            Integer factor = builder.clumpingFactor.get();
+            if (factor == null) {
+                return;
+            }
+            KNNMethodContext resolvedCtx = builder.originalParameters.getResolvedKnnMethodContext();
+            if (resolvedCtx != null && KNNEngine.LUCENE.equals(resolvedCtx.getKnnEngine())) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] is only supported for native engines (faiss, nmslib), not lucene, for field: %s",
+                        KNNConstants.CLUMPING_FACTOR,
+                        builder.name()
                     )
                 );
             }

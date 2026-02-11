@@ -22,6 +22,7 @@ import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.opensearch.common.StopWatch;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.query.memoryoptsearch.MemoryOptimizedKNNWeight;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.profile.KNNProfileUtil;
@@ -54,6 +55,7 @@ public class KNNQuery extends Query {
     private final String indexName;
     private final VectorDataType vectorDataType;
     private final RescoreContext rescoreContext;
+    private final ClumpingContext clumpingContext;
     @Setter
     private Query filterQuery;
     @Getter
@@ -140,6 +142,7 @@ public class KNNQuery extends Query {
         this.parentsFilter = parentsFilter;
         this.vectorDataType = vectorDataType;
         this.rescoreContext = rescoreContext;
+        this.clumpingContext = null;
         this.originalQueryVector = queryVector;
     }
 
@@ -313,7 +316,8 @@ public class KNNQuery extends Query {
             parentsFilter,
             radius,
             methodParameters,
-            rescoreContext
+            rescoreContext,
+            clumpingContext
         );
     }
 
@@ -334,7 +338,8 @@ public class KNNQuery extends Query {
             && Objects.equals(indexName, other.indexName)
             && Objects.equals(parentsFilter, other.parentsFilter)
             && Objects.equals(filterQuery, other.filterQuery)
-            && Objects.equals(rescoreContext, other.rescoreContext);
+            && Objects.equals(rescoreContext, other.rescoreContext)
+            && Objects.equals(clumpingContext, other.clumpingContext);
     }
 
     /**

@@ -41,6 +41,7 @@ import org.opensearch.knn.index.mapper.KNNVectorFieldType;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.query.parser.RescoreParser;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.util.IndexUtil;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.indices.ModelMetadata;
@@ -445,6 +446,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         SpaceType spaceType = queryConfigFromMapping.getSpaceType();
         VectorDataType vectorDataType = queryConfigFromMapping.getVectorDataType();
         RescoreContext processedRescoreContext = knnVectorFieldType.resolveRescoreContext(rescoreContext);
+        ClumpingContext clumpingContext = knnVectorFieldType.resolveClumpingContext();
         // Transform the query vector if it's required. It will return `vector` itself if transform is not needed.
         // Otherwise, it will return a new transformed vector.
         final float[] transformedQueryVector = knnVectorFieldType.transformQueryVector(vector);
@@ -584,6 +586,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
                 .filter(this.filter)
                 .context(context)
                 .rescoreContext(processedRescoreContext)
+                .clumpingContext(clumpingContext)
                 .expandNested(expandNested == null ? false : expandNested)
                 .memoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
                 .build();

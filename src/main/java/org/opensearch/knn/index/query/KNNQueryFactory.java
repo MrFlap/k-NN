@@ -16,6 +16,7 @@ import org.opensearch.knn.index.query.common.QueryUtils;
 import org.opensearch.knn.index.query.lucenelib.OSKnnByteVectorQuery;
 import org.opensearch.knn.index.query.lucenelib.OSKnnFloatVectorQuery;
 import org.opensearch.knn.index.query.lucenelib.NestedKnnVectorQueryFactory;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.query.lucene.LuceneEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.nativelib.NativeEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
@@ -50,6 +51,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
         final Query filterQuery = getFilterQuery(createQueryRequest);
         final Map<String, ?> methodParameters = createQueryRequest.getMethodParameters();
         final RescoreContext rescoreContext = createQueryRequest.getRescoreContext().orElse(null);
+        final ClumpingContext clumpingContext = createQueryRequest.getClumpingContext().orElse(null);
         final boolean expandNested = createQueryRequest.isExpandNested();
         final boolean memoryOptimizedSearchEnabled = createQueryRequest.isMemoryOptimizedSearchEnabled();
 
@@ -97,6 +99,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
                         .filterQuery(validatedFilterQuery)
                         .vectorDataType(vectorDataType)
                         .rescoreContext(rescoreContext)
+                        .clumpingContext(clumpingContext)
                         .shardId(shardId)
                         .isMemoryOptimizedSearch(memoryOptimizedSearchEnabled)
                         .build();
@@ -114,6 +117,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
                         .filterQuery(validatedFilterQuery)
                         .vectorDataType(vectorDataType)
                         .rescoreContext(rescoreContext)
+                        .clumpingContext(clumpingContext)
                         .shardId(shardId)
                         .isMemoryOptimizedSearch(memoryOptimizedSearchEnabled)
                         .build();
@@ -121,6 +125,7 @@ public class KNNQueryFactory extends BaseQueryFactory {
 
             if (memoryOptimizedSearchEnabled
                 || createQueryRequest.getRescoreContext().isPresent()
+                || (clumpingContext != null && clumpingContext.isEnabled())
                 || (ENGINES_SUPPORTING_NESTED_FIELDS.contains(createQueryRequest.getKnnEngine()) && expandNested)) {
                 return new NativeEngineKnnVectorQuery(knnQuery, QueryUtils.getInstance(), expandNested);
             }
