@@ -38,6 +38,7 @@ import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
 import static org.opensearch.knn.common.KNNConstants.QFRAMEWORK_CONFIG;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
 import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_FACTOR;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.buildDocValuesFieldType;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createStoredFieldForByteVector;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createStoredFieldForFloatVector;
@@ -112,6 +113,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
                 @Override
                 public KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
                     return libraryContext;
+                }
+
+                @Override
+                public Optional<Integer> getClumpingFactor() {
+                    return originalMappingParameters.getOptionalClumpingFactor();
                 }
             },
             indexCreatedVersion
@@ -199,6 +205,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
             } catch (IOException ioe) {
                 throw new RuntimeException(String.format("Unable to create KNNVectorFieldMapper: %s", ioe), ioe);
             }
+
+            // Store clumping factor as a field attribute so it's available during index build
+            originalMappingParameters.getOptionalClumpingFactor().ifPresent(
+                factor -> this.fieldType.putAttribute(CLUMPING_FACTOR, String.valueOf(factor))
+            );
 
             if (useLuceneBasedVectorField) {
                 int adjustedDimension = mappedFieldType.vectorDataType == VectorDataType.BINARY

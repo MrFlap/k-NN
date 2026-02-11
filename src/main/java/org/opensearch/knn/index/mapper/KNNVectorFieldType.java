@@ -24,6 +24,7 @@ import org.opensearch.knn.index.KNNVectorIndexFieldData;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
+import org.opensearch.knn.index.query.clumping.ClumpingContext;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.indices.ModelMetadata;
@@ -150,6 +151,18 @@ public class KNNVectorFieldType extends MappedFieldType {
         CompressionLevel compressionLevel = knnMappingConfig.getCompressionLevel();
         Mode mode = knnMappingConfig.getMode();
         return compressionLevel.getDefaultRescoreContext(mode, dimension, knnMappingConfig.getIndexCreatedVersion());
+    }
+
+    /**
+     * Resolve the clumping context from the field's mapping configuration.
+     * Returns a {@link ClumpingContext} if clumping_factor is configured (>= 2), otherwise null.
+     *
+     * @return {@link ClumpingContext} or null if clumping is not configured
+     */
+    public ClumpingContext resolveClumpingContext() {
+        return getKnnMappingConfig().getClumpingFactor()
+            .map(factor -> ClumpingContext.builder().clumpingFactor(factor).enabled(true).build())
+            .orElse(null);
     }
 
     /**

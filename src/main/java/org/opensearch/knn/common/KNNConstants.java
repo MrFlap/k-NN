@@ -210,4 +210,8 @@ public class KNNConstants {
 
     // Bit manipulation constants for quantization
     public static final int BYTE_ALIGNMENT_MASK = 7; // Used for rounding up to nearest byte (Byte.SIZE - 1)
+
+    // Clumping constants
+    public static final String CLUMP_FILE_EXTENSION = ".clump";
+    public static final String CLUMPING_FACTOR = "clumping_factor";
 }

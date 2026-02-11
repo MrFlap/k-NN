@@ -12,6 +12,7 @@ import org.apache.lucene.codecs.CompoundFormat;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
+import org.opensearch.knn.index.codec.nativeindex.clumping.ClumpFileFormat;
 import org.opensearch.knn.index.engine.KNNEngine;
 
 import java.io.IOException;
@@ -49,6 +50,7 @@ public class KNN80CompoundFormat extends CompoundFormat {
         for (KNNEngine knnEngine : KNNEngine.getEnginesThatCreateCustomSegmentFiles()) {
             writeEngineFiles(dir, si, context, knnEngine.getExtension());
         }
+        writeEngineFiles(dir, si, context, ClumpFileFormat.CLUMP_FILE_EXTENSION);
         delegate.write(dir, si, context);
     }
 
