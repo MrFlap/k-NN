@@ -46,6 +46,8 @@ import org.opensearch.search.profile.AbstractProfileBreakdown;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.query.QueryProfiler;
 
+import org.opensearch.knn.index.query.clumping.ClumpingExpander;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -134,8 +136,31 @@ public class NativeEngineKnnVectorQuery extends Query {
         // e.g. Let's say we got 100 result per each segment where #segments=3, then 300 should be returned as total hit.
         // Therefore, when memory optimized search is enabled, we should skip taking top-k and return whatever we got from approximate
         // search.
-        if (knnQuery.isMemoryOptimizedSearch() == false) {
+        // When clumping is enabled, we also skip the pre-expansion reduceToTopK. Each segment returns up to k markers,
+        // and the clumping expansion needs ALL of them to look up hidden vectors. Reducing before expansion would trim
+        // markers across segments to a global top-k, leaving each segment with only a few markers and missing most
+        // hidden vectors. The final reduceToTopK happens after expansion instead.
+        final boolean clumpingEnabled = knnQuery.getClumpingContext() != null && knnQuery.getClumpingContext().isEnabled();
+        if (knnQuery.isMemoryOptimizedSearch() == false && clumpingEnabled == false) {
             ResultUtil.reduceToTopK(perLeafResults, finalK);
+        }
+
+        // Expand clumped results: if a clump file exists, marker vectors are expanded to include hidden vectors
+        if (clumpingEnabled) {
+            StopWatch clumpStopWatch = new StopWatch().start();
+            perLeafResults = ClumpingExpander.expandClumpedResults(
+                perLeafResults,
+                leafReaderContexts,
+                knnWeight,
+                knnQuery.getField(),
+                knnQuery.getQueryVector(),
+                knnQuery.getByteQueryVector(),
+                finalK
+            );
+            // Reduce to top k after expansion — this is the only reduceToTopK when clumping is active
+            ResultUtil.reduceToTopK(perLeafResults, finalK);
+            long clumpTime = clumpStopWatch.stop().totalTime().millis();
+            log.info("Clumping expansion took {} ms", clumpTime);
         }
 
         if (expandNestedDocs) {

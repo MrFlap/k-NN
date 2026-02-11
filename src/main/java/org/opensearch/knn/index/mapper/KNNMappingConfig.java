@@ -76,4 +76,14 @@ public interface KNNMappingConfig {
     default KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
         return null;
     }
+
+    /**
+     * Returns the clumping factor configured for this field. When clumping is enabled (factor >= 2),
+     * only every nth vector is inserted into the native index as a "marker" vector.
+     *
+     * @return Optional containing the clumping factor, or empty if not configured
+     */
+    default Optional<Integer> getClumpingFactor() {
+        return Optional.empty();
+    }
 }

@@ -8,7 +8,12 @@ package org.opensearch.knn.index.codec.nativeindex;
 import lombok.Setter;
 import org.apache.lucene.index.FieldInfo;
 import org.opensearch.index.IndexSettings;
+<<<<<<< HEAD
 import org.opensearch.knn.common.FieldInfoExtractor;
+=======
+import org.opensearch.knn.index.codec.nativeindex.clumping.ClumpingIndexBuildStrategy;
+import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
+>>>>>>> 27da7db6 (Clumping init)
 import org.opensearch.knn.index.codec.nativeindex.remote.RemoteIndexBuildStrategy;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.faiss.FaissSQEncoder;
@@ -20,7 +25,11 @@ import java.io.IOException;
 import java.util.function.Supplier;
 
 import static org.opensearch.knn.common.FieldInfoExtractor.extractKNNEngine;
+<<<<<<< HEAD
 import static org.opensearch.knn.common.KNNConstants.MIN_DOCS_FOR_REMOTE_INDEX_BUILD;
+=======
+import static org.opensearch.knn.common.KNNConstants.CLUMPING_FACTOR;
+>>>>>>> 27da7db6 (Clumping init)
 import static org.opensearch.knn.common.KNNConstants.MODEL_ID;
 import static org.opensearch.knn.index.KNNSettings.isKNNRemoteVectorBuildEnabled;
 import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorValues;
@@ -80,9 +89,18 @@ public final class NativeIndexBuildStrategyFactory {
             && isKNNRemoteVectorBuildEnabled()
             && knnEngine.supportsRemoteIndexBuild(knnLibraryIndexingContext)
             && RemoteIndexBuildStrategy.shouldBuildIndexRemotely(indexSettings, vectorBlobLength)) {
-            return new RemoteIndexBuildStrategy(repositoriesServiceSupplier, strategy, indexSettings, knnLibraryIndexingContext);
-        } else {
-            return strategy;
+            strategy = new RemoteIndexBuildStrategy(repositoriesServiceSupplier, strategy, indexSettings, knnLibraryIndexingContext);
         }
+
+        // Wrap with clumping if configured
+        String clumpingFactorStr = fieldInfo.attributes().get(CLUMPING_FACTOR);
+        if (clumpingFactorStr != null) {
+            int clumpingFactor = Integer.parseInt(clumpingFactorStr);
+            if (clumpingFactor >= 2) {
+                strategy = new ClumpingIndexBuildStrategy(strategy, clumpingFactor);
+            }
+        }
+
+        return strategy;
     }
 }
