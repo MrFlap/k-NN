@@ -17,7 +17,7 @@ package org.opensearch.knn.index.codec.nativeindex.clumping;
  *   [Header]
  *     4 bytes: numMarkers (int)
  *     4 bytes: dimension (int)
- *     1 byte:  vectorDataType (0 = float, 1 = byte)
+ *     1 byte:  vectorDataType (0 = float, 1 = byte, 2 = fp16)
  *
  *   [Marker Table] — numMarkers entries, each (4 + 4 + 8) = 16 bytes
  *     For each marker i:
@@ -53,6 +53,8 @@ public final class ClumpFileFormat {
     /** Vector data type codes stored in the header. */
     public static final byte VECTOR_TYPE_FLOAT = 0;
     public static final byte VECTOR_TYPE_BYTE = 1;
+    /** FP16 (half-precision float): 2 bytes per dimension. Halves I/O for hidden vectors. */
+    public static final byte VECTOR_TYPE_FP16 = 2;
 
     /** Header size: numMarkers (4) + dimension (4) + vectorDataType (1) = 9 bytes. */
     public static final int HEADER_BYTES = Integer.BYTES + Integer.BYTES + Byte.BYTES;
@@ -87,7 +89,12 @@ public final class ClumpFileFormat {
      * Returns the number of bytes per vector element for the given data type code.
      */
     public static int bytesPerElement(byte vectorDataType) {
-        return vectorDataType == VECTOR_TYPE_FLOAT ? Float.BYTES : Byte.BYTES;
+        if (vectorDataType == VECTOR_TYPE_FLOAT) {
+            return Float.BYTES;
+        } else if (vectorDataType == VECTOR_TYPE_FP16) {
+            return Short.BYTES;
+        }
+        return Byte.BYTES;
     }
 
     /**

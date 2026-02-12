@@ -208,6 +208,11 @@ public final class ClumpFileWriter {
             for (float v : fv) {
                 output.writeInt(Float.floatToIntBits(v));
             }
+        } else if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16) {
+            float[] fv = (float[]) vector;
+            for (float v : fv) {
+                output.writeShort(Float.floatToFloat16(v));
+            }
         } else {
             byte[] bv = (byte[]) vector;
             output.writeBytes(bv, bv.length);
@@ -231,6 +236,17 @@ public final class ClumpFileWriter {
                 buf[off + 1] = (byte) (bits >> 8);
                 buf[off + 2] = (byte) (bits >> 16);
                 buf[off + 3] = (byte) (bits >> 24);
+            }
+            raf.write(buf);
+        } else if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16) {
+            float[] fv = (float[]) vector;
+            byte[] buf = new byte[fv.length * Short.BYTES];
+            for (int i = 0; i < fv.length; i++) {
+                short fp16 = Float.floatToFloat16(fv[i]);
+                int off = i * Short.BYTES;
+                // Little-endian
+                buf[off] = (byte) fp16;
+                buf[off + 1] = (byte) (fp16 >> 8);
             }
             raf.write(buf);
         } else {
