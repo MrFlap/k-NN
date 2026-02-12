@@ -126,6 +126,7 @@ public final class ClumpFileReader {
             Arrays.sort(matchedIndices);
 
             boolean isFloat = (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT);
+            boolean isFp16 = (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16);
             int hiddenEntrySize = Integer.BYTES + vectorSize;
 
             // Phase 1: READ — parallel. Each marker's hidden entries are bulk-read into
@@ -141,7 +142,6 @@ public final class ClumpFileReader {
                     clonedInput.readBytes(buf, 0, bytesToRead);
                 } catch (IOException e) {
                     log.warn("Error reading hidden entries for marker index {}", markerIndex, e);
-                    // Leave buf as zeroes; scoring phase will produce zero-score entries
                 }
                 markerBulkData[idx] = buf;
             });
@@ -163,6 +163,17 @@ public final class ClumpFileReader {
                         int hiddenDocId = bb.getInt();
                         for (int d = 0; d < dimension; d++) {
                             reusableVector[d] = bb.getFloat();
+                        }
+                        float score = similarityFunction.compare(floatQueryVector, reusableVector);
+                        scoredHidden.add(new ScoreDoc(hiddenDocId, score));
+                    }
+                } else if (isFp16) {
+                    // FP16: read 2 bytes per dimension, decode to float via Float.float16ToFloat
+                    float[] reusableVector = new float[dimension];
+                    for (int j = 0; j < numHidden; j++) {
+                        int hiddenDocId = bb.getInt();
+                        for (int d = 0; d < dimension; d++) {
+                            reusableVector[d] = Float.float16ToFloat(bb.getShort());
                         }
                         float score = similarityFunction.compare(floatQueryVector, reusableVector);
                         scoredHidden.add(new ScoreDoc(hiddenDocId, score));
