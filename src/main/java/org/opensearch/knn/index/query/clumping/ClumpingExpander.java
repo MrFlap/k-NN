@@ -10,6 +10,7 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.store.Directory;
@@ -29,6 +30,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
 
 /**
  * Expands clumped search results by reading hidden vectors directly from the .clump
@@ -44,11 +46,9 @@ public final class ClumpingExpander {
     private ClumpingExpander() {}
 
     /**
-     * Expands per-leaf results by reading hidden vectors from the .clump file,
-     * scoring them directly against the query vector, and merging into results.
-     * <p>
-     * No ExactSearcher or Lucene vector storage access is needed — all vector data
-     * is read sequentially from the clump file.
+     * Expands per-leaf results in parallel using the provided {@link TaskExecutor}
+     * for cross-segment parallelism. Within each leaf, marker expansion is further
+     * parallelized via a parallel stream in {@link ClumpFileReader}.
      *
      * @param perLeafResults     The per-leaf results from ANN search (containing marker vectors)
      * @param leafReaderContexts The leaf reader contexts
@@ -57,6 +57,7 @@ public final class ClumpingExpander {
      * @param queryVector        The float query vector (may be null for byte vectors)
      * @param byteQueryVector    The byte query vector (may be null for float vectors)
      * @param k                  The final k to return
+     * @param taskExecutor       The Lucene task executor from the IndexSearcher for parallel execution
      * @return Expanded per-leaf results including hidden vectors
      */
     public static List<PerLeafResult> expandClumpedResults(
@@ -66,122 +67,127 @@ public final class ClumpingExpander {
         String fieldName,
         float[] queryVector,
         byte[] byteQueryVector,
-        int k
+        int k,
+        TaskExecutor taskExecutor
     ) throws IOException {
-        List<PerLeafResult> expandedResults = new ArrayList<>(perLeafResults.size());
-
+        List<Callable<PerLeafResult>> tasks = new ArrayList<>(perLeafResults.size());
         for (int i = 0; i < perLeafResults.size(); i++) {
-            PerLeafResult leafResult = perLeafResults.get(i);
-            LeafReaderContext leafCtx = leafReaderContexts.get(i);
+            final PerLeafResult leafResult = perLeafResults.get(i);
+            final LeafReaderContext leafCtx = leafReaderContexts.get(i);
+            tasks.add(() -> expandLeaf(leafResult, leafCtx, fieldName, queryVector, byteQueryVector));
+        }
+        return taskExecutor.invokeAll(tasks);
+    }
 
-            if (leafResult.getResult().scoreDocs.length == 0) {
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            SegmentReader reader = Lucene.segmentReader(leafCtx.reader());
-            String segmentName = reader.getSegmentName();
-
-            // Get the outer directory where .clumpc files live.
-            // When segments are compounded, reader.directory() is a KNN80CompoundDirectory
-            // whose listAll() only shows files inside the .cfs. The .clumpc sidecar lives
-            // in the outer directory, so we need to unwrap it.
-            Directory clumpDirectory = reader.directory();
-            if (clumpDirectory instanceof KNN80CompoundDirectory) {
-                clumpDirectory = ((KNN80CompoundDirectory) clumpDirectory).getDir();
-            }
-
-            // Check if a clump file exists for this segment and field
-            boolean hasClumpFile;
-            try {
-                hasClumpFile = ClumpFileReader.clumpFileExists(clumpDirectory, segmentName, fieldName);
-            } catch (IOException e) {
-                log.warn("Error checking for clump file, skipping expansion for segment {}", segmentName, e);
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            if (hasClumpFile == false) {
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            // Get the similarity function for scoring hidden vectors
-            KNNVectorSimilarityFunction similarityFunction = getSimilarityFunction(reader, fieldName);
-            if (similarityFunction == null) {
-                log.warn("Could not determine similarity function for field {}, skipping expansion", fieldName);
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            // Get marker doc IDs from the search results
-            int[] markerDocIds = Arrays.stream(leafResult.getResult().scoreDocs)
-                .mapToInt(sd -> sd.doc)
-                .toArray();
-
-            // Read hidden vectors from .clump file and score them inline
-            List<ScoreDoc> scoredHidden;
-            try {
-                scoredHidden = ClumpFileReader.getHiddenVectorsScored(
-                    clumpDirectory,
-                    segmentName,
-                    fieldName,
-                    markerDocIds,
-                    queryVector,
-                    byteQueryVector,
-                    similarityFunction
-                );
-            } catch (IOException e) {
-                log.warn("Error reading clump file, skipping expansion for segment {}", segmentName, e);
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            if (scoredHidden.isEmpty()) {
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            // Remove any hidden docs that are already in the marker results
-            Set<Integer> existingDocIds = new HashSet<>();
-            for (ScoreDoc sd : leafResult.getResult().scoreDocs) {
-                existingDocIds.add(sd.doc);
-            }
-            scoredHidden.removeIf(sd -> existingDocIds.contains(sd.doc));
-
-            if (scoredHidden.isEmpty()) {
-                expandedResults.add(leafResult);
-                continue;
-            }
-
-            // Merge marker results with scored hidden results
-            ScoreDoc[] markerDocs = leafResult.getResult().scoreDocs;
-            ScoreDoc[] merged = new ScoreDoc[markerDocs.length + scoredHidden.size()];
-            System.arraycopy(markerDocs, 0, merged, 0, markerDocs.length);
-            for (int j = 0; j < scoredHidden.size(); j++) {
-                merged[markerDocs.length + j] = scoredHidden.get(j);
-            }
-
-            TotalHits totalHits = new TotalHits(merged.length, TotalHits.Relation.EQUAL_TO);
-            TopDocs mergedTopDocs = new TopDocs(totalHits, merged);
-
-            expandedResults.add(new PerLeafResult(
-                leafResult.getFilterBits(),
-                leafResult.getFilterBitsCardinality(),
-                mergedTopDocs,
-                leafResult.getSearchMode()
-            ));
-
-            log.debug(
-                "Clumping expansion: segment={}, markers={}, hidden={}, merged={}",
-                segmentName,
-                markerDocIds.length,
-                scoredHidden.size(),
-                merged.length
-            );
+    /**
+     * Expands a single leaf's marker results by reading and scoring hidden vectors
+     * from the .clump sidecar file.
+     */
+    private static PerLeafResult expandLeaf(
+        PerLeafResult leafResult,
+        LeafReaderContext leafCtx,
+        String fieldName,
+        float[] queryVector,
+        byte[] byteQueryVector
+    ) throws IOException {
+        if (leafResult.getResult().scoreDocs.length == 0) {
+            return leafResult;
         }
 
-        return expandedResults;
+        SegmentReader reader = Lucene.segmentReader(leafCtx.reader());
+        String segmentName = reader.getSegmentName();
+
+        // Get the outer directory where .clumpc files live.
+        // When segments are compounded, reader.directory() is a KNN80CompoundDirectory
+        // whose listAll() only shows files inside the .cfs. The .clumpc sidecar lives
+        // in the outer directory, so we need to unwrap it.
+        Directory clumpDirectory = reader.directory();
+        if (clumpDirectory instanceof KNN80CompoundDirectory) {
+            clumpDirectory = ((KNN80CompoundDirectory) clumpDirectory).getDir();
+        }
+
+        // Check if a clump file exists for this segment and field
+        boolean hasClumpFile;
+        try {
+            hasClumpFile = ClumpFileReader.clumpFileExists(clumpDirectory, segmentName, fieldName);
+        } catch (IOException e) {
+            log.warn("Error checking for clump file, skipping expansion for segment {}", segmentName, e);
+            return leafResult;
+        }
+
+        if (hasClumpFile == false) {
+            return leafResult;
+        }
+
+        // Get the similarity function for scoring hidden vectors
+        KNNVectorSimilarityFunction similarityFunction = getSimilarityFunction(reader, fieldName);
+        if (similarityFunction == null) {
+            log.warn("Could not determine similarity function for field {}, skipping expansion", fieldName);
+            return leafResult;
+        }
+
+        // Get marker doc IDs from the search results
+        int[] markerDocIds = Arrays.stream(leafResult.getResult().scoreDocs)
+            .mapToInt(sd -> sd.doc)
+            .toArray();
+
+        // Read hidden vectors from .clump file and score them inline
+        List<ScoreDoc> scoredHidden;
+        try {
+            scoredHidden = ClumpFileReader.getHiddenVectorsScored(
+                clumpDirectory,
+                segmentName,
+                fieldName,
+                markerDocIds,
+                queryVector,
+                byteQueryVector,
+                similarityFunction
+            );
+        } catch (IOException e) {
+            log.warn("Error reading clump file, skipping expansion for segment {}", segmentName, e);
+            return leafResult;
+        }
+
+        if (scoredHidden.isEmpty()) {
+            return leafResult;
+        }
+
+        // Remove any hidden docs that are already in the marker results
+        Set<Integer> existingDocIds = new HashSet<>();
+        for (ScoreDoc sd : leafResult.getResult().scoreDocs) {
+            existingDocIds.add(sd.doc);
+        }
+        scoredHidden.removeIf(sd -> existingDocIds.contains(sd.doc));
+
+        if (scoredHidden.isEmpty()) {
+            return leafResult;
+        }
+
+        // Merge marker results with scored hidden results
+        ScoreDoc[] markerDocs = leafResult.getResult().scoreDocs;
+        ScoreDoc[] merged = new ScoreDoc[markerDocs.length + scoredHidden.size()];
+        System.arraycopy(markerDocs, 0, merged, 0, markerDocs.length);
+        for (int j = 0; j < scoredHidden.size(); j++) {
+            merged[markerDocs.length + j] = scoredHidden.get(j);
+        }
+
+        TotalHits totalHits = new TotalHits(merged.length, TotalHits.Relation.EQUAL_TO);
+        TopDocs mergedTopDocs = new TopDocs(totalHits, merged);
+
+        log.debug(
+            "Clumping expansion: segment={}, markers={}, hidden={}, merged={}",
+            segmentName,
+            markerDocIds.length,
+            scoredHidden.size(),
+            merged.length
+        );
+
+        return new PerLeafResult(
+            leafResult.getFilterBits(),
+            leafResult.getFilterBitsCardinality(),
+            mergedTopDocs,
+            leafResult.getSearchMode()
+        );
     }
 
     /**
