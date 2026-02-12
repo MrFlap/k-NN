@@ -6,16 +6,26 @@
 package org.opensearch.knn.index.codec.nativeindex.clumping;
 
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategy;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
+import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.query.KNNQueryResult;
+import org.opensearch.knn.index.store.IndexInputWithBuffer;
+import org.opensearch.knn.index.store.IndexOutputWithBuffer;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
+import org.opensearch.knn.jni.JNIService;
 
 import java.io.IOException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
@@ -26,13 +36,14 @@ import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorV
  * <p>
  * Every nth vector (starting from 0) is designated a "marker" vector and is inserted into the
  * native index via the delegate strategy. The remaining "hidden" vectors are not inserted into
- * the native index. Instead, after all marker vectors are indexed, each hidden vector is assigned
- * to its nearest marker via brute-force L2 distance. The mapping — including all vector data —
- * is written to a .clump sidecar file so that expansion at query time can read vectors
- * sequentially without random access into Lucene's vector storage.
+ * the native index. Instead, after the marker-only index is built, each hidden vector is assigned
+ * to its nearest marker by searching the native index with k=1 via JNI. The mapping — including
+ * all vector data — is written to a .clump sidecar file so that expansion at query time can read
+ * vectors sequentially without random access into Lucene's vector storage.
  * <p>
- * Memory budget: O(marker vectors) = O(1/clumpingFactor × total). Hidden vectors are spilled
- * to a temp file during assignment and never held in heap simultaneously.
+ * The marker index is first built into a temporary file so it can be loaded and searched via JNI.
+ * After hidden vector assignment is complete, the temp file contents are copied to the real engine
+ * output and the temp file is deleted.
  */
 @Log4j2
 public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
@@ -86,49 +97,31 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             return;
         }
 
-        // Build native index with only marker vectors
-        BuildIndexParams markerIndexParams = BuildIndexParams.builder()
-            .fieldName(indexInfo.getFieldName())
-            .knnEngine(indexInfo.getKnnEngine())
-            .indexOutputWithBuffer(indexInfo.getIndexOutputWithBuffer())
-            .vectorDataType(indexInfo.getVectorDataType())
-            .parameters(indexInfo.getParameters())
-            .quantizationState(indexInfo.getQuantizationState())
-            .knnVectorValuesSupplier(() -> {
-                try {
-                    return new FilteredKNNVectorValues(markerDocIds, indexInfo);
-                } catch (IOException e) {
-                    throw new RuntimeException("Failed to create filtered vector values", e);
-                }
-            })
-            .totalLiveDocs(markerDocIds.size())
-            .segmentWriteState(indexInfo.getSegmentWriteState())
-            .isFlush(indexInfo.isFlush())
-            .build();
+        final KNNEngine knnEngine = indexInfo.getKnnEngine();
+        final String segmentName = indexInfo.getSegmentWriteState().segmentInfo.name;
+        final String fieldName = indexInfo.getFieldName();
 
-        delegate.buildAndWriteIndex(markerIndexParams);
+        // Build marker index into a temp file so we can load it for searching
+        String tempEngineFileName = segmentName + "_" + fieldName + ".clumpidx";
+        buildMarkerIndexToTempFile(indexInfo, markerDocIds, tempEngineFileName);
 
-        // Pass 2: assign hidden vectors to nearest markers.
-        // Marker vectors are held in memory (1/N of total).
-        // Hidden vectors are spilled to a temp file immediately after scoring — never held in heap.
-        String tempFileName = ClumpFileWriter.buildTempFileName(
-            indexInfo.getSegmentWriteState().segmentInfo.name,
-            indexInfo.getFieldName()
-        );
-
-        int dimension;
-        byte vectorDataType;
+        // Load the temp index, assign hidden vectors, then clean up
         int[] numHiddenPerMarker = new int[markerDocIds.size()];
         List<HiddenEntryLocation> hiddenEntryLocations;
         List<Object> markerVectors;
+        int dimension;
+        byte vectorDataType;
+
+        String tempHiddenFileName = ClumpFileWriter.buildTempFileName(segmentName, fieldName);
 
         try (
-            IndexOutput tempOutput = indexInfo.getSegmentWriteState().directory.createOutput(
-                tempFileName, indexInfo.getSegmentWriteState().context
+            IndexOutput tempHiddenOutput = indexInfo.getSegmentWriteState().directory.createOutput(
+                tempHiddenFileName, indexInfo.getSegmentWriteState().context
             )
         ) {
-            AssignmentResult result = assignHiddenToMarkersStreaming(
-                indexInfo, markerDocIds, hiddenDocIds, numHiddenPerMarker, tempOutput
+            AssignmentResult result = assignHiddenToMarkersViaIndex(
+                indexInfo, markerDocIds, hiddenDocIds, numHiddenPerMarker,
+                tempHiddenOutput, tempEngineFileName, knnEngine
             );
             dimension = result.dimension;
             vectorDataType = result.vectorDataType;
@@ -136,75 +129,92 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             markerVectors = result.markerVectors;
         }
 
+        // Copy the temp engine file to the real output, then clean it up
+        copyTempToRealOutput(indexInfo, tempEngineFileName);
+        deleteTempFile(indexInfo, tempEngineFileName);
+
         // Write the final .clump file, reading hidden vectors back from the temp file
         try (
-            IndexInput tempInput = indexInfo.getSegmentWriteState().directory.openInput(
-                tempFileName, indexInfo.getSegmentWriteState().context
+            IndexInput tempHiddenInput = indexInfo.getSegmentWriteState().directory.openInput(
+                tempHiddenFileName, indexInfo.getSegmentWriteState().context
             )
         ) {
             ClumpFileWriter.writeClumpFile(
                 indexInfo.getSegmentWriteState(),
-                indexInfo.getFieldName(),
+                fieldName,
                 dimension,
                 vectorDataType,
                 markerDocIds,
                 markerVectors,
                 numHiddenPerMarker,
                 hiddenEntryLocations,
-                tempInput
+                tempHiddenInput
             );
         } finally {
-            // Clean up temp file
-            try {
-                indexInfo.getSegmentWriteState().directory.deleteFile(tempFileName);
-            } catch (IOException e) {
-                log.warn("Failed to delete temp clump file {}", tempFileName, e);
-            }
+            deleteTempFile(indexInfo, tempHiddenFileName);
         }
     }
 
     /**
-     * Result of the streaming assignment pass. Contains marker vectors (held in memory),
-     * dimension/type metadata, and the list of hidden entry locations pointing into the temp file.
+     * Builds the marker-only native index into a temporary file in the segment directory.
      */
-    private static class AssignmentResult {
-        final List<Object> markerVectors;
-        final List<HiddenEntryLocation> hiddenEntryLocations;
-        final int dimension;
-        final byte vectorDataType;
+    private void buildMarkerIndexToTempFile(
+        BuildIndexParams indexInfo,
+        List<Integer> markerDocIds,
+        String tempEngineFileName
+    ) throws IOException {
+        try (IndexOutput tempOutput = indexInfo.getSegmentWriteState().directory.createOutput(
+            tempEngineFileName, indexInfo.getSegmentWriteState().context
+        )) {
+            IndexOutputWithBuffer tempOutputWithBuffer = new IndexOutputWithBuffer(tempOutput);
 
-        AssignmentResult(List<Object> markerVectors, List<HiddenEntryLocation> hiddenEntryLocations,
-                         int dimension, byte vectorDataType) {
-            this.markerVectors = markerVectors;
-            this.hiddenEntryLocations = hiddenEntryLocations;
-            this.dimension = dimension;
-            this.vectorDataType = vectorDataType;
+            BuildIndexParams markerIndexParams = BuildIndexParams.builder()
+                .fieldName(indexInfo.getFieldName())
+                .knnEngine(indexInfo.getKnnEngine())
+                .indexOutputWithBuffer(tempOutputWithBuffer)
+                .vectorDataType(indexInfo.getVectorDataType())
+                .parameters(indexInfo.getParameters())
+                .quantizationState(indexInfo.getQuantizationState())
+                .knnVectorValuesSupplier(() -> {
+                    try {
+                        return new FilteredKNNVectorValues(markerDocIds, indexInfo);
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to create filtered vector values", e);
+                    }
+                })
+                .totalLiveDocs(markerDocIds.size())
+                .segmentWriteState(indexInfo.getSegmentWriteState())
+                .isFlush(indexInfo.isFlush())
+                .build();
+
+            delegate.buildAndWriteIndex(markerIndexParams);
         }
     }
 
     /**
-     * Assigns each hidden vector to its nearest marker using streaming.
+     * Assigns each hidden vector to its nearest marker by loading the just-built marker index
+     * via JNI and querying it with k=1 for each hidden vector.
      * <p>
-     * Marker vectors are cloned into memory (1/N of total — same budget as v1).
-     * Hidden vectors are scored against all markers, then immediately spilled to
-     * {@code tempOutput} and discarded. Only a lightweight {@link HiddenEntryLocation}
-     * (12 bytes) is retained per hidden vector.
-     *
-     * @param indexInfo           Build parameters with vector supplier
-     * @param markerDocIds        Ordered marker doc IDs
-     * @param hiddenDocIds        Ordered hidden doc IDs
-     * @param numHiddenPerMarker  Output array: count of hidden vectors per marker (filled by this method)
-     * @param tempOutput          Temp file to spill hidden vector data into
-     * @return Assignment result with marker vectors and hidden entry locations
+     * Marker vectors are cloned into memory (1/N of total).
+     * Hidden vectors are scored via the native index, then immediately spilled to
+     * {@code tempHiddenOutput} and discarded.
      */
-    private AssignmentResult assignHiddenToMarkersStreaming(
+    private AssignmentResult assignHiddenToMarkersViaIndex(
         BuildIndexParams indexInfo,
         List<Integer> markerDocIds,
         List<Integer> hiddenDocIds,
         int[] numHiddenPerMarker,
-        IndexOutput tempOutput
+        IndexOutput tempHiddenOutput,
+        String tempEngineFileName,
+        KNNEngine knnEngine
     ) throws IOException {
-        // First, read marker vectors into memory (only the marker subset — 1/N of total)
+        // Build a reverse map from marker doc ID to marker index for translating JNI results
+        Map<Integer, Integer> markerDocIdToIndex = new HashMap<>(markerDocIds.size());
+        for (int i = 0; i < markerDocIds.size(); i++) {
+            markerDocIdToIndex.put(markerDocIds.get(i), i);
+        }
+
+        // Read marker vectors into memory (1/N of total) for the clump file
         final KNNVectorValues<?> markerScan = indexInfo.getKnnVectorValuesSupplier().get();
         initializeVectorValues(markerScan);
 
@@ -234,38 +244,104 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             markerVectors.add(mv);
         }
 
-        // Now stream hidden vectors: read each one, find nearest marker, spill to temp file
-        final KNNVectorValues<?> hiddenScan = indexInfo.getKnnVectorValuesSupplier().get();
-        initializeVectorValues(hiddenScan);
+        // Load the temp marker index via JNI
+        long indexPointer = loadTempIndex(indexInfo, tempEngineFileName, knnEngine);
 
-        Set<Integer> hiddenSet = new HashSet<>(hiddenDocIds);
-        List<HiddenEntryLocation> hiddenEntryLocations = new ArrayList<>(hiddenDocIds.size());
-        final byte finalVectorDataType = vectorDataType;
+        try {
+            // Stream hidden vectors: read each one, search the native index for nearest marker,
+            // spill to temp file
+            final KNNVectorValues<?> hiddenScan = indexInfo.getKnnVectorValuesSupplier().get();
+            initializeVectorValues(hiddenScan);
 
-        while (hiddenScan.docId() != NO_MORE_DOCS) {
-            if (hiddenSet.contains(hiddenScan.docId())) {
-                // Get vector reference (do NOT clone — we'll write it immediately and discard)
-                Object hiddenVector = hiddenScan.getVector();
-                int nearestIdx = findNearestMarker(hiddenVector, markerVectorArray);
+            Set<Integer> hiddenSet = new HashSet<>(hiddenDocIds);
+            List<HiddenEntryLocation> hiddenEntryLocations = new ArrayList<>(hiddenDocIds.size());
+            final byte finalVectorDataType = vectorDataType;
+            final int finalDimension = dimension;
 
-                // Spill to temp file immediately
-                long tempOffset = ClumpFileWriter.writeHiddenEntryToTemp(
-                    tempOutput, hiddenScan.docId(), hiddenVector, finalVectorDataType
-                );
+            while (hiddenScan.docId() != NO_MORE_DOCS) {
+                if (hiddenSet.contains(hiddenScan.docId())) {
+                    Object hiddenVector = hiddenScan.getVector();
 
-                hiddenEntryLocations.add(new HiddenEntryLocation(nearestIdx, tempOffset));
-                numHiddenPerMarker[nearestIdx]++;
+                    // Search the native index with k=1 to find the nearest marker
+                    int nearestMarkerIdx = findNearestMarkerViaIndex(
+                        hiddenVector, indexPointer, knnEngine, markerDocIdToIndex,
+                        markerVectorArray, finalVectorDataType
+                    );
+
+                    // Spill to temp file immediately
+                    long tempOffset = ClumpFileWriter.writeHiddenEntryToTemp(
+                        tempHiddenOutput, hiddenScan.docId(), hiddenVector, finalVectorDataType
+                    );
+
+                    hiddenEntryLocations.add(new HiddenEntryLocation(nearestMarkerIdx, tempOffset));
+                    numHiddenPerMarker[nearestMarkerIdx]++;
+                }
+                hiddenScan.nextDoc();
             }
-            hiddenScan.nextDoc();
-        }
 
-        return new AssignmentResult(markerVectors, hiddenEntryLocations, dimension, vectorDataType);
+            return new AssignmentResult(markerVectors, hiddenEntryLocations, finalDimension, finalVectorDataType);
+        } finally {
+            // Always free the loaded index — the temp engine file is deleted by the caller
+            // after it has been copied to the real output.
+            freeTempIndex(indexPointer, knnEngine);
+        }
     }
 
     /**
-     * Finds the index of the nearest marker vector using squared L2 distance.
+     * Searches the loaded native index for the nearest marker to the given hidden vector.
+     * Falls back to brute-force L2 if the JNI search returns no results.
+     *
+     * @return the index into the markerDocIds list of the nearest marker
      */
-    private int findNearestMarker(Object hiddenVector, Object[] markerVectors) {
+    private int findNearestMarkerViaIndex(
+        Object hiddenVector,
+        long indexPointer,
+        KNNEngine knnEngine,
+        Map<Integer, Integer> markerDocIdToIndex,
+        Object[] markerVectorArray,
+        byte vectorDataType
+    ) {
+        KNNQueryResult[] results;
+        if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT) {
+            float[] queryVector = (hiddenVector instanceof float[])
+                ? (float[]) hiddenVector
+                : toFloatArray((byte[]) hiddenVector);
+            results = AccessController.doPrivileged((PrivilegedAction<KNNQueryResult[]>) () ->
+                JNIService.queryIndex(
+                    indexPointer, queryVector, 1, null, knnEngine,
+                    null, 0, null
+                )
+            );
+        } else {
+            // For byte vectors, convert to float for querying (JNI queryIndex takes float[])
+            float[] queryVector = toFloatArray((byte[]) hiddenVector);
+            results = AccessController.doPrivileged((PrivilegedAction<KNNQueryResult[]>) () ->
+                JNIService.queryIndex(
+                    indexPointer, queryVector, 1, null, knnEngine,
+                    null, 0, null
+                )
+            );
+        }
+
+        if (results != null && results.length > 0) {
+            int nearestDocId = results[0].getId();
+            Integer markerIndex = markerDocIdToIndex.get(nearestDocId);
+            if (markerIndex != null) {
+                return markerIndex;
+            }
+            log.warn("JNI search returned doc ID {} not in marker set, falling back to brute-force", nearestDocId);
+        } else {
+            log.warn("JNI search returned no results, falling back to brute-force");
+        }
+
+        // Fallback: brute-force L2 distance
+        return findNearestMarkerBruteForce(hiddenVector, markerVectorArray);
+    }
+
+    /**
+     * Brute-force fallback for finding the nearest marker using squared L2 distance.
+     */
+    private int findNearestMarkerBruteForce(Object hiddenVector, Object[] markerVectors) {
         int bestIdx = 0;
         float bestDist = Float.MAX_VALUE;
 
@@ -280,8 +356,64 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
     }
 
     /**
-     * Computes squared L2 distance between two vectors. Works for both float[] and byte[].
+     * Loads the temp marker index file via JNI.
      */
+    private long loadTempIndex(BuildIndexParams indexInfo, String tempEngineFileName, KNNEngine knnEngine) throws IOException {
+        try (
+            IndexInput tempInput = indexInfo.getSegmentWriteState().directory.openInput(
+                tempEngineFileName, IOContext.DEFAULT
+            )
+        ) {
+            IndexInputWithBuffer readStream = new IndexInputWithBuffer(tempInput);
+            return AccessController.doPrivileged((PrivilegedAction<Long>) () ->
+                JNIService.loadIndex(readStream, indexInfo.getParameters(), knnEngine)
+            );
+        }
+    }
+
+    /**
+     * Frees a loaded native index.
+     */
+    private void freeTempIndex(long indexPointer, KNNEngine knnEngine) {
+        try {
+            AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+                JNIService.free(indexPointer, knnEngine);
+                return null;
+            });
+        } catch (Exception e) {
+            log.warn("Failed to free temp index pointer", e);
+        }
+    }
+
+    /**
+     * Copies the temp engine file contents to the real engine output.
+     */
+    private void copyTempToRealOutput(BuildIndexParams indexInfo, String tempEngineFileName) throws IOException {
+        IndexOutput realOutput = indexInfo.getIndexOutputWithBuffer().getIndexOutput();
+        try (
+            IndexInput tempInput = indexInfo.getSegmentWriteState().directory.openInput(
+                tempEngineFileName, IOContext.DEFAULT
+            )
+        ) {
+            long remaining = tempInput.length();
+            byte[] copyBuffer = new byte[64 * 1024];
+            while (remaining > 0) {
+                int toRead = (int) Math.min(remaining, copyBuffer.length);
+                tempInput.readBytes(copyBuffer, 0, toRead);
+                realOutput.writeBytes(copyBuffer, 0, toRead);
+                remaining -= toRead;
+            }
+        }
+    }
+
+    private void deleteTempFile(BuildIndexParams indexInfo, String fileName) {
+        try {
+            indexInfo.getSegmentWriteState().directory.deleteFile(fileName);
+        } catch (IOException e) {
+            log.warn("Failed to delete temp file {}", fileName, e);
+        }
+    }
+
     private float computeDistance(Object a, Object b) {
         if (a instanceof float[] && b instanceof float[]) {
             float[] fa = (float[]) a;
@@ -305,6 +437,14 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         throw new IllegalArgumentException("Unsupported vector types: " + a.getClass() + ", " + b.getClass());
     }
 
+    private static float[] toFloatArray(byte[] bytes) {
+        float[] result = new float[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            result[i] = bytes[i];
+        }
+        return result;
+    }
+
     private Object cloneVector(KNNVectorValues<?> vectorValues) throws IOException {
         Object vector = vectorValues.getVector();
         if (vector instanceof float[]) {
@@ -313,5 +453,24 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             return ((byte[]) vector).clone();
         }
         throw new IllegalArgumentException("Unsupported vector type: " + vector.getClass());
+    }
+
+    /**
+     * Result of the streaming assignment pass. Contains marker vectors (held in memory),
+     * dimension/type metadata, and the list of hidden entry locations pointing into the temp file.
+     */
+    private static class AssignmentResult {
+        final List<Object> markerVectors;
+        final List<HiddenEntryLocation> hiddenEntryLocations;
+        final int dimension;
+        final byte vectorDataType;
+
+        AssignmentResult(List<Object> markerVectors, List<HiddenEntryLocation> hiddenEntryLocations,
+                         int dimension, byte vectorDataType) {
+            this.markerVectors = markerVectors;
+            this.hiddenEntryLocations = hiddenEntryLocations;
+            this.dimension = dimension;
+            this.vectorDataType = vectorDataType;
+        }
     }
 }
