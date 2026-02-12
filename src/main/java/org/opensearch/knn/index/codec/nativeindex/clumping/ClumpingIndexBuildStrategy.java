@@ -265,7 +265,7 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
                 if (dimension == 0) {
                     dimension = (cloned instanceof float[]) ? ((float[]) cloned).length : ((byte[]) cloned).length;
                     vectorDataType = (cloned instanceof float[])
-                        ? ClumpFileFormat.VECTOR_TYPE_FLOAT
+                        ? ClumpFileFormat.VECTOR_TYPE_FP16
                         : ClumpFileFormat.VECTOR_TYPE_BYTE;
                 }
                 markerIdx++;
@@ -341,7 +341,7 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         byte vectorDataType
     ) {
         float[] queryVector;
-        if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT) {
+        if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT || vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16) {
             queryVector = (hiddenVector instanceof float[])
                 ? (float[]) hiddenVector
                 : toFloatArray((byte[]) hiddenVector);
