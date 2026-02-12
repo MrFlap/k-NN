@@ -62,8 +62,11 @@ public final class ClumpFileReader {
      * Expands marker doc IDs by reading their hidden vectors from the .clump file,
      * scoring each hidden vector against the query vector, and returning scored results.
      * <p>
-     * All vector data is read sequentially from the clump file — no random access into
-     * Lucene's vector storage is needed.
+     * The read phase is parallelized: each matched marker's raw hidden entry bytes are
+     * read concurrently via cloned {@link IndexInput} handles on a parallel stream.
+     * The scoring phase runs sequentially over the pre-read byte buffers to avoid
+     * thread-safety concerns with the similarity function and to keep CPU work on the
+     * calling thread.
      *
      * @param directory          The segment directory
      * @param segmentName        The segment name
@@ -109,36 +112,69 @@ public final class ClumpFileReader {
                 allClumpDataOffsets[i] = input.readLong();
             }
 
-            // For each query marker, find its index, seek to its clump data, read + score
-            List<ScoreDoc> scoredHidden = new ArrayList<>();
+            // Resolve which marker table indices match the query markers
+            int[] matchedIndices = Arrays.stream(markerDocIds)
+                .map(docId -> Arrays.binarySearch(allMarkerDocIds, docId))
+                .filter(idx -> idx >= 0 && allNumHidden[idx] > 0)
+                .toArray();
+
+            if (matchedIndices.length == 0) {
+                return Collections.emptyList();
+            }
+
+            // Sort matched indices by file offset for better I/O locality
+            Arrays.sort(matchedIndices);
+
             boolean isFloat = (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT);
+            int hiddenEntrySize = Integer.BYTES + vectorSize;
 
-            for (int queryMarkerDocId : markerDocIds) {
-                int markerIndex = Arrays.binarySearch(allMarkerDocIds, queryMarkerDocId);
-                if (markerIndex < 0) {
-                    continue;
-                }
-
+            // Phase 1: READ — parallel. Each marker's hidden entries are bulk-read into
+            // a byte[] via a cloned IndexInput (independent seek cursor, shared file handle).
+            byte[][] markerBulkData = new byte[matchedIndices.length][];
+            Arrays.stream(matchedIndices).parallel().forEach(markerIndex -> {
+                int idx = Arrays.binarySearch(matchedIndices, markerIndex);
                 int numHidden = allNumHidden[markerIndex];
-                if (numHidden == 0) {
+                int bytesToRead = numHidden * hiddenEntrySize;
+                byte[] buf = new byte[bytesToRead];
+                try (IndexInput clonedInput = input.clone()) {
+                    clonedInput.seek(allClumpDataOffsets[markerIndex] + vectorSize); // skip marker vector
+                    clonedInput.readBytes(buf, 0, bytesToRead);
+                } catch (IOException e) {
+                    log.warn("Error reading hidden entries for marker index {}", markerIndex, e);
+                    // Leave buf as zeroes; scoring phase will produce zero-score entries
+                }
+                markerBulkData[idx] = buf;
+            });
+
+            // Phase 2: SCORE — sequential over the pre-read byte buffers.
+            List<ScoreDoc> scoredHidden = new ArrayList<>();
+            for (int m = 0; m < matchedIndices.length; m++) {
+                int markerIndex = matchedIndices[m];
+                byte[] bulk = markerBulkData[m];
+                if (bulk == null) {
                     continue;
                 }
+                int numHidden = allNumHidden[markerIndex];
+                java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bulk).order(java.nio.ByteOrder.LITTLE_ENDIAN);
 
-                // Seek to clump data: skip marker vector, then read hidden entries sequentially
-                long clumpOffset = allClumpDataOffsets[markerIndex];
-                input.seek(clumpOffset + vectorSize); // skip marker vector
-
-                for (int j = 0; j < numHidden; j++) {
-                    int hiddenDocId = input.readInt();
-                    float score;
-                    if (isFloat) {
-                        float[] hiddenVector = readFloatVector(input, dimension);
-                        score = similarityFunction.compare(floatQueryVector, hiddenVector);
-                    } else {
-                        byte[] hiddenVector = readByteVector(input, dimension);
-                        score = similarityFunction.compare(byteQueryVector, hiddenVector);
+                if (isFloat) {
+                    float[] reusableVector = new float[dimension];
+                    for (int j = 0; j < numHidden; j++) {
+                        int hiddenDocId = bb.getInt();
+                        for (int d = 0; d < dimension; d++) {
+                            reusableVector[d] = bb.getFloat();
+                        }
+                        float score = similarityFunction.compare(floatQueryVector, reusableVector);
+                        scoredHidden.add(new ScoreDoc(hiddenDocId, score));
                     }
-                    scoredHidden.add(new ScoreDoc(hiddenDocId, score));
+                } else {
+                    byte[] reusableVector = new byte[dimension];
+                    for (int j = 0; j < numHidden; j++) {
+                        int hiddenDocId = bb.getInt();
+                        bb.get(reusableVector);
+                        float score = similarityFunction.compare(byteQueryVector, reusableVector);
+                        scoredHidden.add(new ScoreDoc(hiddenDocId, score));
+                    }
                 }
             }
 
@@ -207,17 +243,4 @@ public final class ClumpFileReader {
         }
     }
 
-    private static float[] readFloatVector(IndexInput input, int dimension) throws IOException {
-        float[] vector = new float[dimension];
-        for (int i = 0; i < dimension; i++) {
-            vector[i] = Float.intBitsToFloat(input.readInt());
-        }
-        return vector;
-    }
-
-    private static byte[] readByteVector(IndexInput input, int dimension) throws IOException {
-        byte[] vector = new byte[dimension];
-        input.readBytes(vector, 0, dimension);
-        return vector;
-    }
 }
