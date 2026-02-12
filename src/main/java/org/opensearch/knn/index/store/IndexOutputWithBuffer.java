@@ -54,6 +54,15 @@ public class IndexOutputWithBuffer {
     }
 
     /**
+     * Returns the underlying {@link IndexOutput} for direct byte-level operations.
+     * Used by components that need to copy raw bytes into the output (e.g., from a temp file).
+     */
+    public IndexOutput getIndexOutput() {
+        return indexOutput;
+    }
+
+
+    /**
      * Writes to the {@link IndexOutput} by buffering bytes with @param outputBuffer. This method allows
      * {@link org.opensearch.knn.index.codec.nativeindex.remote.RemoteIndexBuildStrategy} to provide a separate, larger buffer as that buffer is for buffering
      * bytes downloaded from the repository, so it may be more performant to use a larger buffer.
