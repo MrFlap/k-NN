@@ -153,7 +153,8 @@ public class NativeEngineKnnVectorQuery extends Query {
                 knnQuery.getField(),
                 knnQuery.getQueryVector(),
                 knnQuery.getByteQueryVector(),
-                finalK
+                finalK,
+                indexSearcher.getTaskExecutor()
             );
             // Reduce to top k after expansion — this is the only reduceToTopK when clumping is active
             ResultUtil.reduceToTopK(perLeafResults, finalK);
