@@ -72,7 +72,8 @@ public final class ClumpFileWriter {
     ) throws IOException {
         int numMarkers = markerDocIds.size();
         int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
-        int hiddenEntrySize = ClumpFileFormat.hiddenEntryBytes(dimension, vectorDataType);
+        // Spill file still uses the old interleaved format (docId + vector per entry)
+        int spillEntrySize = Integer.BYTES + vectorSize;
 
         // Build marker doc ID → marker index lookup
         Map<Integer, Integer> markerDocIdToIndex = new HashMap<>(numMarkers);
@@ -83,7 +84,7 @@ public final class ClumpFileWriter {
         // Pass 1: count numHiddenPerMarker — O(M) heap
         int[] numHiddenPerMarker = new int[numMarkers];
         for (int h = 0; h < totalHidden; h++) {
-            long entryOffset = (long) h * hiddenEntrySize;
+            long entryOffset = (long) h * spillEntrySize;
             tempInput.seek(entryOffset);
             int hiddenDocId = tempInput.readInt();
 
@@ -96,43 +97,49 @@ public final class ClumpFileWriter {
             }
         }
 
-        // Compute each marker's byte offset within the clump data section.
-        // The clump data for marker i is: markerVector + numHidden[i] * hiddenEntry.
-        // The hidden entries for marker i start at clumpDataOffset[i] + vectorSize.
-        long[] hiddenSectionOffset = new long[numMarkers];
+        // v3 layout per marker: [markerVector][docId0..docIdN][vec0..vecN]
+        // Compute each marker's offsets within the clump data section.
+        long[] docIdBlockOffset = new long[numMarkers];  // offset of doc ID block within temp file
+        long[] vectorBlockOffset = new long[numMarkers];  // offset of vector block within temp file
         long runningOffset = 0;
         for (int i = 0; i < numMarkers; i++) {
-            hiddenSectionOffset[i] = runningOffset + vectorSize;
-            runningOffset += vectorSize + (long) numHiddenPerMarker[i] * hiddenEntrySize;
+            // marker vector
+            runningOffset += vectorSize;
+            // doc ID block
+            docIdBlockOffset[i] = runningOffset;
+            runningOffset += (long) numHiddenPerMarker[i] * Integer.BYTES;
+            // vector block
+            vectorBlockOffset[i] = runningOffset;
+            runningOffset += (long) numHiddenPerMarker[i] * vectorSize;
         }
         long totalClumpDataSize = runningOffset;
 
-        // Write clump file: header + marker table + marker vectors, then hidden entries
-        // via a seekable temp file.
+        // Write clump file: header + marker table + clump data via seekable temp file.
         String clumpFileName = buildClumpFileName(state.segmentInfo.name, fieldName);
         Path clumpDataTempPath = Files.createTempFile("clumpdata", ".tmp");
 
         try {
-            // Pass 2: write hidden entries to the seekable temp file at computed offsets.
-            // Per-marker cursors track how many entries have been placed for each marker.
-            int[] cursors = new int[numMarkers];
-            byte[] entryBuf = new byte[hiddenEntrySize];
+            // Pass 2: write marker vectors, then scatter hidden doc IDs and vectors
+            // into their separate blocks within the temp file.
+            int[] docIdCursors = new int[numMarkers];
+            int[] vectorCursors = new int[numMarkers];
 
             try (RandomAccessFile raf = new RandomAccessFile(clumpDataTempPath.toFile(), "rw")) {
                 // Pre-allocate the file to its final size
                 raf.setLength(totalClumpDataSize);
 
-                // Write marker vectors at their known offsets
-                long markerOffset = 0;
+                // Write marker vectors at their known offsets (start of each marker's clump data)
                 for (int i = 0; i < numMarkers; i++) {
-                    raf.seek(markerOffset);
+                    long mvOffset = docIdBlockOffset[i] - vectorSize; // marker vec is right before doc ID block
+                    raf.seek(mvOffset);
                     writeVectorToRaf(raf, markerVectors.get(i), vectorDataType);
-                    markerOffset += vectorSize + (long) numHiddenPerMarker[i] * hiddenEntrySize;
                 }
 
-                // Scan spill file once, placing each hidden entry at its correct position
+                // Scan spill file once, placing doc IDs and vectors into separate blocks
+                byte[] vecBuf = new byte[vectorSize];
+                byte[] docIdBuf = new byte[Integer.BYTES];
                 for (int h = 0; h < totalHidden; h++) {
-                    long spillOffset = (long) h * hiddenEntrySize;
+                    long spillOffset = (long) h * spillEntrySize;
                     tempInput.seek(spillOffset);
                     int hiddenDocId = tempInput.readInt();
 
@@ -144,16 +151,25 @@ public final class ClumpFileWriter {
                         continue;
                     }
 
-                    // Compute destination: marker's hidden section start + cursor * entrySize
-                    long destOffset = hiddenSectionOffset[markerIndex]
-                        + (long) cursors[markerIndex] * hiddenEntrySize;
-                    cursors[markerIndex]++;
+                    // Write doc ID to the doc ID block
+                    long docIdDest = docIdBlockOffset[markerIndex]
+                        + (long) docIdCursors[markerIndex] * Integer.BYTES;
+                    docIdBuf[0] = (byte) hiddenDocId;
+                    docIdBuf[1] = (byte) (hiddenDocId >> 8);
+                    docIdBuf[2] = (byte) (hiddenDocId >> 16);
+                    docIdBuf[3] = (byte) (hiddenDocId >> 24);
+                    raf.seek(docIdDest);
+                    raf.write(docIdBuf);
+                    docIdCursors[markerIndex]++;
 
-                    // Read the full entry from the spill file and write to the temp file
-                    tempInput.seek(spillOffset);
-                    tempInput.readBytes(entryBuf, 0, hiddenEntrySize);
-                    raf.seek(destOffset);
-                    raf.write(entryBuf);
+                    // Write vector to the vector block
+                    long vecDest = vectorBlockOffset[markerIndex]
+                        + (long) vectorCursors[markerIndex] * vectorSize;
+                    tempInput.seek(spillOffset + Integer.BYTES); // skip docId in spill entry
+                    tempInput.readBytes(vecBuf, 0, vectorSize);
+                    raf.seek(vecDest);
+                    raf.write(vecBuf);
+                    vectorCursors[markerIndex]++;
                 }
             }
 
@@ -164,14 +180,16 @@ public final class ClumpFileWriter {
                 output.writeInt(dimension);
                 output.writeByte(vectorDataType);
 
-                // Marker table
+                // Marker table — clumpDataOffset points to the start of each marker's data
                 long clumpDataBase = ClumpFileFormat.clumpDataStart(numMarkers);
                 long currentOffset = clumpDataBase;
                 for (int i = 0; i < numMarkers; i++) {
                     output.writeInt(markerDocIds.get(i));
                     output.writeInt(numHiddenPerMarker[i]);
                     output.writeLong(currentOffset);
-                    currentOffset += vectorSize + (long) numHiddenPerMarker[i] * hiddenEntrySize;
+                    currentOffset += vectorSize
+                        + (long) numHiddenPerMarker[i] * Integer.BYTES
+                        + (long) numHiddenPerMarker[i] * vectorSize;
                 }
 
                 // Append clump data from the temp file
@@ -181,9 +199,10 @@ public final class ClumpFileWriter {
             }
 
             log.debug(
-                "Wrote clump file {} with {} markers, {} hidden vectors, dim={}, type={}",
+                "Wrote v3 clump file {} with {} markers, {} hidden vectors, dim={}, type={}",
                 clumpFileName, numMarkers, totalHidden, dimension,
-                vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT ? "float" : "byte"
+                vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16 ? "fp16"
+                    : vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT ? "float" : "byte"
             );
         } finally {
             Files.deleteIfExists(clumpDataTempPath);
