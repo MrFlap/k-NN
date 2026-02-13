@@ -12,6 +12,8 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
+import org.opensearch.knn.jni.SimdVectorComputeService;
+import org.opensearch.knn.memoryoptsearch.MemorySegmentAddressExtractorUtil;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -207,72 +209,183 @@ public final class ClumpFileReader {
         // Sort matched indices by file offset for better I/O locality
         Arrays.sort(matchedIndices);
 
+        // v3 layout: per marker, doc IDs and vectors are in separate contiguous blocks.
+        // docIdBlockStart = clumpDataOffset + vectorSize
+        // vectorBlockStart = docIdBlockStart + numHidden * 4
         boolean isFloat = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT);
         boolean isFp16 = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16);
-        int hiddenEntrySize = Integer.BYTES + table.vectorSize;
 
-        // Phase 1: READ — parallel. Each marker's hidden entries are bulk-read into
-        // a byte[] via a cloned IndexInput (independent seek cursor, shared file handle).
-        byte[][] markerBulkData = new byte[matchedIndices.length][];
+        // For FP16, try to get mmap addresses for SIMD bulk scoring
+        SimdVectorComputeService.SimilarityFunctionType simdFunctionType = null;
+        if (isFp16) {
+            simdFunctionType = toSimdFunctionType(similarityFunction);
+        }
+
+        // Phase 1: READ doc IDs in parallel. For non-SIMD paths, also read vector blocks.
+        int[][] markerDocIdArrays = new int[matchedIndices.length][];
+        byte[][] markerVectorBlocks = (simdFunctionType == null) ? new byte[matchedIndices.length][] : null;
+        // For SIMD path, store vector block file offsets and sizes instead of reading bytes
+        long[] vecBlockOffsets = (simdFunctionType != null) ? new long[matchedIndices.length] : null;
+        int[] vecBlockSizes = (simdFunctionType != null) ? new int[matchedIndices.length] : null;
+
         try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
+            final byte[][] finalVectorBlocks = markerVectorBlocks;
+            final long[] finalVecOffsets = vecBlockOffsets;
+            final int[] finalVecSizes = vecBlockSizes;
+
             Arrays.stream(matchedIndices).parallel().forEach(markerIndex -> {
                 int idx = Arrays.binarySearch(matchedIndices, markerIndex);
                 int numHidden = table.numHidden[markerIndex];
-                int bytesToRead = numHidden * hiddenEntrySize;
-                byte[] buf = new byte[bytesToRead];
+                long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
+                long vecStart = docIdStart + (long) numHidden * Integer.BYTES;
+
+                // Read doc IDs (always needed)
+                int[] docIds = new int[numHidden];
+                byte[] docIdBytes = new byte[numHidden * Integer.BYTES];
                 try (IndexInput clonedInput = input.clone()) {
-                    clonedInput.seek(table.clumpDataOffsets[markerIndex] + table.vectorSize); // skip marker vector
-                    clonedInput.readBytes(buf, 0, bytesToRead);
+                    clonedInput.seek(docIdStart);
+                    clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
+                    java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                    for (int j = 0; j < numHidden; j++) {
+                        docIds[j] = dbuf.getInt();
+                    }
                 } catch (IOException e) {
-                    log.warn("Error reading hidden entries for marker index {}", markerIndex, e);
+                    log.warn("Error reading doc IDs for marker index {}", markerIndex, e);
                 }
-                markerBulkData[idx] = buf;
+                markerDocIdArrays[idx] = docIds;
+
+                if (finalVectorBlocks != null) {
+                    // Non-SIMD path: read vector block into heap
+                    int vecBlockSize = numHidden * table.vectorSize;
+                    byte[] vecBlock = new byte[vecBlockSize];
+                    try (IndexInput clonedInput = input.clone()) {
+                        clonedInput.seek(vecStart);
+                        clonedInput.readBytes(vecBlock, 0, vecBlockSize);
+                    } catch (IOException e) {
+                        log.warn("Error reading vector block for marker index {}", markerIndex, e);
+                    }
+                    finalVectorBlocks[idx] = vecBlock;
+                } else {
+                    // SIMD path: just record the offset and size
+                    finalVecOffsets[idx] = vecStart;
+                    finalVecSizes[idx] = numHidden * table.vectorSize;
+                }
             });
-        }
 
-        // Phase 2: SCORE — sequential over the pre-read byte buffers.
-        List<ScoreDoc> scoredHidden = new ArrayList<>();
-        for (int m = 0; m < matchedIndices.length; m++) {
-            int markerIndex = matchedIndices[m];
-            byte[] bulk = markerBulkData[m];
-            if (bulk == null) {
-                continue;
-            }
-            int numHidden = table.numHidden[markerIndex];
-            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bulk).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            // Phase 2: SCORE
+            List<ScoreDoc> scoredHidden = new ArrayList<>();
 
-            if (isFloat) {
-                float[] reusableVector = new float[table.dimension];
-                for (int j = 0; j < numHidden; j++) {
-                    int hiddenDocId = bb.getInt();
-                    for (int d = 0; d < table.dimension; d++) {
-                        reusableVector[d] = bb.getFloat();
+            if (simdFunctionType != null) {
+                // SIMD bulk scoring for FP16 vectors via native code.
+                // For each marker, extract mmap addresses for its vector block and score in bulk.
+                for (int m = 0; m < matchedIndices.length; m++) {
+                    int[] docIds = markerDocIdArrays[m];
+                    if (docIds == null || docIds.length == 0) {
+                        continue;
                     }
-                    float score = similarityFunction.compare(floatQueryVector, reusableVector);
-                    scoredHidden.add(new ScoreDoc(hiddenDocId, score));
-                }
-            } else if (isFp16) {
-                float[] reusableVector = new float[table.dimension];
-                for (int j = 0; j < numHidden; j++) {
-                    int hiddenDocId = bb.getInt();
-                    for (int d = 0; d < table.dimension; d++) {
-                        reusableVector[d] = Float.float16ToFloat(bb.getShort());
+                    int numHidden = docIds.length;
+
+                    long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(
+                        input, vecBlockOffsets[m], vecBlockSizes[m]
+                    );
+
+                    if (addressAndSize != null) {
+                        // SIMD path: bulk score all hidden vectors for this marker
+                        SimdVectorComputeService.saveSearchContext(
+                            floatQueryVector, addressAndSize, simdFunctionType.ordinal()
+                        );
+                        int[] ordinals = new int[numHidden];
+                        for (int j = 0; j < numHidden; j++) {
+                            ordinals[j] = j;
+                        }
+                        float[] scores = new float[numHidden];
+                        SimdVectorComputeService.scoreSimilarityInBulk(ordinals, scores, numHidden);
+                        for (int j = 0; j < numHidden; j++) {
+                            scoredHidden.add(new ScoreDoc(docIds[j], scores[j]));
+                        }
+                    } else {
+                        // Fallback: read vector block and score with Java
+                        byte[] vecBlock = new byte[vecBlockSizes[m]];
+                        try (IndexInput clonedInput = input.clone()) {
+                            clonedInput.seek(vecBlockOffsets[m]);
+                            clonedInput.readBytes(vecBlock, 0, vecBlock.length);
+                        }
+                        scoreFp16VectorBlock(docIds, vecBlock, table.dimension, floatQueryVector, similarityFunction, scoredHidden);
                     }
-                    float score = similarityFunction.compare(floatQueryVector, reusableVector);
-                    scoredHidden.add(new ScoreDoc(hiddenDocId, score));
                 }
             } else {
-                byte[] reusableVector = new byte[table.dimension];
-                for (int j = 0; j < numHidden; j++) {
-                    int hiddenDocId = bb.getInt();
-                    bb.get(reusableVector);
-                    float score = similarityFunction.compare(byteQueryVector, reusableVector);
-                    scoredHidden.add(new ScoreDoc(hiddenDocId, score));
+                // Java scoring path for float and byte vectors
+                for (int m = 0; m < matchedIndices.length; m++) {
+                    int[] docIds = markerDocIdArrays[m];
+                    byte[] vecBlock = markerVectorBlocks[m];
+                    if (docIds == null || vecBlock == null) {
+                        continue;
+                    }
+                    int numHidden = docIds.length;
+                    java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBlock)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+
+                    if (isFloat) {
+                        float[] reusableVector = new float[table.dimension];
+                        for (int j = 0; j < numHidden; j++) {
+                            for (int d = 0; d < table.dimension; d++) {
+                                reusableVector[d] = vb.getFloat();
+                            }
+                            float score = similarityFunction.compare(floatQueryVector, reusableVector);
+                            scoredHidden.add(new ScoreDoc(docIds[j], score));
+                        }
+                    } else {
+                        byte[] reusableVector = new byte[table.dimension];
+                        for (int j = 0; j < numHidden; j++) {
+                            vb.get(reusableVector);
+                            float score = similarityFunction.compare(byteQueryVector, reusableVector);
+                            scoredHidden.add(new ScoreDoc(docIds[j], score));
+                        }
+                    }
                 }
             }
-        }
 
-        return scoredHidden;
+            return scoredHidden;
+        }
+    }
+
+    /**
+     * Maps a KNNVectorSimilarityFunction to the corresponding SIMD function type for FP16.
+     * Returns null if the similarity function is not supported by the SIMD service.
+     */
+    private static SimdVectorComputeService.SimilarityFunctionType toSimdFunctionType(
+        KNNVectorSimilarityFunction similarityFunction
+    ) {
+        if (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+            || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT) {
+            return SimdVectorComputeService.SimilarityFunctionType.FP16_MAXIMUM_INNER_PRODUCT;
+        } else if (similarityFunction == KNNVectorSimilarityFunction.EUCLIDEAN) {
+            return SimdVectorComputeService.SimilarityFunctionType.FP16_L2;
+        }
+        return null;
+    }
+
+    /**
+     * Fallback Java scoring for FP16 vector blocks when SIMD is not available.
+     */
+    private static void scoreFp16VectorBlock(
+        int[] docIds,
+        byte[] vecBlock,
+        int dimension,
+        float[] queryVector,
+        KNNVectorSimilarityFunction similarityFunction,
+        List<ScoreDoc> results
+    ) {
+        java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBlock).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        float[] reusableVector = new float[dimension];
+        for (int j = 0; j < docIds.length; j++) {
+            for (int d = 0; d < dimension; d++) {
+                reusableVector[d] = Float.float16ToFloat(vb.getShort());
+            }
+            float score = similarityFunction.compare(queryVector, reusableVector);
+            results.add(new ScoreDoc(docIds[j], score));
+        }
     }
 
     /**
@@ -304,14 +417,12 @@ public final class ClumpFileReader {
                     continue;
                 }
 
-                // Seek past marker vector, then read hidden doc IDs (skipping vector data)
-                long clumpOffset = table.clumpDataOffsets[markerIndex];
-                input.seek(clumpOffset + table.vectorSize);
+                // v3: doc IDs are in a contiguous block after the marker vector
+                long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
+                input.seek(docIdStart);
 
                 for (int j = 0; j < numHidden; j++) {
                     hiddenDocIds.add(input.readInt());
-                    // Skip the vector data
-                    input.seek(input.getFilePointer() + table.vectorSize);
                 }
             }
 
