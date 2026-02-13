@@ -6,11 +6,11 @@
 package org.opensearch.knn.index.codec.nativeindex.clumping;
 
 /**
- * Defines the binary format of a .clump file (v2 — vectors inline).
+ * Defines the binary format of a .clump file (v3 — separated doc IDs and vectors).
  * <p>
- * This format stores all vector data directly in the clump file so that expansion
- * at query time can read vectors sequentially without random access into Lucene's
- * vector storage.
+ * This format stores vector data contiguously per marker (separated from doc IDs)
+ * so that the vector block can be passed directly to SIMD bulk scoring via
+ * {@code SimdVectorComputeService} when the file is memory-mapped.
  * <p>
  * Layout:
  * <pre>
@@ -28,20 +28,18 @@ package org.opensearch.knn.index.codec.nativeindex.clumping;
  *
  *   [Clump Data] — sequential per marker
  *     For each marker i (in marker table order):
- *       // Marker's own vector (so the marker vector is also available for sequential read)
  *       D * elementSize bytes: marker vector data
- *       // Hidden vectors
- *       For each hidden vector j in marker i's clump:
- *         4 bytes: hiddenDocId (int)
- *         D * elementSize bytes: hidden vector data
+ *       numHidden * 4 bytes:   hidden doc IDs (int[]) — contiguous block
+ *       numHidden * D * elementSize bytes: hidden vectors — contiguous block
  * </pre>
  *
  * To expand marker i at query time:
  * 1. Read the marker table entry at index i to get (markerDocId, numHidden, clumpDataOffset).
- * 2. Seek to clumpDataOffset.
- * 3. Skip the marker vector (D * elementSize bytes) — or read it if needed.
- * 4. Sequentially read numHidden entries of (hiddenDocId, hiddenVector).
- * 5. Score each hidden vector against the query vector inline.
+ * 2. docIdBlockOffset = clumpDataOffset + D * elementSize
+ * 3. vectorBlockOffset = docIdBlockOffset + numHidden * 4
+ * 4. Read numHidden doc IDs from docIdBlockOffset.
+ * 5. Score the contiguous vector block at vectorBlockOffset via SIMD bulk scoring
+ *    (or read + decode individually for non-mmap directories).
  *
  * Binary search on the marker table (sorted by markerDocId) maps a Lucene doc ID
  * to a marker index.
@@ -105,9 +103,33 @@ public final class ClumpFileFormat {
     }
 
     /**
-     * Returns the byte size of one hidden entry (docId + vector).
+     * Returns the byte size of one hidden entry (docId + vector) — total bytes per hidden
+     * vector across both the doc ID block and the vector block.
      */
     public static int hiddenEntryBytes(int dimension, byte vectorDataType) {
         return Integer.BYTES + vectorBytes(dimension, vectorDataType);
+    }
+
+    /**
+     * Returns the byte size of the doc ID block for a marker with the given number of hidden vectors.
+     */
+    public static int docIdBlockBytes(int numHidden) {
+        return numHidden * Integer.BYTES;
+    }
+
+    /**
+     * Returns the byte size of the contiguous vector block for a marker.
+     */
+    public static int vectorBlockBytes(int numHidden, int dimension, byte vectorDataType) {
+        return numHidden * vectorBytes(dimension, vectorDataType);
+    }
+
+    /**
+     * Returns the total clump data size for a marker (marker vector + doc ID block + vector block).
+     */
+    public static long markerClumpDataSize(int numHidden, int dimension, byte vectorDataType) {
+        return vectorBytes(dimension, vectorDataType)
+            + docIdBlockBytes(numHidden)
+            + vectorBlockBytes(numHidden, dimension, vectorDataType);
     }
 }
