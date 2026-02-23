@@ -237,39 +237,55 @@ public final class ClumpFileReader {
                 int idx = Arrays.binarySearch(matchedIndices, markerIndex);
                 int numHidden = table.numHidden[markerIndex];
                 long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
-                long vecStart = docIdStart + (long) numHidden * Integer.BYTES;
+                int docIdBlockSize = numHidden * Integer.BYTES;
+                int vecBlockSize = numHidden * table.vectorSize;
 
-                // Read doc IDs (always needed)
-                int[] docIds = new int[numHidden];
-                byte[] docIdBytes = new byte[numHidden * Integer.BYTES];
-                try (IndexInput clonedInput = input.clone()) {
-                    clonedInput.seek(docIdStart);
-                    clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
-                    java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
+                if (finalVectorBlocks != null) {
+                    // Non-SIMD path: read doc IDs + vector block in a single I/O operation
+                    // since they are contiguous in the v3 layout.
+                    int totalSize = docIdBlockSize + vecBlockSize;
+                    byte[] combined = new byte[totalSize];
+                    try (IndexInput clonedInput = input.clone()) {
+                        clonedInput.seek(docIdStart);
+                        clonedInput.readBytes(combined, 0, totalSize);
+                    } catch (IOException e) {
+                        log.warn("Error reading clump data for marker index {}", markerIndex, e);
+                    }
+
+                    // Parse doc IDs from the first portion of the combined buffer
+                    int[] docIds = new int[numHidden];
+                    java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN);
                     for (int j = 0; j < numHidden; j++) {
                         docIds[j] = dbuf.getInt();
                     }
-                } catch (IOException e) {
-                    log.warn("Error reading doc IDs for marker index {}", markerIndex, e);
-                }
-                markerDocIdArrays[idx] = docIds;
+                    markerDocIdArrays[idx] = docIds;
 
-                if (finalVectorBlocks != null) {
-                    // Non-SIMD path: read vector block into heap
-                    int vecBlockSize = numHidden * table.vectorSize;
+                    // Extract vector block from the remainder
                     byte[] vecBlock = new byte[vecBlockSize];
-                    try (IndexInput clonedInput = input.clone()) {
-                        clonedInput.seek(vecStart);
-                        clonedInput.readBytes(vecBlock, 0, vecBlockSize);
-                    } catch (IOException e) {
-                        log.warn("Error reading vector block for marker index {}", markerIndex, e);
-                    }
+                    System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
                     finalVectorBlocks[idx] = vecBlock;
                 } else {
-                    // SIMD path: just record the offset and size
+                    // SIMD path: read only doc IDs; vectors will be scored directly from mmap
+                    int[] docIds = new int[numHidden];
+                    byte[] docIdBytes = new byte[docIdBlockSize];
+                    try (IndexInput clonedInput = input.clone()) {
+                        clonedInput.seek(docIdStart);
+                        clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
+                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                        for (int j = 0; j < numHidden; j++) {
+                            docIds[j] = dbuf.getInt();
+                        }
+                    } catch (IOException e) {
+                        log.warn("Error reading doc IDs for marker index {}", markerIndex, e);
+                    }
+                    markerDocIdArrays[idx] = docIds;
+
+                    // Record the offset and size for SIMD scoring later
+                    long vecStart = docIdStart + (long) docIdBlockSize;
                     finalVecOffsets[idx] = vecStart;
-                    finalVecSizes[idx] = numHidden * table.vectorSize;
+                    finalVecSizes[idx] = vecBlockSize;
                 }
             });
 
