@@ -28,6 +28,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorValues;
@@ -61,6 +62,9 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     /** Value written to the assign map for doc IDs that have no assignment (sparse gaps). */
     static final int UNASSIGNED = -1;
+
+    /** Number of hidden vectors to batch before dispatching parallel searches. */
+    static final int ASSIGNMENT_BATCH_SIZE = 256;
 
     public ClumpingIndexBuildStrategy(NativeIndexBuildStrategy delegate, int clumpingFactor) {
         this.delegate = delegate;
@@ -227,11 +231,12 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     /**
      * Assigns each hidden vector to its nearest marker by loading the just-built marker index
-     * via JNI and querying it with k=1 for each hidden vector.
+     * via JNI and querying it for each hidden vector.
      * <p>
      * Marker vectors are cloned into memory (1/N of total) for the clump file.
-     * Hidden vectors are scored via the native index, then immediately spilled to
-     * {@code tempHiddenOutput}. Assignments are recorded in a flat int array where
+     * Hidden vectors are batched and searched in parallel via a ForkJoinPool, then
+     * results are written sequentially to the assign map and spill file.
+     * Assignments are recorded in a flat int array where
      * {@code assignMap[docId] = markerDocId}. Markers point to themselves.
      */
     private AssignmentResult assignHiddenToMarkersViaIndex(
@@ -289,34 +294,42 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         long indexPointer = loadTempIndex(indexInfo, tempEngineFileName, knnEngine);
 
         try {
-            // Stream hidden vectors: read each one, search the native index for nearest marker,
-            // record assignment, spill vector to temp file
             final KNNVectorValues<?> hiddenScan = indexInfo.getKnnVectorValuesSupplier().get();
             initializeVectorValues(hiddenScan);
 
             final byte finalVectorDataType = vectorDataType;
 
+            // Batch hidden vectors, search in parallel, write results sequentially
+            List<int[]> batchDocIds = new ArrayList<>(ASSIGNMENT_BATCH_SIZE);
+            List<Object> batchVectors = new ArrayList<>(ASSIGNMENT_BATCH_SIZE);
+
             while (hiddenScan.docId() != NO_MORE_DOCS) {
                 int docId = hiddenScan.docId();
 
                 if (markerSet.contains(docId) == false) {
-                    Object hiddenVector = hiddenScan.getVector();
+                    batchDocIds.add(new int[] { docId });
+                    batchVectors.add(cloneVectorRaw(hiddenScan.getVector()));
 
-                    // Search the native index with k=1 to find the nearest marker
-                    int nearestMarkerDocId = findNearestMarkerDocIdViaIndex(
-                        hiddenVector, indexPointer, knnEngine, markerDocIdToIndex,
-                        markerVectorArray, markerDocIds, finalVectorDataType
-                    );
-
-                    // Record assignment in the flat array
-                    assignMap[docId] = nearestMarkerDocId;
-
-                    // Spill vector to temp file immediately (docId + vector bytes)
-                    ClumpFileWriter.writeHiddenEntryToTemp(
-                        tempHiddenOutput, docId, hiddenVector, finalVectorDataType
-                    );
+                    if (batchDocIds.size() >= ASSIGNMENT_BATCH_SIZE) {
+                        processBatch(
+                            batchDocIds, batchVectors, indexPointer, knnEngine,
+                            markerDocIdToIndex, markerVectorArray, markerDocIds,
+                            finalVectorDataType, assignMap, tempHiddenOutput
+                        );
+                        batchDocIds.clear();
+                        batchVectors.clear();
+                    }
                 }
                 hiddenScan.nextDoc();
+            }
+
+            // Process remaining batch
+            if (batchDocIds.isEmpty() == false) {
+                processBatch(
+                    batchDocIds, batchVectors, indexPointer, knnEngine,
+                    markerDocIdToIndex, markerVectorArray, markerDocIds,
+                    finalVectorDataType, assignMap, tempHiddenOutput
+                );
             }
 
             return new AssignmentResult(markerVectors, assignMap, dimension, vectorDataType);
@@ -326,8 +339,45 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
     }
 
     /**
+     * Processes a batch of hidden vectors: searches for nearest markers in parallel,
+     * then writes assignments and spills vector data sequentially.
+     */
+    private void processBatch(
+        List<int[]> batchDocIds,
+        List<Object> batchVectors,
+        long indexPointer,
+        KNNEngine knnEngine,
+        Map<Integer, Integer> markerDocIdToIndex,
+        Object[] markerVectorArray,
+        List<Integer> markerDocIds,
+        byte vectorDataType,
+        int[] assignMap,
+        IndexOutput tempHiddenOutput
+    ) throws IOException {
+        int batchSize = batchDocIds.size();
+        int[] nearestMarkers = new int[batchSize];
+
+        // Parallel search: each hidden vector finds its nearest marker concurrently
+        IntStream.range(0, batchSize).parallel().forEach(i -> {
+            nearestMarkers[i] = findNearestMarkerDocIdViaIndex(
+                batchVectors.get(i), indexPointer, knnEngine,
+                markerDocIdToIndex, markerVectorArray, markerDocIds, vectorDataType
+            );
+        });
+
+        // Sequential write: assign map updates and spill file writes
+        for (int i = 0; i < batchSize; i++) {
+            int docId = batchDocIds.get(i)[0];
+            assignMap[docId] = nearestMarkers[i];
+            ClumpFileWriter.writeHiddenEntryToTemp(
+                tempHiddenOutput, docId, batchVectors.get(i), vectorDataType
+            );
+        }
+    }
+
+    /**
      * Searches the loaded native index for the nearest marker to the given hidden vector.
-     * Falls back to brute-force L2 if the JNI search returns no results.
+     * Falls back to brute-force if the JNI search returns no results.
      *
      * @return the doc ID of the nearest marker
      */
@@ -480,6 +530,20 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     private Object cloneVector(KNNVectorValues<?> vectorValues) throws IOException {
         Object vector = vectorValues.getVector();
+        if (vector instanceof float[]) {
+            return ((float[]) vector).clone();
+        } else if (vector instanceof byte[]) {
+            return ((byte[]) vector).clone();
+        }
+        throw new IllegalArgumentException("Unsupported vector type: " + vector.getClass());
+    }
+
+    /**
+     * Clones a raw vector object (float[] or byte[]). Unlike {@link #cloneVector}, this
+     * operates on an already-extracted vector rather than a KNNVectorValues instance.
+     * Needed because {@code KNNVectorValues.getVector()} reuses its internal buffer.
+     */
+    private Object cloneVectorRaw(Object vector) {
         if (vector instanceof float[]) {
             return ((float[]) vector).clone();
         } else if (vector instanceof byte[]) {
