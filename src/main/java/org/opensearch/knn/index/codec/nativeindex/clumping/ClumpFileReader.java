@@ -21,6 +21,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Reads a .clump sidecar file (v2 format with inline vectors) to expand marker
@@ -233,61 +236,79 @@ public final class ClumpFileReader {
             final long[] finalVecOffsets = vecBlockOffsets;
             final int[] finalVecSizes = vecBlockSizes;
 
-            Arrays.stream(matchedIndices).parallel().forEach(markerIndex -> {
-                int idx = Arrays.binarySearch(matchedIndices, markerIndex);
-                int numHidden = table.numHidden[markerIndex];
-                long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
-                int docIdBlockSize = numHidden * Integer.BYTES;
-                int vecBlockSize = numHidden * table.vectorSize;
+            // Phase 1: READ — use virtual threads so each I/O read gets its own
+            // lightweight thread. When a read blocks on NFS, the virtual thread yields
+            // its carrier, letting other queries' reads proceed. No shared ForkJoinPool
+            // contention.
+            try (ExecutorService vte = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> readFutures = new ArrayList<>(matchedIndices.length);
+                for (int mi = 0; mi < matchedIndices.length; mi++) {
+                    final int idx = mi;
+                    final int markerIndex = matchedIndices[mi];
+                    readFutures.add(vte.submit(() -> {
+                        int numHidden = table.numHidden[markerIndex];
+                        long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
+                        int docIdBlockSize = numHidden * Integer.BYTES;
+                        int vecBlockSize = numHidden * table.vectorSize;
 
-                if (finalVectorBlocks != null) {
-                    // Non-SIMD path: read doc IDs + vector block in a single I/O operation
-                    // since they are contiguous in the v3 layout.
-                    int totalSize = docIdBlockSize + vecBlockSize;
-                    byte[] combined = new byte[totalSize];
-                    try (IndexInput clonedInput = input.clone()) {
-                        clonedInput.seek(docIdStart);
-                        clonedInput.readBytes(combined, 0, totalSize);
-                    } catch (IOException e) {
-                        log.warn("Error reading clump data for marker index {}", markerIndex, e);
-                    }
+                        if (finalVectorBlocks != null) {
+                            // Non-SIMD path: read doc IDs + vector block in a single I/O operation
+                            // since they are contiguous in the v3 layout.
+                            int totalSize = docIdBlockSize + vecBlockSize;
+                            byte[] combined = new byte[totalSize];
+                            try (IndexInput clonedInput = input.clone()) {
+                                clonedInput.seek(docIdStart);
+                                clonedInput.readBytes(combined, 0, totalSize);
+                            } catch (IOException e) {
+                                log.warn("Error reading clump data for marker index {}", markerIndex, e);
+                            }
 
-                    // Parse doc IDs from the first portion of the combined buffer
-                    int[] docIds = new int[numHidden];
-                    java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
-                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                    for (int j = 0; j < numHidden; j++) {
-                        docIds[j] = dbuf.getInt();
-                    }
-                    markerDocIdArrays[idx] = docIds;
+                            // Parse doc IDs from the first portion of the combined buffer
+                            int[] docIds = new int[numHidden];
+                            java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
+                                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                            for (int j = 0; j < numHidden; j++) {
+                                docIds[j] = dbuf.getInt();
+                            }
+                            markerDocIdArrays[idx] = docIds;
 
-                    // Extract vector block from the remainder
-                    byte[] vecBlock = new byte[vecBlockSize];
-                    System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
-                    finalVectorBlocks[idx] = vecBlock;
-                } else {
-                    // SIMD path: read only doc IDs; vectors will be scored directly from mmap
-                    int[] docIds = new int[numHidden];
-                    byte[] docIdBytes = new byte[docIdBlockSize];
-                    try (IndexInput clonedInput = input.clone()) {
-                        clonedInput.seek(docIdStart);
-                        clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
-                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
-                            .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                        for (int j = 0; j < numHidden; j++) {
-                            docIds[j] = dbuf.getInt();
+                            // Extract vector block from the remainder
+                            byte[] vecBlock = new byte[vecBlockSize];
+                            System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
+                            finalVectorBlocks[idx] = vecBlock;
+                        } else {
+                            // SIMD path: read only doc IDs; vectors will be scored directly from mmap
+                            int[] docIds = new int[numHidden];
+                            byte[] docIdBytes = new byte[docIdBlockSize];
+                            try (IndexInput clonedInput = input.clone()) {
+                                clonedInput.seek(docIdStart);
+                                clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
+                                java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
+                                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                                for (int j = 0; j < numHidden; j++) {
+                                    docIds[j] = dbuf.getInt();
+                                }
+                            } catch (IOException e) {
+                                log.warn("Error reading doc IDs for marker index {}", markerIndex, e);
+                            }
+                            markerDocIdArrays[idx] = docIds;
+
+                            // Record the offset and size for SIMD scoring later
+                            long vecStart = docIdStart + (long) docIdBlockSize;
+                            finalVecOffsets[idx] = vecStart;
+                            finalVecSizes[idx] = vecBlockSize;
                         }
-                    } catch (IOException e) {
-                        log.warn("Error reading doc IDs for marker index {}", markerIndex, e);
-                    }
-                    markerDocIdArrays[idx] = docIds;
-
-                    // Record the offset and size for SIMD scoring later
-                    long vecStart = docIdStart + (long) docIdBlockSize;
-                    finalVecOffsets[idx] = vecStart;
-                    finalVecSizes[idx] = vecBlockSize;
+                    }));
                 }
-            });
+                // Wait for all reads to complete
+                for (Future<?> f : readFutures) {
+                    try {
+                        f.get();
+                    } catch (Exception e) {
+                        log.warn("Error waiting for clump read task", e);
+                    }
+                }
+            }
 
             // Phase 2: SCORE
             List<ScoreDoc> scoredHidden = new ArrayList<>();
