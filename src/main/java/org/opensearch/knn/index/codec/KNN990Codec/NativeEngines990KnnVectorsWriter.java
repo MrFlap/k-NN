@@ -206,7 +206,7 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             // For merge-aware strategy, load source .kcs files now while we have MergeState.
             // All segments in a shard share the same Directory.
             if (reorderStrategy instanceof MergeAwareReorderStrategy) {
-                List<ClusterSummary> summaries = loadSourceClusterSummaries(fieldInfo);
+                List<ClusterSummary> summaries = loadSourceClusterSummaries(fieldInfo, mergeState);
                 sourceClusterSummaries.put(fieldInfo.name, summaries);
             }
         }
@@ -290,24 +290,31 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
     }
 
     /**
-     * Scan the directory for .kcs files from source segments for the given field.
-     * Source segment names are derived from the .kcs filenames matching the field name,
-     * excluding the target segment.
+     * Load .kcs files from source segments being merged.
+     * Scans the directory for .kcs files excluding the target segment.
+     * Logs a warning if the count doesn't match the expected number of source segments,
+     * which can happen during concurrent merges when unrelated segments' .kcs files are present.
+     * Extra centroids from unrelated segments only affect cluster quality (more centroids in the
+     * pool), not correctness — the permutation is always a valid bijection over the merged vectors.
      */
-    private List<ClusterSummary> loadSourceClusterSummaries(FieldInfo fieldInfo) throws IOException {
+    private List<ClusterSummary> loadSourceClusterSummaries(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
         Directory dir = segmentWriteState.directory;
         String targetSegName = segmentWriteState.segmentInfo.name;
         String suffix = "_" + fieldInfo.name + ".kcs";
         String compoundSuffix = suffix + "c";
+        int expectedSources = mergeState.maxDocs.length;
         List<ClusterSummary> summaries = new ArrayList<>();
 
         for (String file : dir.listAll()) {
             if (file.startsWith(targetSegName + "_")) continue;
-            if (file.endsWith(compoundSuffix)) {
-                summaries.add(ClusterSummaryReader.read(dir, file, fieldInfo.name));
-            } else if (file.endsWith(suffix)) {
+            if (file.endsWith(compoundSuffix) || file.endsWith(suffix)) {
                 summaries.add(ClusterSummaryReader.read(dir, file, fieldInfo.name));
             }
+        }
+
+        if (summaries.size() != expectedSources) {
+            log.warn("Expected {} source .kcs files but found {} for field [{}] (concurrent merge may have extra .kcs files)",
+                expectedSources, summaries.size(), fieldInfo.name);
         }
         return summaries;
     }
