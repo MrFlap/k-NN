@@ -266,7 +266,7 @@ public class SegmentReorderService {
         final SegmentReadState readState = new SegmentReadState(
             readDir, state.segmentInfo, fieldInfos, IOContext.DEFAULT, segmentSuffix
         );
-
+        // write the new .vemf file
         try (IndexInput vecMetaInput = readDir.openInput(vecMetaFileName, IOContext.DEFAULT)) {
             final ReorderedFlatVectorsWriter writer = new ReorderedFlatVectorsWriter(
                 writeDir, reorderedVecMeta, reorderedVecData, numVectors, vecMetaInput
