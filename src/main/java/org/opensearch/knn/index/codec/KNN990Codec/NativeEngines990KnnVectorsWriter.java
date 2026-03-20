@@ -22,6 +22,7 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.opensearch.common.StopWatch;
@@ -30,6 +31,10 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter;
 import org.opensearch.knn.index.quantizationservice.QuantizationService;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
+import org.opensearch.knn.index.vectorvalues.ReorderedKNNFloatVectorValues;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.MergeOrdMappingBuilder;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.MergedRandomAccessFloatVectorValues;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.ReorderedFieldMetaWriter;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.SegmentReorderService;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.MergeAwareReorderStrategy;
@@ -65,9 +70,9 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
     private final Integer approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
     private final VectorReorderStrategy reorderStrategy;
+    private final boolean replacementFree;
 
     // Fields that need reordering after finish() writes footers.
-    // Populated during mergeOneField() for fields above the reorder threshold.
     private final List<FieldInfo> fieldsToReorder = new ArrayList<>();
 
     // Stored during mergeOneField() so finish() can read source .kcs files.
@@ -83,7 +88,7 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
         Integer approximateThreshold,
         NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
     ) {
-        this(segmentWriteState, flatVectorsWriter, approximateThreshold, nativeIndexBuildStrategyFactory, null);
+        this(segmentWriteState, flatVectorsWriter, approximateThreshold, nativeIndexBuildStrategyFactory, null, false);
     }
 
     public NativeEngines990KnnVectorsWriter(
@@ -93,11 +98,23 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
         NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
         VectorReorderStrategy reorderStrategy
     ) {
+        this(segmentWriteState, flatVectorsWriter, approximateThreshold, nativeIndexBuildStrategyFactory, reorderStrategy, false);
+    }
+
+    public NativeEngines990KnnVectorsWriter(
+        SegmentWriteState segmentWriteState,
+        FlatVectorsWriter flatVectorsWriter,
+        Integer approximateThreshold,
+        NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
+        VectorReorderStrategy reorderStrategy,
+        boolean replacementFree
+    ) {
         this.segmentWriteState = segmentWriteState;
         this.flatVectorsWriter = flatVectorsWriter;
         this.approximateThreshold = approximateThreshold;
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
         this.reorderStrategy = reorderStrategy;
+        this.replacementFree = replacementFree;
     }
 
     @Override
@@ -161,9 +178,22 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
     @Override
     public void mergeOneField(final FieldInfo fieldInfo, final MergeState mergeState) throws IOException {
         this.mergeState = mergeState;
+        final VectorDataType vectorDataType = extractVectorDataType(fieldInfo);
+
+        // Replacement-free path: write .vec in reordered order directly, build .faiss in reordered order.
+        // Skips flatVectorsWriter.mergeOneField() and the post-hoc rewrite in finish().
+        if (replacementFree && reorderStrategy != null && vectorDataType == VectorDataType.FLOAT) {
+            final MergeOrdMappingBuilder.MergeOrdMapping mapping = MergeOrdMappingBuilder.build(mergeState, fieldInfo);
+            if (mapping.totalLiveDocs() >= SegmentReorderService.MIN_VECTORS_FOR_REORDER) {
+                mergeOneFieldReplacementFree(fieldInfo, mergeState, mapping);
+                return;
+            }
+            // Below threshold — fall through to standard path
+        }
+
+        // Standard path: delegate writes .vec, optionally mark for post-hoc reorder in finish()
         flatVectorsWriter.mergeOneField(fieldInfo, mergeState);
 
-        final VectorDataType vectorDataType = extractVectorDataType(fieldInfo);
         final Supplier<KNNVectorValues<?>> knnVectorValuesSupplier = getKNNVectorValuesSupplierForMerge(
             vectorDataType,
             fieldInfo,
@@ -210,6 +240,82 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
                 sourceClusterSummaries.put(fieldInfo.name, summaries);
             }
         }
+    }
+
+    /**
+     * Replacement-free merge path: skips the delegate's mergeOneField, writes .vec in permuted
+     * order and reordered .vemf metadata directly into the delegate's IndexOutput streams.
+     * Builds .faiss with vectors already in reordered order. True single-pass — no re-reading.
+     * Uses standard codec headers; the reader dispatches per-field via knn_reordered attribute.
+     */
+    private void mergeOneFieldReplacementFree(final FieldInfo fieldInfo, final MergeState mergeState,
+                                              final MergeOrdMappingBuilder.MergeOrdMapping mapping) throws IOException {
+
+        // Mark field so the unified reader knows to parse reordered metadata format
+        fieldInfo.putAttribute("knn_reordered", "true");
+
+        // Build random-access composite over source segment mmap readers
+        final MergedRandomAccessFloatVectorValues mergedRA = buildMergedRandomAccess(mergeState, fieldInfo, mapping);
+
+        // Compute permutation from source mmap
+        final int[] permutation = reorderStrategy.computePermutation(
+            mergedRA, SegmentReorderService.DEFAULT_REORDER_THREADS, fieldInfo.getVectorSimilarityFunction()
+        );
+        log.info("[ReplacementFree] Permutation computed for {} vectors, field [{}]", mapping.totalLiveDocs(), fieldInfo.getName());
+
+        // Write .vec in permuted order directly into delegate's stream
+        final ReorderAwareFlatVectorsWriter flatWriter = (ReorderAwareFlatVectorsWriter) flatVectorsWriter;
+        final IndexOutput vectorData = flatWriter.getVectorDataOutput();
+        final long vectorDataOffset = vectorData.alignFilePointer(Float.BYTES);
+        final int dim = mergedRA.dimension();
+        final java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(dim * Float.BYTES).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int newOrd = 0; newOrd < mapping.totalLiveDocs(); newOrd++) {
+            float[] vec = mergedRA.vectorValue(permutation[newOrd]);
+            buffer.asFloatBuffer().put(vec);
+            vectorData.writeBytes(buffer.array(), buffer.array().length);
+        }
+        final long vectorDataLength = vectorData.getFilePointer() - vectorDataOffset;
+
+        // Write reordered .vemf metadata + skip list directly into delegate's stream
+        ReorderedFieldMetaWriter.writeReorderedMeta(
+            flatWriter.getMetaOutput(), fieldInfo, vectorDataOffset, vectorDataLength,
+            mapping.mergedOrdToDocId(), permutation
+        );
+
+        // Build .faiss with reordered supplier — graph built in permuted order
+        final Supplier<KNNVectorValues<?>> reorderedSupplier = () -> new ReorderedKNNFloatVectorValues(
+            mergedRA, permutation, mapping.mergedOrdToDocId()
+        );
+        final VectorDataType vectorDataType = extractVectorDataType(fieldInfo);
+        final Supplier<KNNVectorValues<?>> standardSupplier = getKNNVectorValuesSupplierForMerge(
+            vectorDataType, fieldInfo, mergeState
+        );
+        final QuantizationState quantizationState = train(fieldInfo, standardSupplier, mapping.totalLiveDocs());
+        if (quantizationState == null && shouldSkipBuildingVectorDataStructure(mapping.totalLiveDocs())) {
+            return;
+        }
+        final NativeIndexWriter writer = NativeIndexWriter.getWriter(
+            fieldInfo, segmentWriteState, quantizationState, nativeIndexBuildStrategyFactory
+        );
+
+        StopWatch stopWatch = new StopWatch().start();
+        writer.mergeIndex(reorderedSupplier, mapping.totalLiveDocs());
+        long time_in_millis = stopWatch.stop().totalTime().millis();
+        KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(time_in_millis);
+        log.info("[ReplacementFree] Merge+reorder took {} ms for field [{}]", time_in_millis, fieldInfo.getName());
+    }
+
+    private MergedRandomAccessFloatVectorValues buildMergedRandomAccess(
+        MergeState mergeState, FieldInfo fieldInfo, MergeOrdMappingBuilder.MergeOrdMapping mapping
+    ) throws IOException {
+        final int numSegments = mergeState.knnVectorsReaders.length;
+        final FloatVectorValues[] segmentValues = new FloatVectorValues[numSegments];
+        for (int seg = 0; seg < numSegments; seg++) {
+            if (mergeState.knnVectorsReaders[seg] != null) {
+                segmentValues[seg] = mergeState.knnVectorsReaders[seg].getFloatVectorValues(fieldInfo.name);
+            }
+        }
+        return new MergedRandomAccessFloatVectorValues(segmentValues, mapping.segmentStarts(), mapping.liveLocalOrds());
     }
 
     @Override

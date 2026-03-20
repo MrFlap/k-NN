@@ -378,6 +378,52 @@ No forward pass over `MergedFloat32VectorValues` needed. All mappings are comput
 Both are O(1) random access. The construction loop iterates source segment ords sequentially
 (not vectors — just integer metadata), touching no vector data.
 
+## RESOLVED: Codec Header and Reader Strategy (2026-03-20)
+
+### Problem
+
+Flush and merge share the same `ReorderAwareFlatVectorsWriter` instance. The codec header is
+written once at construction. We can't use reordered codec headers (`ReorderedLucene99FlatVectorsFormatMeta`)
+because flush segments need standard headers, and the reader dispatches based on the header.
+
+### Solution: Standard Headers + FieldInfo Attribute + Unified Reader
+
+**Writer:** `ReorderAwareFlatVectorsWriter` always uses standard codec headers
+(`Lucene99FlatVectorsFormatMeta` / `Lucene99FlatVectorsFormatData`). Both flush and merge
+write into the same `.vec`/`.vemf` streams. For reordered fields,
+`mergeOneFieldReplacementFree()` writes reordered metadata format (skip list) directly into
+the `.vemf` stream and sets `fieldInfo.putAttribute("knn_reordered", "true")`.
+
+**Reader:** A unified `FlatVectorsReader` that:
+1. Opens `.vemf`/`.vec` with standard codec headers — works for all segments
+2. In `readFields()`, checks `fieldInfo.getAttribute("knn_reordered")` per field
+3. If `"true"`: parses reordered format (isDense, maxDoc, skip list) → returns
+   `ReorderedOffHeapFloatVectorValues111` with doc→ord skip list translation
+4. If not: parses standard format (count + OrdToDocDISI) → returns standard
+   `OffHeapFloatVectorValues` with identity mapping
+
+**Backward compatibility:**
+- Old replacement-based segments: `ReorderedLucene99FlatVectorsFormatMeta` codec header →
+  existing `ReorderedLucene99FlatVectorsReader111` handles via try/catch fallback in `fieldsReader()`
+- Old non-reordered segments: standard headers, no attribute → unified reader parses all
+  fields as standard
+- New replacement-free segments: standard headers, `knn_reordered` attribute on reordered
+  fields → unified reader dispatches per-field
+
+**File layout (single .vemf with mixed field formats):**
+```
+[CodecUtil header: "Lucene99FlatVectorsFormatMeta"]
+Field 0 (flush, standard):
+  fieldNumber, encoding, similarity, offset, length, dimension
+  count (int), OrdToDocDISI config
+Field 1 (merge, reordered):
+  fieldNumber, encoding, similarity, offset, length, dimension
+  isDense (byte), maxDoc, numLevel, numDocsForGrouping, groupFactor
+  FixedBlockSkipListIndex
+sentinel: -1
+[CodecUtil footer]
+```
+
 ## Remaining Open Questions
 
 1. **RESOLVED: Accessing delegate IndexOutput streams.** Replace `Lucene99FlatVectorsWriter`

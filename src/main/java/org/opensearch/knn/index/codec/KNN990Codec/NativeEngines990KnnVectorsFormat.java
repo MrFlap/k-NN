@@ -19,6 +19,7 @@ import org.apache.lucene.codecs.hnsw.DefaultFlatVectorScorer;
 import org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
 import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
@@ -44,6 +45,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     private final int approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
     private final VectorReorderStrategy reorderStrategy;
+    private final boolean replacementFree;
 
     public NativeEngines990KnnVectorsFormat() {
         this(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_DEFAULT_VALUE);
@@ -57,7 +59,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
         int approximateThreshold,
         final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
     ) {
-        this(flatVectorsFormat, approximateThreshold, nativeIndexBuildStrategyFactory, null);
+        this(approximateThreshold, nativeIndexBuildStrategyFactory, null, false);
     }
 
     public NativeEngines990KnnVectorsFormat(
@@ -66,10 +68,20 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
         final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
         final VectorReorderStrategy reorderStrategy
     ) {
+        this(approximateThreshold, nativeIndexBuildStrategyFactory, reorderStrategy, false);
+    }
+
+    public NativeEngines990KnnVectorsFormat(
+        int approximateThreshold,
+        final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
+        final VectorReorderStrategy reorderStrategy,
+        boolean replacementFree
+    ) {
         super(FORMAT_NAME);
         this.approximateThreshold = approximateThreshold;
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
         this.reorderStrategy = reorderStrategy;
+        this.replacementFree = replacementFree;
     }
 
     /**
@@ -79,12 +91,16 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsWriter fieldsWriter(final SegmentWriteState state) throws IOException {
+        final FlatVectorsWriter flatWriter = replacementFree
+            ? new ReorderAwareFlatVectorsWriter(state, FlatVectorScorerUtil.getLucene99FlatVectorsScorer(), false)
+            : flatVectorsFormat.fieldsWriter(state);
         return new NativeEngines990KnnVectorsWriter(
             state,
-            flatVectorsFormat.fieldsWriter(state),
+            flatWriter,
             approximateThreshold,
             nativeIndexBuildStrategyFactory,
-            reorderStrategy
+            reorderStrategy,
+            replacementFree
         );
     }
 
@@ -95,8 +111,14 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
+        // Try unified reader first (handles standard headers with mixed reordered/standard fields)
         try {
-            // Try reordered
+            return new NativeEngines990KnnVectorsReader(state, new UnifiedFlatVectorsReader(state,
+                FlatVectorScorerUtil.getLucene99FlatVectorsScorer()));
+        } catch (org.apache.lucene.index.CorruptIndexException | NullPointerException e) {
+            // Not standard headers — try legacy reordered reader
+        }
+        try {
             final FlatVectorsReader reorderedFlatVectorsReader =
                 new ReorderedLucene99FlatVectorsReader111(state, FlatVectorScorerUtil.getLucene99FlatVectorsScorer());
             return new NativeEngines990KnnVectorsReader(state, reorderedFlatVectorsReader);

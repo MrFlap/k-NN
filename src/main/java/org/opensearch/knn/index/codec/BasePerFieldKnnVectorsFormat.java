@@ -162,11 +162,14 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
         // addition isPresent check here.
         final int approximateThreshold = getApproximateThresholdValue();
         final VectorReorderStrategy reorderStrategy = getReorderStrategy();
+        final boolean replacementFree = "replacement_free".equals(
+            mapperService.get().getIndexSettings().getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_SETTING)
+        );
         return new NativeEngines990KnnVectorsFormat(
-            new Lucene99FlatVectorsFormat(FlatVectorScorerUtil.getLucene99FlatVectorsScorer()),
             approximateThreshold,
             nativeIndexBuildStrategyFactory,
-            reorderStrategy
+            reorderStrategy,
+            replacementFree
         );
     }
 
