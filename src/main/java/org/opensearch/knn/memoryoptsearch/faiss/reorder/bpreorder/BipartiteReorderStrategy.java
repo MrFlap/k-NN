@@ -26,7 +26,7 @@ public class BipartiteReorderStrategy implements VectorReorderStrategy {
     public int[] computePermutation(FloatVectorValues vectors, int numThreads, VectorSimilarityFunction similarityFunction)
         throws IOException {
         BpVectorReorderer reorderer = new BpVectorReorderer("vectors"); // TODO: indicate "vectors" is a dummy value or change interface.
-        reorderer.setMinPartitionSize(1); // TODO: magic number, it's 32 by default, should probably keep it at 32.
+        reorderer.setMinPartitionSize(BpVectorReorderer.DEFAULT_MIN_PARTITION_SIZE); // TODO: magic number, it's 32 by default, should probably keep it at 32.
 
         ForkJoinPool pool = new ForkJoinPool(numThreads);
         try {
