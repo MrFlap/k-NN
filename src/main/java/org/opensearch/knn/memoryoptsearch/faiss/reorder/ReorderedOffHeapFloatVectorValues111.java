@@ -69,24 +69,34 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
         IndexInput vectorData,
         int numVectors
     ) throws IOException {
+        return load(vectorSimilarityFunction, flatVectorsScorer, docIdOrdSkipListIndex,
+            dimension, vectorDataOffset, vectorDataLength, vectorData, numVectors, null);
+    }
+
+    public static ReorderedOffHeapFloatVectorValues111 load(
+        VectorSimilarityFunction vectorSimilarityFunction,
+        FlatVectorsScorer flatVectorsScorer,
+        FixedBlockSkipListIndexReader docIdOrdSkipListIndex,
+        int dimension,
+        long vectorDataOffset,
+        long vectorDataLength,
+        IndexInput vectorData,
+        int numVectors,
+        int[] ordToDocMap
+    ) throws IOException {
 
         final IndexInput bytesSlice = vectorData.slice("vector-data", vectorDataOffset, vectorDataLength);
         final int byteSize = dimension * Float.BYTES;
         return new ReorderedOffHeapFloatVectorValues111.DenseOffHeapVectorValues(
-            dimension,
-                                                                                 bytesSlice,
-                                                                                 byteSize,
-                                                                                 numVectors,
-                                                                                 flatVectorsScorer,
-                                                                                 vectorSimilarityFunction,
-                                                                                 docIdOrdSkipListIndex
+            dimension, bytesSlice, byteSize, numVectors,
+            flatVectorsScorer, vectorSimilarityFunction,
+            docIdOrdSkipListIndex, ordToDocMap
         );
     }
 
     public static class DenseOffHeapVectorValues extends ReorderedOffHeapFloatVectorValues111 {
         private final FixedBlockSkipListIndexReader docIdOrdSkipListIndex;
-
-        private final int[][] sharedOrdToDocMap; // single-element array as mutable holder
+        private final int[] ordToDocMap;  // pre-built from .vemf, or null
 
         public DenseOffHeapVectorValues(
             int dimension,
@@ -97,10 +107,10 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
             VectorSimilarityFunction similarityFunction,
             FixedBlockSkipListIndexReader docIdOrdSkipListIndex
         ) {
-            this(dimension, slice, byteSize, totalNumVectors, flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, new int[1][]);
+            this(dimension, slice, byteSize, totalNumVectors, flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, null);
         }
 
-        private DenseOffHeapVectorValues(
+        public DenseOffHeapVectorValues(
             int dimension,
             IndexInput slice,
             int byteSize,
@@ -108,40 +118,25 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
             FlatVectorsScorer flatVectorsScorer,
             VectorSimilarityFunction similarityFunction,
             FixedBlockSkipListIndexReader docIdOrdSkipListIndex,
-            int[][] sharedOrdToDocMap
+            int[] ordToDocMap
         ) {
             super(dimension, slice, byteSize, totalNumVectors, flatVectorsScorer, similarityFunction);
             this.docIdOrdSkipListIndex = docIdOrdSkipListIndex;
-            this.sharedOrdToDocMap = sharedOrdToDocMap;
+            this.ordToDocMap = ordToDocMap;
         }
 
         @Override
         public DenseOffHeapVectorValues copy() throws IOException {
             return new DenseOffHeapVectorValues(
                 dimension, slice.clone(), byteSize, numVectors,
-                flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, sharedOrdToDocMap
+                flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, ordToDocMap
             );
         }
 
         @Override
         public int ordToDoc(int ord) {
-            if (docIdOrdSkipListIndex == null) return ord;
-            if (sharedOrdToDocMap[0] == null) {
-                int[] map = new int[numVectors];
-                for (int doc = 0; doc <= docIdOrdSkipListIndex.maxDoc; doc++) {
-                    docIdOrdSkipListIndex.skipTo(doc);
-                    int o = docIdOrdSkipListIndex.getOrd();
-                    if (o >= 0 && o < numVectors) {
-                        map[o] = doc;
-                    }
-                }
-                sharedOrdToDocMap[0] = map;
-//                System.out.println("[ReorderedFVV] Built ordToDocMap: numVectors=" + numVectors
-//                    + ", maxDoc=" + docIdOrdSkipListIndex.maxDoc
-//                    + ", sample ordToDoc[0]=" + map[0]
-//                    + ", ordToDoc[1]=" + map[1]);
-            }
-            return sharedOrdToDocMap[0][ord];
+            if (ordToDocMap != null) return ordToDocMap[ord];
+            return ord;
         }
 
         @Override

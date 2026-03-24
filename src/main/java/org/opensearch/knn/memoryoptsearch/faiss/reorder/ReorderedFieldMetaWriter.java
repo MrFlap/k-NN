@@ -69,11 +69,18 @@ public class ReorderedFieldMetaWriter {
         meta.writeInt(256);          // numDocsForGrouping
         meta.writeInt(4);            // groupFactor
 
-        // Skip list body
+        // Skip list body (doc→ord, used by search path)
         FixedBlockSkipListIndexBuilder skipListBuilder = new FixedBlockSkipListIndexBuilder(meta, maxDoc);
         for (long docAndOrd : docAndOrds) {
             skipListBuilder.add((int) (docAndOrd >>> 32), (int) docAndOrd);
         }
         skipListBuilder.finish();
+
+        // Ord→doc array (used by merge path for ordToDoc())
+        // ordToDoc[newOrd] = docId for the vector at position newOrd in .vec
+        meta.writeInt(n);
+        for (int newOrd = 0; newOrd < n; newOrd++) {
+            meta.writeInt(mergedOrdToDocId[permutation[newOrd]]);
+        }
     }
 }

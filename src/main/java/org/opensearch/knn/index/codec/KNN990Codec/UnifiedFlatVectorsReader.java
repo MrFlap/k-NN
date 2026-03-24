@@ -110,11 +110,10 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
         FieldEntry entry = getFieldEntry(field, VectorEncoding.FLOAT32);
         if (entry.reordered) {
-//            System.out.println("[UnifiedReader] getFloatVectorValues field=" + field + " → REORDERED, numVectors=" + (entry.skipListReader.maxDoc + 1));
             return ReorderedOffHeapFloatVectorValues111.load(
                 entry.similarityFunction, vectorScorer, entry.skipListReader,
                 entry.dimension, entry.vectorDataOffset, entry.vectorDataLength,
-                vectorData, entry.skipListReader.maxDoc + 1
+                vectorData, entry.skipListReader.maxDoc + 1, entry.ordToDocMap
             );
         }
 //        System.out.println("[UnifiedReader] getFloatVectorValues field=" + field + " → STANDARD, vecLen=" + entry.vectorDataLength + " dim=" + entry.dimension);
@@ -183,7 +182,8 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
         int dimension,
         boolean reordered,
         FixedBlockSkipListIndexReader skipListReader,       // non-null for reordered
-        OrdToDocDISIReaderConfiguration ordToDocConfig       // non-null for standard
+        OrdToDocDISIReaderConfiguration ordToDocConfig,     // non-null for standard
+        int[] ordToDocMap                                   // non-null for reordered
     ) {
         static FieldEntry createReordered(IndexInput input, FieldInfo info) throws IOException {
             VectorEncoding enc = readVectorEncoding(input);
@@ -199,7 +199,15 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
             input.readInt();   // groupFactor
 
             FixedBlockSkipListIndexReader skipList = new FixedBlockSkipListIndexReader(input, maxDoc);
-            return new FieldEntry(sim, enc, offset, length, dim, true, skipList, null);
+
+            // Read ord→doc array
+            int n = input.readInt();
+            int[] ordToDocMap = new int[n];
+            for (int i = 0; i < n; i++) {
+                ordToDocMap[i] = input.readInt();
+            }
+
+            return new FieldEntry(sim, enc, offset, length, dim, true, skipList, null, ordToDocMap);
         }
 
         static FieldEntry createStandard(IndexInput input, FieldInfo info) throws IOException {
@@ -211,7 +219,7 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
 
             int count = input.readInt();
             OrdToDocDISIReaderConfiguration config = OrdToDocDISIReaderConfiguration.fromStoredMeta(input, count);
-            return new FieldEntry(sim, enc, offset, length, dim, false, null, config);
+            return new FieldEntry(sim, enc, offset, length, dim, false, null, config, null);
         }
     }
 }
