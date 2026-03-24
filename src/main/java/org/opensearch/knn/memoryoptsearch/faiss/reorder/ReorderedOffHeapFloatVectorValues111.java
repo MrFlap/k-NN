@@ -86,6 +86,8 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
     public static class DenseOffHeapVectorValues extends ReorderedOffHeapFloatVectorValues111 {
         private final FixedBlockSkipListIndexReader docIdOrdSkipListIndex;
 
+        private final int[][] sharedOrdToDocMap; // single-element array as mutable holder
+
         public DenseOffHeapVectorValues(
             int dimension,
             IndexInput slice,
@@ -95,26 +97,51 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
             VectorSimilarityFunction similarityFunction,
             FixedBlockSkipListIndexReader docIdOrdSkipListIndex
         ) {
+            this(dimension, slice, byteSize, totalNumVectors, flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, new int[1][]);
+        }
+
+        private DenseOffHeapVectorValues(
+            int dimension,
+            IndexInput slice,
+            int byteSize,
+            int totalNumVectors,
+            FlatVectorsScorer flatVectorsScorer,
+            VectorSimilarityFunction similarityFunction,
+            FixedBlockSkipListIndexReader docIdOrdSkipListIndex,
+            int[][] sharedOrdToDocMap
+        ) {
             super(dimension, slice, byteSize, totalNumVectors, flatVectorsScorer, similarityFunction);
             this.docIdOrdSkipListIndex = docIdOrdSkipListIndex;
+            this.sharedOrdToDocMap = sharedOrdToDocMap;
         }
 
         @Override
         public DenseOffHeapVectorValues copy() throws IOException {
             return new DenseOffHeapVectorValues(
-                dimension,
-                                                slice.clone(),
-                                                byteSize,
-                                                numVectors,
-                                                flatVectorsScorer,
-                                                similarityFunction,
-                                                docIdOrdSkipListIndex
+                dimension, slice.clone(), byteSize, numVectors,
+                flatVectorsScorer, similarityFunction, docIdOrdSkipListIndex, sharedOrdToDocMap
             );
         }
 
         @Override
         public int ordToDoc(int ord) {
-            return ord;
+            if (docIdOrdSkipListIndex == null) return ord;
+            if (sharedOrdToDocMap[0] == null) {
+                int[] map = new int[numVectors];
+                for (int doc = 0; doc <= docIdOrdSkipListIndex.maxDoc; doc++) {
+                    docIdOrdSkipListIndex.skipTo(doc);
+                    int o = docIdOrdSkipListIndex.getOrd();
+                    if (o >= 0 && o < numVectors) {
+                        map[o] = doc;
+                    }
+                }
+                sharedOrdToDocMap[0] = map;
+                System.out.println("[ReorderedFVV] Built ordToDocMap: numVectors=" + numVectors
+                    + ", maxDoc=" + docIdOrdSkipListIndex.maxDoc
+                    + ", sample ordToDoc[0]=" + map[0]
+                    + ", ordToDoc[1]=" + map[1]);
+            }
+            return sharedOrdToDocMap[0][ord];
         }
 
         @Override

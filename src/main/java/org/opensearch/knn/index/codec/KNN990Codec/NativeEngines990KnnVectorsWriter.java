@@ -253,6 +253,7 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
 
         // Mark field so the unified reader knows to parse reordered metadata format
         fieldInfo.putAttribute("knn_reordered", "true");
+        System.out.println("[Writer] putAttribute knn_reordered=true on field=" + fieldInfo.name + " number=" + fieldInfo.number + " attrs=" + fieldInfo.attributes());
 
         // Build random-access composite over source segment mmap readers
         final MergedRandomAccessFloatVectorValues mergedRA = buildMergedRandomAccess(mergeState, fieldInfo, mapping);

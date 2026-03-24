@@ -113,16 +113,21 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
         // Try unified reader first (handles standard headers with mixed reordered/standard fields)
         try {
-            return new NativeEngines990KnnVectorsReader(state, new UnifiedFlatVectorsReader(state,
-                FlatVectorScorerUtil.getLucene99FlatVectorsScorer()));
+            UnifiedFlatVectorsReader unified = new UnifiedFlatVectorsReader(state,
+                FlatVectorScorerUtil.getLucene99FlatVectorsScorer());
+            System.out.println("[Format] fieldsReader → UnifiedFlatVectorsReader for segment " + state.segmentInfo.name);
+            return new NativeEngines990KnnVectorsReader(state, unified);
         } catch (org.apache.lucene.index.CorruptIndexException | NullPointerException e) {
             // Not standard headers — try legacy reordered reader
+            System.out.println("[Format] fieldsReader → UnifiedReader failed for " + state.segmentInfo.name + ": " + e.getMessage());
         }
         try {
             final FlatVectorsReader reorderedFlatVectorsReader =
                 new ReorderedLucene99FlatVectorsReader111(state, FlatVectorScorerUtil.getLucene99FlatVectorsScorer());
+            System.out.println("[Format] fieldsReader → ReorderedLucene99FlatVectorsReader111 for segment " + state.segmentInfo.name);
             return new NativeEngines990KnnVectorsReader(state, reorderedFlatVectorsReader);
         } catch (org.apache.lucene.index.CorruptIndexException | NullPointerException e) {
+            System.out.println("[Format] fieldsReader → standard Lucene reader for segment " + state.segmentInfo.name);
             return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
         }
     }

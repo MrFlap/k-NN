@@ -98,6 +98,7 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
                 throw new CorruptIndexException("Invalid field number: " + fieldNumber, meta);
             }
             boolean isReordered = "true".equals(info.getAttribute("knn_reordered"));
+            System.out.println("[UnifiedReader] readFields field=" + info.name + " num=" + info.number + " reordered=" + isReordered + " attrs=" + info.attributes());
             FieldEntry entry = isReordered
                 ? FieldEntry.createReordered(meta, info)
                 : FieldEntry.createStandard(meta, info);
@@ -109,12 +110,14 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
         FieldEntry entry = getFieldEntry(field, VectorEncoding.FLOAT32);
         if (entry.reordered) {
+            System.out.println("[UnifiedReader] getFloatVectorValues field=" + field + " → REORDERED, numVectors=" + (entry.skipListReader.maxDoc + 1));
             return ReorderedOffHeapFloatVectorValues111.load(
                 entry.similarityFunction, vectorScorer, entry.skipListReader,
                 entry.dimension, entry.vectorDataOffset, entry.vectorDataLength,
                 vectorData, entry.skipListReader.maxDoc + 1
             );
         }
+        System.out.println("[UnifiedReader] getFloatVectorValues field=" + field + " → STANDARD, vecLen=" + entry.vectorDataLength + " dim=" + entry.dimension);
         return OffHeapFloatVectorValues.load(
             entry.similarityFunction, vectorScorer, entry.ordToDocConfig,
             VectorEncoding.FLOAT32, entry.dimension,
