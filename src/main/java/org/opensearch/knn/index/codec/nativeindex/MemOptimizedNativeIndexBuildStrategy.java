@@ -83,9 +83,9 @@ final class MemOptimizedNativeIndexBuildStrategy implements NativeIndexBuildStra
                 // append is false to be able to reuse the memory location
                 boolean transferred = vectorTransfer.transfer(vector, false);
                 transferredDocIds.add(knnVectorValues.docId());
-                if (transferredDocIds.size() <= 3) {
-                    System.out.println("[MemOpt] docId=" + knnVectorValues.docId() + " vectorClass=" + knnVectorValues.getClass().getSimpleName());
-                }
+//                if (transferredDocIds.size() <= 3) {
+//                    System.out.println("[MemOpt] docId=" + knnVectorValues.docId() + " vectorClass=" + knnVectorValues.getClass().getSimpleName());
+//                }
                 if (transferred) {
                     // Insert vectors
                     long vectorAddress = vectorTransfer.getVectorAddress();
