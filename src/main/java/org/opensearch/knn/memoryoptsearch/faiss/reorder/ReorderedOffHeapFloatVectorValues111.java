@@ -136,10 +136,10 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
                     }
                 }
                 sharedOrdToDocMap[0] = map;
-                System.out.println("[ReorderedFVV] Built ordToDocMap: numVectors=" + numVectors
-                    + ", maxDoc=" + docIdOrdSkipListIndex.maxDoc
-                    + ", sample ordToDoc[0]=" + map[0]
-                    + ", ordToDoc[1]=" + map[1]);
+//                System.out.println("[ReorderedFVV] Built ordToDocMap: numVectors=" + numVectors
+//                    + ", maxDoc=" + docIdOrdSkipListIndex.maxDoc
+//                    + ", sample ordToDoc[0]=" + map[0]
+//                    + ", ordToDoc[1]=" + map[1]);
             }
             return sharedOrdToDocMap[0][ord];
         }

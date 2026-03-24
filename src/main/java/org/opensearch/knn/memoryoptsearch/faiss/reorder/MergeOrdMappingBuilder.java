@@ -25,66 +25,56 @@ public class MergeOrdMappingBuilder {
         final int[] segmentStarts = new int[numSegments + 1];
         final int[][] liveLocalOrds = new int[numSegments][];
 
-        // First pass: count total live docs and collect live local ords
+        // Compute max possible size for mergedOrdToDocId
+        int maxDocs = 0;
+        for (int seg = 0; seg < numSegments; seg++) {
+            maxDocs += mergeState.maxDocs[seg];
+        }
+        int[] mergedOrdToDocId = new int[maxDocs];
+
+        // Single pass: build all mappings at once
         int totalLiveDocs = 0;
         for (int seg = 0; seg < numSegments; seg++) {
             segmentStarts[seg] = totalLiveDocs;
 
             if (mergeState.knnVectorsReaders[seg] == null) {
-                liveLocalOrds[seg] = null;
                 continue;
             }
 
             FloatVectorValues segValues = mergeState.knnVectorsReaders[seg].getFloatVectorValues(fieldInfo.name);
             if (segValues == null) {
-                liveLocalOrds[seg] = null;
                 continue;
             }
 
             int segSize = segValues.size();
+            boolean hasDeletions = mergeState.liveDocs[seg] != null;
+            int[] tempLiveOrds = hasDeletions ? new int[segSize] : null;
             int liveCount = 0;
-            int[] tempLiveOrds = new int[segSize];
+            MergeState.DocMap docMap = mergeState.docMaps[seg];
 
             for (int localOrd = 0; localOrd < segSize; localOrd++) {
                 int sourceDocId = segValues.ordToDoc(localOrd);
-                int mergedDocId = mergeState.docMaps[seg].get(sourceDocId);
+                int mergedDocId = docMap.get(sourceDocId);
                 if (mergedDocId == -1) {
                     continue;
                 }
-                tempLiveOrds[liveCount++] = localOrd;
+                mergedOrdToDocId[totalLiveDocs + liveCount] = mergedDocId;
+                if (hasDeletions) {
+                    tempLiveOrds[liveCount] = localOrd;
+                }
+                liveCount++;
             }
 
-            if (mergeState.liveDocs[seg] != null) {
+            if (hasDeletions) {
                 liveLocalOrds[seg] = Arrays.copyOf(tempLiveOrds, liveCount);
-            } else {
-                liveLocalOrds[seg] = null;
             }
             totalLiveDocs += liveCount;
         }
         segmentStarts[numSegments] = totalLiveDocs;
 
-        // Second pass: build mergedOrdToDocId
-        int[] mergedOrdToDocId = new int[totalLiveDocs];
-        int idx = 0;
-        for (int seg = 0; seg < numSegments; seg++) {
-            if (mergeState.knnVectorsReaders[seg] == null) {
-                continue;
-            }
-
-            FloatVectorValues segValues = mergeState.knnVectorsReaders[seg].getFloatVectorValues(fieldInfo.name);
-            if (segValues == null) {
-                continue;
-            }
-
-            int segSize = segValues.size();
-            for (int localOrd = 0; localOrd < segSize; localOrd++) {
-                int sourceDocId = segValues.ordToDoc(localOrd);
-                int mergedDocId = mergeState.docMaps[seg].get(sourceDocId);
-                if (mergedDocId == -1) {
-                    continue;
-                }
-                mergedOrdToDocId[idx++] = mergedDocId;
-            }
+        // Trim to actual size
+        if (mergedOrdToDocId.length != totalLiveDocs) {
+            mergedOrdToDocId = Arrays.copyOf(mergedOrdToDocId, totalLiveDocs);
         }
 
         if (mergeState.needsIndexSort) {

@@ -253,16 +253,22 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
 
         // Mark field so the unified reader knows to parse reordered metadata format
         fieldInfo.putAttribute("knn_reordered", "true");
-//        System.out.println("[Writer] putAttribute knn_reordered=true on field=" + fieldInfo.name + " number=" + fieldInfo.number + " attrs=" + fieldInfo.attributes());
+
+        StopWatch sw = new StopWatch().start();
 
         // Build random-access composite over source segment mmap readers
         final MergedRandomAccessFloatVectorValues mergedRA = buildMergedRandomAccess(mergeState, fieldInfo, mapping);
+
+        long buildRA_ms = sw.stop().totalTime().millis();
+        sw = new StopWatch().start();
 
         // Compute permutation from source mmap
         final int[] permutation = reorderStrategy.computePermutation(
             mergedRA, SegmentReorderService.DEFAULT_REORDER_THREADS, fieldInfo.getVectorSimilarityFunction()
         );
-        log.info("[ReplacementFree] Permutation computed for {} vectors, field [{}]", mapping.totalLiveDocs(), fieldInfo.getName());
+
+        long permutation_ms = sw.stop().totalTime().millis();
+        sw = new StopWatch().start();
 
         // Write .vec in permuted order directly into delegate's stream
         final ReorderAwareFlatVectorsWriter flatWriter = (ReorderAwareFlatVectorsWriter) flatVectorsWriter;
@@ -283,6 +289,9 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             mapping.mergedOrdToDocId(), permutation
         );
 
+        long writeVec_ms = sw.stop().totalTime().millis();
+        sw = new StopWatch().start();
+
         // Build .faiss with reordered supplier — graph built in permuted order
         final Supplier<KNNVectorValues<?>> reorderedSupplier = () -> new ReorderedKNNFloatVectorValues(
             mergedRA, permutation, mapping.mergedOrdToDocId()
@@ -293,17 +302,20 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
         );
         final QuantizationState quantizationState = train(fieldInfo, standardSupplier, mapping.totalLiveDocs());
         if (quantizationState == null && shouldSkipBuildingVectorDataStructure(mapping.totalLiveDocs())) {
+            log.info("[ReplacementFree] {} vectors field [{}]: buildRA={}ms permutation={}ms writeVec={}ms (skipped FAISS)",
+                mapping.totalLiveDocs(), fieldInfo.getName(), buildRA_ms, permutation_ms, writeVec_ms);
             return;
         }
         final NativeIndexWriter writer = NativeIndexWriter.getWriter(
             fieldInfo, segmentWriteState, quantizationState, nativeIndexBuildStrategyFactory
         );
-
-        StopWatch stopWatch = new StopWatch().start();
         writer.mergeIndex(reorderedSupplier, mapping.totalLiveDocs());
-        long time_in_millis = stopWatch.stop().totalTime().millis();
-        KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(time_in_millis);
-        log.info("[ReplacementFree] Merge+reorder took {} ms for field [{}]", time_in_millis, fieldInfo.getName());
+
+        long faiss_ms = sw.stop().totalTime().millis();
+        KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(faiss_ms);
+        log.info("[ReplacementFree] {} vectors field [{}]: buildRA={}ms permutation={}ms writeVec={}ms faiss={}ms total={}ms",
+            mapping.totalLiveDocs(), fieldInfo.getName(), buildRA_ms, permutation_ms, writeVec_ms, faiss_ms,
+            buildRA_ms + permutation_ms + writeVec_ms + faiss_ms);
     }
 
     private MergedRandomAccessFloatVectorValues buildMergedRandomAccess(
