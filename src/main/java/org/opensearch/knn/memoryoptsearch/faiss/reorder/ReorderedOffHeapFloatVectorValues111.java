@@ -94,6 +94,30 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
         );
     }
 
+    public static ReorderedOffHeapFloatVectorValues111 loadSparse(
+        VectorSimilarityFunction vectorSimilarityFunction,
+        FlatVectorsScorer flatVectorsScorer,
+        FixedBlockSkipListIndexReader docIdOrdSkipListIndex,
+        int dimension,
+        long vectorDataOffset,
+        long vectorDataLength,
+        IndexInput vectorData,
+        int numVectors,
+        int maxDoc,
+        int[] ordToDocMap
+    ) throws IOException {
+
+        final IndexInput bytesSlice = vectorData.slice("vector-data", vectorDataOffset, vectorDataLength);
+        final int byteSize = dimension * Float.BYTES;
+        int numBytesPerValue = Integer.BYTES - (Integer.numberOfLeadingZeros(maxDoc) / Byte.SIZE);
+        int sentinelOrd = (1 << (8 * numBytesPerValue)) - 1;
+        return new ReorderedOffHeapFloatVectorValues111.SparseOffHeapVectorValues(
+            dimension, bytesSlice, byteSize, numVectors,
+            flatVectorsScorer, vectorSimilarityFunction,
+            docIdOrdSkipListIndex, ordToDocMap, maxDoc, sentinelOrd
+        );
+    }
+
     public static class DenseOffHeapVectorValues extends ReorderedOffHeapFloatVectorValues111 {
         private final FixedBlockSkipListIndexReader docIdOrdSkipListIndex;
         private final int[] ordToDocMap;  // pre-built from .vemf, or null
@@ -200,6 +224,112 @@ public abstract class ReorderedOffHeapFloatVectorValues111 extends FloatVectorVa
                 @Override
                 public float score() throws IOException {
                     return randomVectorScorer.score(iterator.docID());
+                }
+
+                @Override
+                public DocIdSetIterator iterator() {
+                    return iterator;
+                }
+            };
+        }
+    }
+
+    public static class SparseOffHeapVectorValues extends ReorderedOffHeapFloatVectorValues111 {
+        private final FixedBlockSkipListIndexReader docIdOrdSkipListIndex;
+        private final int[] ordToDocMap;
+        private final int maxDoc;
+        private final int sentinelOrd;
+
+        public SparseOffHeapVectorValues(
+            int dimension, IndexInput slice, int byteSize, int numVectors,
+            FlatVectorsScorer flatVectorsScorer, VectorSimilarityFunction similarityFunction,
+            FixedBlockSkipListIndexReader docIdOrdSkipListIndex, int[] ordToDocMap,
+            int maxDoc, int sentinelOrd
+        ) {
+            super(dimension, slice, byteSize, numVectors, flatVectorsScorer, similarityFunction);
+            this.docIdOrdSkipListIndex = docIdOrdSkipListIndex;
+            this.ordToDocMap = ordToDocMap;
+            this.maxDoc = maxDoc;
+            this.sentinelOrd = sentinelOrd;
+        }
+
+        @Override
+        public SparseOffHeapVectorValues copy() throws IOException {
+            return new SparseOffHeapVectorValues(
+                dimension, slice.clone(), byteSize, numVectors,
+                flatVectorsScorer, similarityFunction,
+                docIdOrdSkipListIndex, ordToDocMap, maxDoc, sentinelOrd
+            );
+        }
+
+        @Override
+        public int ordToDoc(int ord) {
+            return ordToDocMap[ord];
+        }
+
+        @Override
+        public Bits getAcceptOrds(Bits acceptDocs) {
+            if (acceptDocs == null) return null;
+            return new Bits() {
+                @Override
+                public boolean get(int ord) {
+                    return acceptDocs.get(ordToDocMap[ord]);
+                }
+
+                @Override
+                public int length() {
+                    return numVectors;
+                }
+            };
+        }
+
+        @Override
+        public DocIndexIterator iterator() {
+            return new DocIndexIterator() {
+                int doc = -1;
+
+                @Override
+                public int index() {
+                    docIdOrdSkipListIndex.skipTo(doc);
+                    return docIdOrdSkipListIndex.getOrd();
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    while (++doc <= maxDoc) {
+                        docIdOrdSkipListIndex.skipTo(doc);
+                        if (docIdOrdSkipListIndex.getOrd() != sentinelOrd) return doc;
+                    }
+                    return doc = NO_MORE_DOCS;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target - 1;
+                    return nextDoc();
+                }
+
+                @Override
+                public long cost() {
+                    return numVectors;
+                }
+            };
+        }
+
+        @Override
+        public VectorScorer scorer(float[] query) throws IOException {
+            SparseOffHeapVectorValues copy = copy();
+            DocIndexIterator iterator = copy.iterator();
+            RandomVectorScorer randomVectorScorer = flatVectorsScorer.getRandomVectorScorer(similarityFunction, copy, query);
+            return new VectorScorer() {
+                @Override
+                public float score() throws IOException {
+                    return randomVectorScorer.score(iterator.index());
                 }
 
                 @Override

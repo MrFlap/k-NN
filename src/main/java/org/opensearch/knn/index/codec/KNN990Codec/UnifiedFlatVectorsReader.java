@@ -8,6 +8,7 @@ package org.opensearch.knn.index.codec.KNN990Codec;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
+import org.apache.lucene.codecs.lucene95.OffHeapByteVectorValues;
 import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.index.ByteVectorValues;
@@ -110,11 +111,19 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
         FieldEntry entry = getFieldEntry(field, VectorEncoding.FLOAT32);
         if (entry.reordered) {
-            return ReorderedOffHeapFloatVectorValues111.load(
-                entry.similarityFunction, vectorScorer, entry.skipListReader,
-                entry.dimension, entry.vectorDataOffset, entry.vectorDataLength,
-                vectorData, entry.skipListReader.maxDoc + 1, entry.ordToDocMap
-            );
+            if (entry.isDense) {
+                return ReorderedOffHeapFloatVectorValues111.load(
+                    entry.similarityFunction, vectorScorer, entry.skipListReader,
+                    entry.dimension, entry.vectorDataOffset, entry.vectorDataLength,
+                    vectorData, entry.skipListReader.maxDoc + 1, entry.ordToDocMap
+                );
+            } else {
+                return ReorderedOffHeapFloatVectorValues111.loadSparse(
+                    entry.similarityFunction, vectorScorer, entry.skipListReader,
+                    entry.dimension, entry.vectorDataOffset, entry.vectorDataLength,
+                    vectorData, entry.ordToDocMap.length, entry.maxDoc, entry.ordToDocMap
+                );
+            }
         }
 //        System.out.println("[UnifiedReader] getFloatVectorValues field=" + field + " → STANDARD, vecLen=" + entry.vectorDataLength + " dim=" + entry.dimension);
         return OffHeapFloatVectorValues.load(
@@ -132,13 +141,20 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
     }
 
     @Override
-    public ByteVectorValues getByteVectorValues(String field) {
-        throw new UnsupportedOperationException();
+    public ByteVectorValues getByteVectorValues(String field) throws IOException {
+        FieldEntry entry = getFieldEntry(field, VectorEncoding.BYTE);
+        return OffHeapByteVectorValues.load(
+            entry.similarityFunction, vectorScorer, entry.ordToDocConfig,
+            VectorEncoding.BYTE, entry.dimension,
+            entry.vectorDataOffset, entry.vectorDataLength, vectorData
+        );
     }
 
     @Override
-    public RandomVectorScorer getRandomVectorScorer(String field, byte[] target) {
-        throw new UnsupportedOperationException();
+    public RandomVectorScorer getRandomVectorScorer(String field, byte[] target) throws IOException {
+        FieldEntry entry = getFieldEntry(field, VectorEncoding.BYTE);
+        ByteVectorValues values = getByteVectorValues(field);
+        return vectorScorer.getRandomVectorScorer(entry.similarityFunction, values, target);
     }
 
     @Override
@@ -181,6 +197,8 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
         long vectorDataLength,
         int dimension,
         boolean reordered,
+        boolean isDense,
+        int maxDoc,
         FixedBlockSkipListIndexReader skipListReader,       // non-null for reordered
         OrdToDocDISIReaderConfiguration ordToDocConfig,     // non-null for standard
         int[] ordToDocMap                                   // non-null for reordered
@@ -192,7 +210,7 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
             long length = input.readVLong();
             int dim = input.readVInt();
 
-            input.readByte();  // isDense
+            boolean isDense = input.readByte() == 1;
             int maxDoc = input.readInt();
             input.readInt();   // numLevel
             input.readInt();   // numDocsForGrouping
@@ -207,7 +225,7 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
                 ordToDocMap[i] = input.readInt();
             }
 
-            return new FieldEntry(sim, enc, offset, length, dim, true, skipList, null, ordToDocMap);
+            return new FieldEntry(sim, enc, offset, length, dim, true, isDense, maxDoc, skipList, null, ordToDocMap);
         }
 
         static FieldEntry createStandard(IndexInput input, FieldInfo info) throws IOException {
@@ -219,7 +237,7 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
 
             int count = input.readInt();
             OrdToDocDISIReaderConfiguration config = OrdToDocDISIReaderConfiguration.fromStoredMeta(input, count);
-            return new FieldEntry(sim, enc, offset, length, dim, false, null, config, null);
+            return new FieldEntry(sim, enc, offset, length, dim, false, true, 0, null, config, null);
         }
     }
 }

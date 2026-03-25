@@ -62,17 +62,28 @@ public class ReorderedFieldMetaWriter {
         }
         Arrays.sort(docAndOrds);
 
+        boolean isDense = (n == maxDoc + 1);
+
         // Skip list header (matches reader)
-        meta.writeByte((byte) 1);   // isDense
+        meta.writeByte(isDense ? (byte) 1 : (byte) 0);
         meta.writeInt(maxDoc);       // maxDoc
         meta.writeInt(4);            // numLevel
         meta.writeInt(256);          // numDocsForGrouping
         meta.writeInt(4);            // groupFactor
 
         // Skip list body (doc→ord, used by search path)
+        // For sparse, fill sentinel for docs without vectors
         FixedBlockSkipListIndexBuilder skipListBuilder = new FixedBlockSkipListIndexBuilder(meta, maxDoc);
-        for (long docAndOrd : docAndOrds) {
-            skipListBuilder.add((int) (docAndOrd >>> 32), (int) docAndOrd);
+        int numBytesPerValue = Integer.BYTES - (Integer.numberOfLeadingZeros(maxDoc) / Byte.SIZE);
+        int sentinel = (1 << (8 * numBytesPerValue)) - 1;
+        int vecIdx = 0;
+        for (int doc = 0; doc <= maxDoc; doc++) {
+            if (vecIdx < n && (int)(docAndOrds[vecIdx] >>> 32) == doc) {
+                skipListBuilder.add(doc, (int) docAndOrds[vecIdx]);
+                vecIdx++;
+            } else {
+                skipListBuilder.add(doc, sentinel);
+            }
         }
         skipListBuilder.finish();
 
