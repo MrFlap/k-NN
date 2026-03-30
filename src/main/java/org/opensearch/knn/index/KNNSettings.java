@@ -151,8 +151,8 @@ public class KNNSettings {
     public static final String KNN_DEFAULT_VECTOR_STREAMING_MEMORY_LIMIT_PCT = "1%";
 
     public static final Integer ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_DEFAULT_VALUE = -1;
-    public static final String INDEX_KNN_ADVANCED_REORDER_STRATEGY_DEFAULT = "bp";
-    public static final String INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_DEFAULT = "replacement";
+    public static final String INDEX_KNN_ADVANCED_REORDER_STRATEGY_DEFAULT = "none";
+    public static final String INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_DEFAULT = "replacement_free";
     public static final Integer INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_DEFAULT = 256;
     public static final Integer KNN_DEFAULT_QUANTIZATION_STATE_CACHE_SIZE_LIMIT_PERCENTAGE = 5; // By default, set aside 5% of the JVM for
     // the limit

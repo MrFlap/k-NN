@@ -5,8 +5,6 @@
 
 package org.opensearch.knn.index.codec.KNN990Codec;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
@@ -46,7 +44,6 @@ import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.readVe
  * metadata; standard fields use OrdToDocDISI metadata.
  */
 public class UnifiedFlatVectorsReader extends FlatVectorsReader {
-    private static final Logger log = LogManager.getLogger(UnifiedFlatVectorsReader.class);
 
     static final String META_CODEC_NAME = "Lucene99FlatVectorsFormatMeta";
     static final String VECTOR_DATA_CODEC_NAME = "Lucene99FlatVectorsFormatData";
@@ -102,7 +99,6 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
                 throw new CorruptIndexException("Invalid field number: " + fieldNumber, meta);
             }
             boolean isReordered = "true".equals(info.getAttribute("knn_reordered"));
-            log.info("[UnifiedReader] readFields field={} num={} reordered={} attrs={}", info.name, info.number, isReordered, info.attributes());
             FieldEntry entry = isReordered
                 ? FieldEntry.createReordered(meta, info)
                 : FieldEntry.createStandard(meta, info);
@@ -113,8 +109,6 @@ public class UnifiedFlatVectorsReader extends FlatVectorsReader {
     @Override
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
         FieldEntry entry = getFieldEntry(field, VectorEncoding.FLOAT32);
-        log.info("[UnifiedReader] getFloatVectorValues field={} reordered={} isDense={} ordToDocMap={}", 
-            field, entry.reordered, entry.isDense, entry.ordToDocMap != null ? entry.ordToDocMap.length : "null");
         if (entry.reordered) {
             if (entry.isDense) {
                 return ReorderedOffHeapFloatVectorValues111.load(
