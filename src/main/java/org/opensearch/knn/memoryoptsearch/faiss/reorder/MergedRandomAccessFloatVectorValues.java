@@ -46,7 +46,7 @@ public class MergedRandomAccessFloatVectorValues extends FloatVectorValues {
     public MergedRandomAccessFloatVectorValues copy() throws IOException {
         FloatVectorValues[] copies = new FloatVectorValues[segmentValues.length];
         for (int i = 0; i < segmentValues.length; i++) {
-            copies[i] = segmentValues[i].copy();
+            copies[i] = segmentValues[i] != null ? segmentValues[i].copy() : null;
         }
         return new MergedRandomAccessFloatVectorValues(copies, segmentStarts, liveLocalOrds);
     }
@@ -83,6 +83,10 @@ public class MergedRandomAccessFloatVectorValues extends FloatVectorValues {
         // The segment is (insertion point - 1).
         if (idx < 0) {
             idx = -idx - 2;
+        }
+        // Skip past null segments (segments with no vectors have segmentStarts[i] == segmentStarts[i+1])
+        while (segmentValues[idx] == null) {
+            idx++;
         }
         return idx;
     }

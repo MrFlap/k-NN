@@ -426,37 +426,92 @@ sentinel: -1
 
 ## Remaining Open Questions
 
-1. **RESOLVED: Accessing delegate IndexOutput streams.** Replace `Lucene99FlatVectorsWriter`
-   with our own `ReorderAwareFlatVectorsWriter` that extends `FlatVectorsWriter` and exposes
-   `getMetaOutput()` / `getVectorDataOutput()`. This avoids reflection and gives full control.
+All resolved. See implementation summary below.
 
-   `Lucene99FlatVectorsWriter` is `public final` with `private final` fields — can't subclass
-   or access without reflection. Instead, we replicate its logic (~200 lines of straightforward
-   write code) in our own class with accessible fields. This follows the existing k-NN pattern
-   of maintaining custom copies of Lucene codec writers (e.g., `Lucene99ScalarQuantizedVectorsWriter`
-   is already a full copy in `src/main/java/org/apache/lucene/backward_codecs/`).
+---
 
-   **Changes:**
-   - New class: `ReorderAwareFlatVectorsWriter extends FlatVectorsWriter`
-     - Same `.vec`/`.vemf` file creation, codec headers, `mergeOneField()`, `flush()`,
-       `finish()`, `close()` as `Lucene99FlatVectorsWriter`
-     - Exposes `getMetaOutput()` and `getVectorDataOutput()` for reorder to write directly
-   - `NativeEngines990KnnVectorsFormat.fieldsWriter()`: use `new ReorderAwareFlatVectorsWriter(state, scorer)`
-     instead of `flatVectorsFormat.fieldsWriter(state)`
-   - `NativeEngines990KnnVectorsWriter.mergeOneField()`: for reordered fields, call
-     `((ReorderAwareFlatVectorsWriter) flatVectorsWriter).getVectorDataOutput()` to write
-     vectors in permuted order directly into the shared `.vec` stream
+## Implementation Summary (2026-03-23)
 
-2. **RESOLVED: Non-float vector types.** Not a concern — reorder only applies to FLOAT32.
+### What Was Built
 
-3. **RESOLVED: Interaction with quantization.** Not a concern — quantization training is
-   order-independent. Only the final index layout matters.
+Replacement-free reordering: during merge, vectors are written to `.vec` in reordered
+(permuted) order from the start. No double-write, no temp files, no atomic renames for
+the `.vec`/`.vemf` files. The FAISS index is built with vectors already in reordered order,
+so no HNSW neighbor list remapping is needed.
 
-4. **TODO: Building .faiss in permuted order.** Pass a reordered `Supplier<KNNVectorValues<?>>`
-   to `NativeIndexWriter.mergeIndex()` where vectors come out in permuted order. The FAISS
-   `ordToDocs` ID map needs to map `newOrd → mergedDocId[permutation[newOrd]]`. Need to verify
-   the `NativeIndexWriter` / JNI path can accept this without changes to the HNSW build or
-   ID map construction.
+### Architecture
 
-5. **RESOLVED: Empty delegate files.** Not a concern — all fields write into the same
-   `.vec`/`.vemf` files via `ReorderAwareFlatVectorsWriter`. No empty files.
+**Writer side (single-pass):**
+- `ReorderAwareFlatVectorsWriter` replaces `Lucene99FlatVectorsWriter` when `replacement_free`
+  is enabled. Uses standard codec headers. Exposes `getMetaOutput()` / `getVectorDataOutput()`.
+- `mergeOneFieldReplacementFree()` in `NativeEngines990KnnVectorsWriter`:
+  1. Builds `MergeOrdMapping` from `MergeState.docMaps` + per-segment `ordToDoc()` (no vector I/O)
+  2. Builds `MergedRandomAccessFloatVectorValues` over source segment mmap readers
+  3. Computes BP permutation via `VectorReorderStrategy.computePermutation()` (mmap reads)
+  4. Writes `.vec` in permuted order directly into delegate's `IndexOutput`
+  5. Writes reordered `.vemf` metadata + skip list via `ReorderedFieldMetaWriter`
+  6. Sets `fieldInfo.putAttribute("knn_reordered", "true")` for reader dispatch
+  7. Builds `.faiss` with `ReorderedKNNFloatVectorValues` (permuted doc IDs + vectors)
+
+**Reader side (unified):**
+- `UnifiedFlatVectorsReader` reads standard codec headers, dispatches per-field based on
+  `fieldInfo.getAttribute("knn_reordered")`:
+  - `"true"` → parses reordered metadata (skip list) → returns `ReorderedOffHeapFloatVectorValues111`
+  - otherwise → parses standard metadata (OrdToDocDISI) → returns `OffHeapFloatVectorValues`
+- `NativeEngines990KnnVectorsFormat.fieldsReader()` tries `UnifiedFlatVectorsReader` first,
+  falls back to `ReorderedLucene99FlatVectorsReader111` (legacy reordered codec headers),
+  then standard `Lucene99FlatVectorsReader`.
+
+**Setting:**
+- `index.knn.advanced.reorder_implementation` = `replacement` (default) | `replacement_free`
+- Orthogonal to `index.knn.advanced.reorder_strategy` (bp, kmeans, none)
+
+### Bug Fix: ordToDoc for Re-Merged Reordered Segments
+
+When a reordered segment is used as a source in a subsequent merge (tiered merges),
+`MergeOrdMappingBuilder` calls `segValues.ordToDoc(localOrd)` to map vector positions back
+to doc IDs. In a reordered segment, vectors are stored in permuted order, so `ordToDoc(ord)`
+must return the doc ID for the vector at position `ord` — not just `ord` (identity).
+
+**Fix:** `ReorderedOffHeapFloatVectorValues111.DenseOffHeapVectorValues.ordToDoc()` lazily
+builds an `int[] ordToDocMap` by inverting the skip list's doc→ord mapping. The map is shared
+across `copy()` instances via a `int[1][]` holder to avoid redundant construction. The map is
+only built when `ordToDoc()` is first called (during merge), not during search.
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `KNN990Codec/ReorderAwareFlatVectorsWriter.java` | FlatVectorsWriter with exposed IndexOutput |
+| `KNN990Codec/UnifiedFlatVectorsReader.java` | Reads standard headers, dispatches per-field |
+| `reorder/MergedRandomAccessFloatVectorValues.java` | Random-access composite over source segments |
+| `reorder/MergeOrdMappingBuilder.java` | Builds mergedOrd→docId from MergeState metadata |
+| `reorder/ReorderedFieldMetaWriter.java` | Writes reordered .vemf metadata + skip list |
+| `vectorvalues/ReorderedKNNFloatVectorValues.java` | KNNVectorValues wrapper for permuted iteration |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `KNNSettings.java` | Added `reorder_implementation` setting |
+| `BasePerFieldKnnVectorsFormat.java` | Reads new setting, passes to format |
+| `NativeEngines990KnnVectorsFormat.java` | Creates `ReorderAwareFlatVectorsWriter` when replacement-free; updated `fieldsReader()` with unified reader |
+| `NativeEngines990KnnVectorsWriter.java` | Added `mergeOneFieldReplacementFree()`, branch in `mergeOneField()` |
+| `ReorderedOffHeapFloatVectorValues111.java` | Fixed `ordToDoc()` with lazy inverted skip list |
+
+### Validation
+
+**Non-compressed (l2, 15k vectors, single merge):** Identical doc IDs and scores between
+no-reorder and replacement-free. ✅
+
+**Non-compressed (l2, 50k vectors, tiered merges):** Identical top results between
+no-reorder and replacement-free after `ordToDoc` fix. ✅
+
+**32x compression (l2/innerproduct):** Results differ between no-reorder and replacement-free,
+but this is pre-existing behavior — replacement-based reorder also produces different results
+from no-reorder with 32x. The binary quantization + different HNSW graph insertion order =
+different approximate search candidates. Recall@10 on 10M benchmark matches replacement-based
+baseline (~0.8). ✅
+
+**Mixed segment sizes (8k + 15k):** Below-threshold segment (8k) not reordered, above-threshold
+merged segment reordered. Results identical between replacement-free and replacement-based. ✅
