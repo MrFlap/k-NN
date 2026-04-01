@@ -262,10 +262,27 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
         long buildRA_ms = sw.stop().totalTime().millis();
         sw = new StopWatch().start();
 
-        // Compute permutation from source mmap
-        final int[] permutation = reorderStrategy.computePermutation(
-            mergedRA, SegmentReorderService.DEFAULT_REORDER_THREADS, fieldInfo.getVectorSimilarityFunction()
-        );
+        // Compute permutation — use quantized vectors if strategy supports it and source .faiss files
+        // have byte vectors (binary quantization). This reduces the working set from ~6GB to ~192MB
+        // for 2M x 768-dim 32x BQ, making permutation computation fit in page cache.
+        final int[] permutation;
+        if (reorderStrategy instanceof org.opensearch.knn.memoryoptsearch.faiss.reorder.bpreorder.QuantizedBipartiteReorderStrategy quantizedStrategy) {
+            final org.apache.lucene.index.ByteVectorValues quantizedVectors = buildMergedQuantizedByteVectors(mergeState, fieldInfo, mapping);
+            if (quantizedVectors != null) {
+                permutation = quantizedStrategy.computePermutationFromQuantized(
+                    quantizedVectors, SegmentReorderService.DEFAULT_REORDER_THREADS
+                );
+            } else {
+                // No quantized vectors available (uncompressed index) — fall back to float BP
+                permutation = reorderStrategy.computePermutation(
+                    mergedRA, SegmentReorderService.DEFAULT_REORDER_THREADS, fieldInfo.getVectorSimilarityFunction()
+                );
+            }
+        } else {
+            permutation = reorderStrategy.computePermutation(
+                mergedRA, SegmentReorderService.DEFAULT_REORDER_THREADS, fieldInfo.getVectorSimilarityFunction()
+            );
+        }
 
         long permutation_ms = sw.stop().totalTime().millis();
         sw = new StopWatch().start();
@@ -329,6 +346,36 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
             }
         }
         return new MergedRandomAccessFloatVectorValues(segmentValues, mapping.segmentStarts(), mapping.liveLocalOrds());
+    }
+
+    /**
+     * Build a merged random-access ByteVectorValues over source segments' quantized vectors
+     * from their .faiss flat storage. Returns null if any source segment doesn't have byte
+     * vectors (e.g., uncompressed index without binary quantization).
+     */
+    private org.apache.lucene.index.ByteVectorValues buildMergedQuantizedByteVectors(
+        MergeState mergeState, FieldInfo fieldInfo, MergeOrdMappingBuilder.MergeOrdMapping mapping
+    ) throws IOException {
+        final int numSegments = mergeState.knnVectorsReaders.length;
+        final org.apache.lucene.index.ByteVectorValues[] segmentValues = new org.apache.lucene.index.ByteVectorValues[numSegments];
+        for (int seg = 0; seg < numSegments; seg++) {
+            if (mergeState.knnVectorsReaders[seg] != null) {
+                try {
+                    segmentValues[seg] = mergeState.knnVectorsReaders[seg].getByteVectorValues(fieldInfo.name);
+                } catch (UnsupportedOperationException | IllegalStateException e) {
+                    // This segment doesn't have byte vectors — fall back to float path
+                    log.debug("[QuantizedBP] Segment {} has no byte vectors for field {}, falling back to float BP",
+                        seg, fieldInfo.name);
+                    return null;
+                }
+                if (segmentValues[seg] == null) {
+                    return null;
+                }
+            }
+        }
+        return new org.opensearch.knn.memoryoptsearch.faiss.reorder.MergedRandomAccessByteVectorValues(
+            segmentValues, mapping.segmentStarts(), mapping.liveLocalOrds()
+        );
     }
 
     @Override

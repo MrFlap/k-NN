@@ -24,6 +24,7 @@ import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.bpreorder.BipartiteReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.bpreorder.QuantizedBipartiteReorderStrategy;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.KMeansReorderStrategy;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.MergeAwareKMeansReorderStrategy;
 
@@ -177,6 +178,10 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
         final IndexSettings indexSettings = mapperService.get().getIndexSettings();
         final String strategy = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_STRATEGY_SETTING);
         switch (strategy) {
+            case "bp":
+                return new QuantizedBipartiteReorderStrategy();
+            case "bp_full":
+                return new BipartiteReorderStrategy();
             case "kmeans":
                 final int numClusters = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING);
                 return new KMeansReorderStrategy(numClusters, 25);
@@ -186,7 +191,7 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
             case "none":
                 return null;
             default:
-                return new BipartiteReorderStrategy();
+                return new QuantizedBipartiteReorderStrategy();
         }
     }
 

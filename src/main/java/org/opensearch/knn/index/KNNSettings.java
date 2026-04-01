@@ -255,9 +255,9 @@ public class KNNSettings {
         INDEX_KNN_ADVANCED_REORDER_STRATEGY,
         INDEX_KNN_ADVANCED_REORDER_STRATEGY_DEFAULT,
         value -> {
-            if (!value.equals("bp") && !value.equals("kmeans") && !value.equals("kmeans_merge_aware") && !value.equals("none")) {
+            if (!value.equals("bp") && !value.equals("bp_full") && !value.equals("kmeans") && !value.equals("kmeans_merge_aware") && !value.equals("none")) {
                 throw new IllegalArgumentException(
-                    "[" + INDEX_KNN_ADVANCED_REORDER_STRATEGY + "] must be one of [bp, kmeans, kmeans_merge_aware, none] but was [" + value + "]"
+                    "[" + INDEX_KNN_ADVANCED_REORDER_STRATEGY + "] must be one of [bp, bp_full, kmeans, kmeans_merge_aware, none] but was [" + value + "]"
                 );
             }
         },
