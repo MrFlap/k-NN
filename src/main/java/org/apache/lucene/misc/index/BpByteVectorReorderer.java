@@ -59,9 +59,20 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
-            // codeSize = number of bytes per vector (e.g., 96 for 768-dim 32x BQ)
-            this.codeSize = vectors.dimension();
-            // Centroids are float arrays over the byte dimensions for precision during accumulation
+            // Determine actual byte vector length by reading one vector.
+            // We cannot rely on dimension() because for binary indices it returns the original
+            // float dimension (e.g., 768), not the code size (e.g., 96 = 768/8).
+            int detectedCodeSize;
+            try {
+                if (vectors.size() > 0) {
+                    detectedCodeSize = vectors.vectorValue(0).length;
+                } else {
+                    detectedCodeSize = vectors.dimension();
+                }
+            } catch (IOException e) {
+                detectedCodeSize = vectors.dimension();
+            }
+            this.codeSize = detectedCodeSize;
             this.leftCentroid = new float[codeSize];
             this.rightCentroid = new float[codeSize];
             this.scratch = new float[codeSize];
