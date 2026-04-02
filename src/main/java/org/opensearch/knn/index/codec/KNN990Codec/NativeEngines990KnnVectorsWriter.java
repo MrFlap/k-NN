@@ -31,7 +31,7 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter;
 import org.opensearch.knn.index.quantizationservice.QuantizationService;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
-import org.opensearch.knn.index.vectorvalues.ReorderedKNNFloatVectorValues;
+import org.opensearch.knn.index.vectorvalues.VecWritingReorderedKNNFloatVectorValues;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.MergeOrdMappingBuilder;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.MergedRandomAccessFloatVectorValues;
 import org.opensearch.knn.memoryoptsearch.faiss.reorder.ReorderedFieldMetaWriter;
@@ -287,52 +287,63 @@ public class NativeEngines990KnnVectorsWriter extends KnnVectorsWriter {
         long permutation_ms = sw.stop().totalTime().millis();
         sw = new StopWatch().start();
 
-        // Write .vec in permuted order directly into delegate's stream
+        // Fused .vec write + .faiss build: the VecWritingReorderedKNNFloatVectorValues writes
+        // each vector to .vec as it yields it to the FAISS graph builder. Single pass over the
+        // permuted vectors — one set of random reads serves both .vec and .faiss.
         final ReorderAwareFlatVectorsWriter flatWriter = (ReorderAwareFlatVectorsWriter) flatVectorsWriter;
         final IndexOutput vectorData = flatWriter.getVectorDataOutput();
         final long vectorDataOffset = vectorData.alignFilePointer(Float.BYTES);
-        final int dim = mergedRA.dimension();
-        final java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(dim * Float.BYTES).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        for (int newOrd = 0; newOrd < mapping.totalLiveDocs(); newOrd++) {
-            float[] vec = mergedRA.vectorValue(permutation[newOrd]);
-            buffer.asFloatBuffer().put(vec);
-            vectorData.writeBytes(buffer.array(), buffer.array().length);
-        }
-        final long vectorDataLength = vectorData.getFilePointer() - vectorDataOffset;
 
-        // Write reordered .vemf metadata + skip list directly into delegate's stream
-        ReorderedFieldMetaWriter.writeReorderedMeta(
-            flatWriter.getMetaOutput(), fieldInfo, vectorDataOffset, vectorDataLength,
-            mapping.mergedOrdToDocId(), permutation
-        );
-
-        long writeVec_ms = sw.stop().totalTime().millis();
-        sw = new StopWatch().start();
-
-        // Build .faiss with reordered supplier — graph built in permuted order
-        final Supplier<KNNVectorValues<?>> reorderedSupplier = () -> new ReorderedKNNFloatVectorValues(
-            mergedRA, permutation, mapping.mergedOrdToDocId()
-        );
+        // Train quantization (order-independent, uses standard supplier)
         final VectorDataType vectorDataType = extractVectorDataType(fieldInfo);
         final Supplier<KNNVectorValues<?>> standardSupplier = getKNNVectorValuesSupplierForMerge(
             vectorDataType, fieldInfo, mergeState
         );
         final QuantizationState quantizationState = train(fieldInfo, standardSupplier, mapping.totalLiveDocs());
+
         if (quantizationState == null && shouldSkipBuildingVectorDataStructure(mapping.totalLiveDocs())) {
+            // No FAISS graph needed — fall back to separate .vec write loop
+            final int dim = mergedRA.dimension();
+            final java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(dim * Float.BYTES).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            for (int newOrd = 0; newOrd < mapping.totalLiveDocs(); newOrd++) {
+                float[] vec = mergedRA.vectorValue(permutation[newOrd]);
+                buffer.asFloatBuffer().put(vec);
+                vectorData.writeBytes(buffer.array(), buffer.array().length);
+            }
+            final long vectorDataLength = vectorData.getFilePointer() - vectorDataOffset;
+            ReorderedFieldMetaWriter.writeReorderedMeta(
+                flatWriter.getMetaOutput(), fieldInfo, vectorDataOffset, vectorDataLength,
+                mapping.mergedOrdToDocId(), permutation
+            );
+            long writeVec_ms = sw.stop().totalTime().millis();
             log.info("[ReplacementFree] {} vectors field [{}]: buildRA={}ms permutation={}ms writeVec={}ms (skipped FAISS)",
                 mapping.totalLiveDocs(), fieldInfo.getName(), buildRA_ms, permutation_ms, writeVec_ms);
             return;
         }
+
+        // Create the fused supplier: writes .vec AND feeds FAISS in one pass
+        final Supplier<KNNVectorValues<?>> fusedSupplier = () -> new VecWritingReorderedKNNFloatVectorValues(
+            mergedRA, permutation, mapping.mergedOrdToDocId(), vectorData
+        );
         final NativeIndexWriter writer = NativeIndexWriter.getWriter(
             fieldInfo, segmentWriteState, quantizationState, nativeIndexBuildStrategyFactory
         );
-        writer.mergeIndex(reorderedSupplier, mapping.totalLiveDocs());
+        writer.mergeIndex(fusedSupplier, mapping.totalLiveDocs());
 
-        long faiss_ms = sw.stop().totalTime().millis();
-        KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(faiss_ms);
-        log.info("[ReplacementFree] {} vectors field [{}]: buildRA={}ms permutation={}ms writeVec={}ms faiss={}ms total={}ms",
-            mapping.totalLiveDocs(), fieldInfo.getName(), buildRA_ms, permutation_ms, writeVec_ms, faiss_ms,
-            buildRA_ms + permutation_ms + writeVec_ms + faiss_ms);
+        // After FAISS build exhausts the iterator, .vec is fully written
+        final long vectorDataLength = vectorData.getFilePointer() - vectorDataOffset;
+
+        // Write reordered .vemf metadata + skip list
+        ReorderedFieldMetaWriter.writeReorderedMeta(
+            flatWriter.getMetaOutput(), fieldInfo, vectorDataOffset, vectorDataLength,
+            mapping.mergedOrdToDocId(), permutation
+        );
+
+        long fusedBuild_ms = sw.stop().totalTime().millis();
+        KNNGraphValue.MERGE_TOTAL_TIME_IN_MILLIS.incrementBy(fusedBuild_ms);
+        log.info("[ReplacementFree] {} vectors field [{}]: buildRA={}ms permutation={}ms fusedVecFaiss={}ms total={}ms",
+            mapping.totalLiveDocs(), fieldInfo.getName(), buildRA_ms, permutation_ms, fusedBuild_ms,
+            buildRA_ms + permutation_ms + fusedBuild_ms);
     }
 
     private MergedRandomAccessFloatVectorValues buildMergedRandomAccess(
