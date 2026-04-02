@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Derived from Lucene's BpVectorReorderer, adapted for ByteVectorValues
- * to enable BP reordering from quantized (binary) vectors without decoding to float.
+ * to enable BP reordering from binary quantized vectors using Hamming distance.
  */
 package org.apache.lucene.misc.index;
 
@@ -22,19 +22,22 @@ import org.apache.lucene.util.IntroSelector;
 import org.apache.lucene.util.IntsRef;
 
 /**
- * BP reorderer that operates directly on {@link ByteVectorValues} using Hamming distance.
+ * BP reorderer for binary quantized vectors using Hamming distance.
  * <p>
- * For binary quantized vectors (e.g., 32x compression), this avoids decoding to float entirely.
- * Centroids are maintained as float arrays (accumulated byte values), and bias computation uses
- * a Hamming-like distance between byte vectors and float centroids.
+ * Binary quantized vectors pack bits into bytes — each byte contains 8 binary decisions.
+ * A 768-dim vector becomes 96 bytes. The natural distance metric is Hamming distance
+ * (popcount of XOR), not L2 on raw byte values.
  * <p>
- * The working set is 32x smaller than the float-based BP, making it fit in page cache
- * and turning an I/O-bound operation into a compute-bound one.
+ * Centroids are represented as per-bit probabilities: for each of the codeSize*8 bit positions,
+ * the centroid stores the fraction of partition vectors that have bit=1 at that position.
+ * The bias (attraction to left vs right centroid) is computed as the expected Hamming distance
+ * difference: for each bit in the vector, we accumulate (prob_left - prob_right) if bit=1,
+ * or (prob_right - prob_left) if bit=0. This is equivalent to computing
+ * E[hamming(vec, left)] - E[hamming(vec, right)] using the probabilistic centroids.
  */
 public class BpByteVectorReorderer extends AbstractBPReorderer {
 
     private static final int FORK_THRESHOLD = 8192;
-    private static final int MAX_CENTROID_UPDATES = 0;
 
     public BpByteVectorReorderer() {
         setMinPartitionSize(DEFAULT_MIN_PARTITION_SIZE);
@@ -43,15 +46,15 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
     }
 
     /**
-     * Per-thread state holding a copy of the byte vector values and scratch arrays.
-     * Each thread gets its own mmap view via copy().
+     * Per-thread state. Centroids are float arrays of size totalBits = codeSize * 8,
+     * where centroid[bitPos] = fraction of vectors in the partition with bit=1 at that position.
      */
     private static class PerThreadState {
         final ByteVectorValues vectors;
+        final int codeSize;
+        final int totalBits;
         final float[] leftCentroid;
         final float[] rightCentroid;
-        final float[] scratch;
-        final int codeSize;
 
         PerThreadState(ByteVectorValues vectors) {
             try {
@@ -59,23 +62,16 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
-            // Determine actual byte vector length by reading one vector.
-            // We cannot rely on dimension() because for binary indices it returns the original
-            // float dimension (e.g., 768), not the code size (e.g., 96 = 768/8).
             int detectedCodeSize;
             try {
-                if (vectors.size() > 0) {
-                    detectedCodeSize = vectors.vectorValue(0).length;
-                } else {
-                    detectedCodeSize = vectors.dimension();
-                }
+                detectedCodeSize = vectors.size() > 0 ? vectors.vectorValue(0).length : vectors.dimension();
             } catch (IOException e) {
                 detectedCodeSize = vectors.dimension();
             }
             this.codeSize = detectedCodeSize;
-            this.leftCentroid = new float[codeSize];
-            this.rightCentroid = new float[codeSize];
-            this.scratch = new float[codeSize];
+            this.totalBits = codeSize * 8;
+            this.leftCentroid = new float[totalBits];
+            this.rightCentroid = new float[totalBits];
         }
     }
 
@@ -91,14 +87,9 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             }
         }
 
-        @Override
-        public int size() { return newToOld.length; }
-
-        @Override
-        public int oldToNew(int docID) { return oldToNew[docID]; }
-
-        @Override
-        public int newToOld(int docID) { return newToOld[docID]; }
+        @Override public int size() { return newToOld.length; }
+        @Override public int oldToNew(int docID) { return oldToNew[docID]; }
+        @Override public int newToOld(int docID) { return newToOld[docID]; }
     }
 
     private abstract class BaseRecursiveAction extends RecursiveAction {
@@ -118,70 +109,78 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
         }
     }
 
-    // ---- Distance functions for byte vectors ----
+    // ---- Hamming-based centroid and distance ----
 
     /**
-     * Compute squared L2 distance between a byte vector and a float centroid.
-     * Each byte is treated as an unsigned value [0, 255].
+     * Compute a probabilistic centroid over packed binary vectors.
+     * centroid[bitPos] = fraction of vectors in the partition with bit=1 at that position.
+     * centroid has length codeSize * 8.
      */
-    static float squareDistanceByteToCentroid(byte[] vec, float[] centroid) {
-        float sum = 0;
-        for (int i = 0; i < centroid.length; i++) {
-            float diff = (vec[i] & 0xFF) - centroid[i];
-            sum += diff * diff;
-        }
-        return sum;
-    }
-
-    /**
-     * Compute dot product between a byte vector (unsigned) and a float centroid.
-     */
-    static float dotProductByteToCentroid(byte[] vec, float[] centroid) {
-        float sum = 0;
-        for (int i = 0; i < centroid.length; i++) {
-            sum += (vec[i] & 0xFF) * centroid[i];
-        }
-        return sum;
-    }
-
-    /**
-     * Compute centroid (mean) of a set of byte vectors, storing result as float.
-     */
-    static void computeCentroid(IntsRef ids, ByteVectorValues vectors, float[] centroid) throws IOException {
+    static void computeBitCentroid(IntsRef ids, ByteVectorValues vectors, float[] centroid) throws IOException {
         Arrays.fill(centroid, 0);
+        int codeSize = centroid.length / 8;
         for (int i = ids.offset; i < ids.offset + ids.length; i++) {
             byte[] vec = vectors.vectorValue(ids.ints[i]);
-            for (int d = 0; d < centroid.length; d++) {
-                centroid[d] += (vec[d] & 0xFF);
+            for (int byteIdx = 0; byteIdx < codeSize; byteIdx++) {
+                int b = vec[byteIdx] & 0xFF;
+                int basePos = byteIdx * 8;
+                // Unpack each bit
+                for (int bit = 0; bit < 8; bit++) {
+                    if ((b & (1 << bit)) != 0) {
+                        centroid[basePos + bit] += 1.0f;
+                    }
+                }
             }
         }
         float scale = 1.0f / ids.length;
-        for (int d = 0; d < centroid.length; d++) {
-            centroid[d] *= scale;
+        for (int j = 0; j < centroid.length; j++) {
+            centroid[j] *= scale;
         }
     }
 
-    static void vectorSubtract(float[] u, float[] v, float[] result) {
-        for (int i = 0; i < u.length; i++) {
-            result[i] = u[i] - v[i];
+    /**
+     * Compute bias: expected Hamming distance to left centroid minus expected Hamming distance
+     * to right centroid. Negative = closer to left, positive = closer to right.
+     *
+     * For each bit position:
+     *   if vec bit = 1: contribution = (1 - leftProb) - (1 - rightProb) = rightProb - leftProb
+     *   if vec bit = 0: contribution = leftProb - rightProb
+     *
+     * This simplifies to: for each bit, bias += (vec_bit == 1) ? (right - left) : (left - right)
+     * Which is: bias += (2 * vec_bit - 1) * (rightProb - leftProb)
+     */
+    static float computeHammingBias(byte[] vec, float[] leftCentroid, float[] rightCentroid) {
+        float bias = 0;
+        int codeSize = leftCentroid.length / 8;
+        for (int byteIdx = 0; byteIdx < codeSize; byteIdx++) {
+            int b = vec[byteIdx] & 0xFF;
+            int basePos = byteIdx * 8;
+            for (int bit = 0; bit < 8; bit++) {
+                float diff = rightCentroid[basePos + bit] - leftCentroid[basePos + bit];
+                if ((b & (1 << bit)) != 0) {
+                    bias += diff;  // bit=1: closer to right if rightProb > leftProb
+                } else {
+                    bias -= diff;  // bit=0: closer to left if leftProb < rightProb
+                }
+            }
         }
+        return bias;
     }
 
-    static float dotProduct(float[] u, float[] v) {
+    /**
+     * Compute a scale factor for convergence check, analogous to the float BP's
+     * centroid distance. We use the L2 norm of the centroid difference vector.
+     */
+    static float centroidDiffScale(float[] leftCentroid, float[] rightCentroid) {
         float sum = 0;
-        for (int i = 0; i < u.length; i++) {
-            sum += u[i] * v[i];
+        for (int i = 0; i < leftCentroid.length; i++) {
+            float d = leftCentroid[i] - rightCentroid[i];
+            sum += d * d;
         }
-        return sum;
+        return (float) Math.sqrt(sum);
     }
 
-    static void vectorScalarMul(float x, float[] v) {
-        for (int i = 0; i < v.length; i++) {
-            v[i] *= x;
-        }
-    }
-
-    // ---- ReorderTask: recursive bisection on byte vectors ----
+    // ---- ReorderTask ----
 
     private class ReorderTask extends BaseRecursiveAction {
         private final IntsRef ids;
@@ -209,14 +208,12 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             IntsRef right = new IntsRef(ids.ints, ids.offset + halfLength, ids.length - halfLength);
 
             PerThreadState state = threadLocal.get();
-            ByteVectorValues vectors = state.vectors;
             float[] leftCentroid = state.leftCentroid;
             float[] rightCentroid = state.rightCentroid;
-            float[] scratch = state.scratch;
 
             try {
-                BpByteVectorReorderer.computeCentroid(left, vectors, leftCentroid);
-                BpByteVectorReorderer.computeCentroid(right, vectors, rightCentroid);
+                computeBitCentroid(left, state.vectors, leftCentroid);
+                computeBitCentroid(right, state.vectors, rightCentroid);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -224,18 +221,17 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             for (int iter = 0; iter < maxIters; ++iter) {
                 int moved;
                 try {
-                    moved = shuffle(vectors, ids, right.offset, leftCentroid, rightCentroid, scratch, biases);
+                    moved = shuffle(ids, right.offset, leftCentroid, rightCentroid, biases);
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
                 if (moved == 0) break;
-                if (moved > MAX_CENTROID_UPDATES) {
-                    try {
-                        BpByteVectorReorderer.computeCentroid(left, vectors, leftCentroid);
-                        BpByteVectorReorderer.computeCentroid(right, vectors, rightCentroid);
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
+                // Always recompute centroids (incremental updates disabled for binary)
+                try {
+                    computeBitCentroid(left, state.vectors, leftCentroid);
+                    computeBitCentroid(right, state.vectors, rightCentroid);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
                 }
             }
 
@@ -250,14 +246,13 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
             }
         }
 
-        private int shuffle(ByteVectorValues vectors, IntsRef ids, int midPoint,
-                            float[] leftCentroid, float[] rightCentroid, float[] scratch,
+        private int shuffle(IntsRef ids, int midPoint,
+                            float[] leftCentroid, float[] rightCentroid,
                             float[] biases) throws IOException {
             new ComputeBiasTask(ids.ints, biases, ids.offset, ids.offset + ids.length,
                 leftCentroid, rightCentroid, threadLocal, executor, depth).compute();
 
-            vectorSubtract(leftCentroid, rightCentroid, scratch);
-            float scale = (float) Math.sqrt(dotProduct(scratch, scratch));
+            float scale = centroidDiffScale(leftCentroid, rightCentroid);
             float maxLeftBias = Float.NEGATIVE_INFINITY;
             for (int i = ids.offset; i < midPoint; ++i) {
                 maxLeftBias = Math.max(maxLeftBias, biases[i]);
@@ -291,15 +286,12 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
                     biases[i] = biases[j];
                     biases[j] = tmpBias;
 
-                    if (i < midPoint == j < midPoint) {
-                        int tmpDoc = ids.ints[i];
-                        ids.ints[i] = ids.ints[j];
-                        ids.ints[j] = tmpDoc;
-                    } else {
+                    int tmpDoc = ids.ints[i];
+                    ids.ints[i] = ids.ints[j];
+                    ids.ints[j] = tmpDoc;
+
+                    if (!(i < midPoint == j < midPoint)) {
                         count++;
-                        int tmpDoc = ids.ints[i];
-                        ids.ints[i] = ids.ints[j];
-                        ids.ints[j] = tmpDoc;
                     }
                 }
             }
@@ -310,7 +302,7 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
         }
     }
 
-    // ---- ComputeBiasTask: parallel bias computation on byte vectors ----
+    // ---- ComputeBiasTask ----
 
     private class ComputeBiasTask extends BaseRecursiveAction {
         private final int[] ids;
@@ -350,10 +342,7 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
                 try {
                     for (int i = start; i < end; ++i) {
                         byte[] vec = vectors.vectorValue(ids[i]);
-                        // Bias = distance_to_left - distance_to_right
-                        // Negative bias → vector is closer to left centroid
-                        biases[i] = squareDistanceByteToCentroid(vec, leftCentroid)
-                                  - squareDistanceByteToCentroid(vec, rightCentroid);
+                        biases[i] = computeHammingBias(vec, leftCentroid, rightCentroid);
                     }
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
@@ -365,10 +354,9 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
     // ---- Public API ----
 
     /**
-     * Compute a permutation from byte vector values using Hamming/L2 distance.
-     * This is the main entry point for quantized-vector BP reordering.
+     * Compute a permutation from binary quantized byte vectors using Hamming distance.
      *
-     * @param vectors  ByteVectorValues — typically mmap-backed quantized vectors from .faiss
+     * @param vectors  ByteVectorValues — packed binary vectors from .faiss
      * @param executor task executor for parallelism, or null for single-threaded
      * @return DocMap mapping old ords to new ords
      */
@@ -401,6 +389,7 @@ public class BpByteVectorReorderer extends AbstractBPReorderer {
     }
 
     private static long docRAMRequirements(int maxDoc) {
+        // sortedIds (int[]) + biases (float[]) + centroid overhead
         return 2L * Integer.BYTES * maxDoc;
     }
 
