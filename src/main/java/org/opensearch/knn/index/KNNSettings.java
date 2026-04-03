@@ -120,6 +120,9 @@ public class KNNSettings {
     public static final String INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH =
         "index.knn.faiss.efficient_filter.disable_exact_search";
 
+    public static final String KNN_BP_VECTOR_REORDER_ENABLED = "index.knn.bp_vector_reorder.enabled";
+    public static final boolean KNN_BP_VECTOR_REORDER_ENABLED_DEFAULT = false;
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -499,6 +502,17 @@ public class KNNSettings {
     );
 
     /**
+     * Setting to enable BP vector reorder merge policy. When enabled, merged segments will have their
+     * documents reordered by vector similarity using bipartite graph partitioning, improving disk cache
+     * locality for vector search workloads. Note: this reorders ALL fields in the segment, not just vectors.
+     */
+    public static final Setting<Boolean> KNN_BP_VECTOR_REORDER_ENABLED_SETTING = Setting.boolSetting(
+        KNN_BP_VECTOR_REORDER_ENABLED,
+        KNN_BP_VECTOR_REORDER_ENABLED_DEFAULT,
+        IndexScope
+    );
+
+    /**
      * Keystore settings for build service HTTP authorization
      */
     public static final Setting<SecureString> KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING = SecureSetting.secureString(
@@ -770,7 +784,8 @@ public class KNNSettings {
             KNN_REMOTE_BUILD_CLIENT_TIMEOUT_SETTING,
             KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING,
             KNN_REMOTE_BUILD_SERVER_PASSWORD_SETTING,
-            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING
+            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
+            KNN_BP_VECTOR_REORDER_ENABLED_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());

@@ -41,6 +41,7 @@ import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNNCodecService;
 import org.opensearch.knn.index.codec.derivedsource.DerivedSourceIndexOperationListener;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
+import org.opensearch.knn.index.engine.merge.KNNEngineFactory;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryLoadStrategy;
@@ -362,6 +363,10 @@ public class KNNPlugin extends Plugin
 
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
+        if (indexSettings.getValue(KNNSettings.IS_KNN_INDEX_SETTING)
+            && indexSettings.getValue(KNNSettings.KNN_BP_VECTOR_REORDER_ENABLED_SETTING)) {
+            return Optional.of(new KNNEngineFactory());
+        }
         return Optional.empty();
     }
 
