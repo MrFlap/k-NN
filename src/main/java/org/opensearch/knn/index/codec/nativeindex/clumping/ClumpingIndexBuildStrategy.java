@@ -161,17 +161,31 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
                 tempHiddenFileName, indexInfo.getSegmentWriteState().context
             )
         ) {
-            ClumpFileWriter.writeClumpFile(
-                indexInfo.getSegmentWriteState(),
-                fieldName,
-                dimension,
-                vectorDataType,
-                markerDocIds,
-                markerVectors,
-                assignInput,
-                tempHiddenInput,
-                totalHidden
-            );
+            // Use Huffman-compressed writer for FP16 vectors, standard writer otherwise
+            if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16) {
+                ClumpFileWriter.writeClumpFileHuffman(
+                    indexInfo.getSegmentWriteState(),
+                    fieldName,
+                    dimension,
+                    markerDocIds,
+                    markerVectors,
+                    assignInput,
+                    tempHiddenInput,
+                    totalHidden
+                );
+            } else {
+                ClumpFileWriter.writeClumpFile(
+                    indexInfo.getSegmentWriteState(),
+                    fieldName,
+                    dimension,
+                    vectorDataType,
+                    markerDocIds,
+                    markerVectors,
+                    assignInput,
+                    tempHiddenInput,
+                    totalHidden
+                );
+            }
         } finally {
             deleteTempFile(indexInfo, assignFileName);
             deleteTempFile(indexInfo, tempHiddenFileName);
@@ -357,12 +371,10 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         int batchSize = batchDocIds.size();
         int[] nearestMarkers = new int[batchSize];
 
-        // Parallel search: each hidden vector finds its nearest marker concurrently
+        // Parallel search: each hidden vector finds its exact nearest marker via brute-force
         IntStream.range(0, batchSize).parallel().forEach(i -> {
-            nearestMarkers[i] = findNearestMarkerDocIdViaIndex(
-                batchVectors.get(i), indexPointer, knnEngine,
-                markerDocIdToIndex, markerVectorArray, markerDocIds, vectorDataType
-            );
+            int bestIdx = findNearestMarkerBruteForce(batchVectors.get(i), markerVectorArray);
+            nearestMarkers[i] = markerDocIds.get(bestIdx);
         });
 
         // Sequential write: assign map updates and spill file writes

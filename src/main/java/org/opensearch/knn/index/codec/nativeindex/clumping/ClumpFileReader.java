@@ -38,6 +38,23 @@ public final class ClumpFileReader {
 
     private ClumpFileReader() {}
 
+    /** Cached flag for native Huffman decoder availability. */
+    private static final boolean NATIVE_HUFFMAN_AVAILABLE = detectNativeHuffman();
+
+    private static boolean detectNativeHuffman() {
+        try {
+            // Trigger class loading which loads the SIMD native library
+            Class.forName("org.opensearch.knn.jni.HuffmanDecoderService");
+            return true;
+        } catch (Throwable t) {
+            log.info("Native Huffman decoder not available, using Java fallback: {}", t.getMessage());
+            return false;
+        }
+    }
+
+    static boolean isNativeHuffmanAvailable() {
+        return NATIVE_HUFFMAN_AVAILABLE;
+    }
     /**
      * Cached marker table data for a segment+field pair. Segments are immutable once
      * committed, so cached entries never go stale. Eviction happens via
@@ -52,10 +69,23 @@ public final class ClumpFileReader {
         final int[] numHidden;
         final long[] clumpDataOffsets;
         final String clumpFileName;
+        /** Non-null for v4 Huffman-compressed clump files. */
+        final HuffmanCodec huffmanCodec;
+        /** True if this is a v4 Huffman-compressed clump file. */
+        final boolean isHuffmanCompressed;
 
         CachedMarkerTable(
             int numMarkers, int dimension, byte vectorDataType, int vectorSize,
             int[] markerDocIds, int[] numHidden, long[] clumpDataOffsets, String clumpFileName
+        ) {
+            this(numMarkers, dimension, vectorDataType, vectorSize,
+                markerDocIds, numHidden, clumpDataOffsets, clumpFileName, null);
+        }
+
+        CachedMarkerTable(
+            int numMarkers, int dimension, byte vectorDataType, int vectorSize,
+            int[] markerDocIds, int[] numHidden, long[] clumpDataOffsets, String clumpFileName,
+            HuffmanCodec huffmanCodec
         ) {
             this.numMarkers = numMarkers;
             this.dimension = dimension;
@@ -65,6 +95,8 @@ public final class ClumpFileReader {
             this.numHidden = numHidden;
             this.clumpDataOffsets = clumpDataOffsets;
             this.clumpFileName = clumpFileName;
+            this.huffmanCodec = huffmanCodec;
+            this.isHuffmanCompressed = huffmanCodec != null;
         }
     }
 
@@ -109,28 +141,71 @@ public final class ClumpFileReader {
         }
 
         try (IndexInput input = directory.openInput(clumpFileName, IOContext.DEFAULT)) {
-            int numMarkers = input.readInt();
-            if (numMarkers == 0) {
-                return null;
+            // Peek at first byte to detect format version.
+            // v3 files start with numMarkers (int32), which is always > 0 and < 2^24 in practice,
+            // so the first byte is 0x00..0x0F. v4 files start with FORMAT_VERSION_V4_HUFFMAN = 4.
+            // We distinguish by checking if the first byte equals the v4 version marker AND
+            // the file is large enough to be v4.
+            long fileLength = input.length();
+            byte firstByte = input.readByte();
+
+            if (firstByte == ClumpFileFormat.FORMAT_VERSION_V4_HUFFMAN && fileLength > ClumpFileFormat.HEADER_V4_FIXED_BYTES) {
+                // v4 Huffman-compressed format
+                int numMarkers = input.readInt();
+                if (numMarkers == 0) {
+                    return null;
+                }
+                int dimension = input.readInt();
+                byte vectorDataType = input.readByte();
+                int huffmanTreeSize = input.readInt();
+                int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
+                log.trace("Loading v4 Huffman clump: huffmanTreeSize={}", huffmanTreeSize);
+
+                // Deserialize Huffman tree
+                HuffmanCodec huffmanCodec = HuffmanCodec.deserialize(input);
+
+                int[] markerDocIds = new int[numMarkers];
+                int[] numHidden = new int[numMarkers];
+                long[] clumpDataOffsets = new long[numMarkers];
+
+                for (int i = 0; i < numMarkers; i++) {
+                    markerDocIds[i] = input.readInt();
+                    numHidden[i] = input.readInt();
+                    clumpDataOffsets[i] = input.readLong();
+                }
+
+                cached = new CachedMarkerTable(
+                    numMarkers, dimension, vectorDataType, vectorSize,
+                    markerDocIds, numHidden, clumpDataOffsets, clumpFileName, huffmanCodec
+                );
+            } else {
+                // v3 uncompressed format — first byte was part of numMarkers int32
+                // Re-read from start
+                input.seek(0);
+                int numMarkers = input.readInt();
+                if (numMarkers == 0) {
+                    return null;
+                }
+                int dimension = input.readInt();
+                byte vectorDataType = input.readByte();
+                int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
+
+                int[] markerDocIds = new int[numMarkers];
+                int[] numHidden = new int[numMarkers];
+                long[] clumpDataOffsets = new long[numMarkers];
+
+                for (int i = 0; i < numMarkers; i++) {
+                    markerDocIds[i] = input.readInt();
+                    numHidden[i] = input.readInt();
+                    clumpDataOffsets[i] = input.readLong();
+                }
+
+                cached = new CachedMarkerTable(
+                    numMarkers, dimension, vectorDataType, vectorSize,
+                    markerDocIds, numHidden, clumpDataOffsets, clumpFileName
+                );
             }
-            int dimension = input.readInt();
-            byte vectorDataType = input.readByte();
-            int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
 
-            int[] markerDocIds = new int[numMarkers];
-            int[] numHidden = new int[numMarkers];
-            long[] clumpDataOffsets = new long[numMarkers];
-
-            for (int i = 0; i < numMarkers; i++) {
-                markerDocIds[i] = input.readInt();
-                numHidden[i] = input.readInt();
-                clumpDataOffsets[i] = input.readLong();
-            }
-
-            cached = new CachedMarkerTable(
-                numMarkers, dimension, vectorDataType, vectorSize,
-                markerDocIds, numHidden, clumpDataOffsets, clumpFileName
-            );
             MARKER_TABLE_CACHE.putIfAbsent(key, cached);
             return cached;
         }
@@ -217,6 +292,11 @@ public final class ClumpFileReader {
         // vectorBlockStart = docIdBlockStart + numHidden * 4
         boolean isFloat = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT);
         boolean isFp16 = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16);
+
+        // For Huffman-compressed v4 files, use the decompression path (no SIMD)
+        if (table.isHuffmanCompressed) {
+            return getHiddenVectorsScoredHuffman(directory, table, matchedIndices, floatQueryVector, similarityFunction);
+        }
 
         // For FP16, try to get mmap addresses for SIMD bulk scoring
         SimdVectorComputeService.SimilarityFunctionType simdFunctionType = null;
@@ -379,6 +459,152 @@ public final class ClumpFileReader {
                             float score = similarityFunction.compare(byteQueryVector, reusableVector);
                             scoredHidden.add(new ScoreDoc(docIds[j], score));
                         }
+                    }
+                }
+            }
+
+            return scoredHidden;
+        }
+    }
+
+    /**
+     * Huffman-compressed scoring path for v4 clump files.
+     * <p>
+     * v4 layout per marker:
+     * <pre>
+     *   [raw marker vector: vectorSize bytes]
+     *   [doc ID block: numHidden * 4 bytes]
+     *   [compressed vector block: variable length]
+     * </pre>
+     * Compressed block boundaries are determined by adjacent marker offsets:
+     * start = offset[i] + vectorSize + docIdBlockSize
+     * end = offset[i+1] (or end of clump data for the last marker)
+     */
+    private static List<ScoreDoc> getHiddenVectorsScoredHuffman(
+        Directory directory,
+        CachedMarkerTable table,
+        int[] matchedIndices,
+        float[] floatQueryVector,
+        KNNVectorSimilarityFunction similarityFunction
+    ) throws IOException {
+        HuffmanCodec huffman = table.huffmanCodec;
+        int dimension = table.dimension;
+        int vectorSize = table.vectorSize;
+
+        try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
+            // Phase 1: READ doc IDs and compressed vector blocks in parallel
+            int[][] markerDocIdArrays = new int[matchedIndices.length][];
+            byte[][] compressedVecBlocks = new byte[matchedIndices.length][];
+
+            try (ExecutorService vte = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> readFutures = new ArrayList<>(matchedIndices.length);
+                for (int mi = 0; mi < matchedIndices.length; mi++) {
+                    final int idx = mi;
+                    final int markerIndex = matchedIndices[mi];
+                    readFutures.add(vte.submit(() -> {
+                        int numHidden = table.numHidden[markerIndex];
+                        long clumpStart = table.clumpDataOffsets[markerIndex];
+                        long docIdStart = clumpStart + vectorSize;
+                        int docIdBlockSize = numHidden * Integer.BYTES;
+
+                        // Determine compressed block end using next marker's offset
+                        long compressedStart = docIdStart + docIdBlockSize;
+                        long compressedEnd;
+                        if (markerIndex + 1 < table.numMarkers) {
+                            compressedEnd = table.clumpDataOffsets[markerIndex + 1];
+                        } else {
+                            // Last marker: read to end of file (before Lucene footer)
+                            compressedEnd = input.length() - 16; // CodecUtil footer is 16 bytes
+                        }
+                        int compressedSize = (int) (compressedEnd - compressedStart);
+
+                        // Read doc IDs + compressed block in one I/O
+                        int totalReadSize = docIdBlockSize + compressedSize;
+                        byte[] combined = new byte[totalReadSize];
+                        try (IndexInput clonedInput = input.clone()) {
+                            clonedInput.seek(docIdStart);
+                            clonedInput.readBytes(combined, 0, totalReadSize);
+                        } catch (IOException e) {
+                            log.warn("Error reading Huffman clump data for marker index {}", markerIndex, e);
+                            return;
+                        }
+
+                        // Parse doc IDs (v4 uses Lucene IndexOutput.writeInt = big-endian)
+                        int[] docIds = new int[numHidden];
+                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
+                            .order(java.nio.ByteOrder.BIG_ENDIAN);
+                        for (int j = 0; j < numHidden; j++) {
+                            docIds[j] = dbuf.getInt();
+                        }
+                        markerDocIdArrays[idx] = docIds;
+
+                        // Extract compressed vector block
+                        byte[] compressed = new byte[compressedSize];
+                        System.arraycopy(combined, docIdBlockSize, compressed, 0, compressedSize);
+                        compressedVecBlocks[idx] = compressed;
+                    }));
+                }
+                for (Future<?> f : readFutures) {
+                    try {
+                        f.get();
+                    } catch (Exception e) {
+                        log.warn("Error waiting for Huffman clump read task", e);
+                    }
+                }
+            }
+
+            // Phase 2: DECOMPRESS + SCORE
+            // Try native JNI decoder (with equivalence-class remapping) first,
+            // fall back to Java DFA decoder if native library is unavailable.
+            List<ScoreDoc> scoredHidden = new ArrayList<>();
+            HuffmanTableDecoder tableDecoder = huffman.getTableDecoder();
+            boolean useNative = isNativeHuffmanAvailable();
+
+            // Pre-fetch native table once if using native path
+            HuffmanTableDecoder.NativeTable nativeTab = useNative ? tableDecoder.getNativeTable() : null;
+
+            for (int m = 0; m < matchedIndices.length; m++) {
+                int[] docIds = markerDocIdArrays[m];
+                byte[] compressed = compressedVecBlocks[m];
+                if (docIds == null || compressed == null || docIds.length == 0) {
+                    continue;
+                }
+
+                int numHidden = docIds.length;
+
+                if (useNative && nativeTab != null) {
+                    // Native path: batch-decode all hidden vectors for this marker in one JNI call,
+                    // fusing Huffman decompression + FP16→float32 conversion in C++.
+                    float[] allFloats = new float[numHidden * dimension];
+                    org.opensearch.knn.jni.HuffmanDecoderService.decodeBatchToFloat(
+                        compressed, 0, numHidden,
+                        nativeTab.flatTable, nativeTab.numEqClasses, dimension,
+                        nativeTab.eqClassMap, allFloats
+                    );
+                    // Score each decoded vector
+                    for (int j = 0; j < numHidden; j++) {
+                        float[] vec = new float[dimension];
+                        System.arraycopy(allFloats, j * dimension, vec, 0, dimension);
+                        float score = similarityFunction.compare(floatQueryVector, vec);
+                        scoredHidden.add(new ScoreDoc(docIds[j], score));
+                    }
+                } else {
+                    // Java fallback: byte-at-a-time DFA decoder
+                    short[] reusableShorts = new short[dimension];
+                    float[] reusableVector = new float[dimension];
+                    int byteOffset = 0;
+                    int decoderState = 0;
+                    for (int j = 0; j < numHidden; j++) {
+                        int[] result = tableDecoder.decodeToShortFromOffset(
+                            compressed, byteOffset, decoderState, dimension, reusableShorts
+                        );
+                        byteOffset = result[0];
+                        decoderState = result[1];
+                        for (int d = 0; d < dimension; d++) {
+                            reusableVector[d] = Float.float16ToFloat(reusableShorts[d]);
+                        }
+                        float score = similarityFunction.compare(floatQueryVector, reusableVector);
+                        scoredHidden.add(new ScoreDoc(docIds[j], score));
                     }
                 }
             }

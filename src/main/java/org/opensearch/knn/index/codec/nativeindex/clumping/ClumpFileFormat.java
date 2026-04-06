@@ -54,13 +54,36 @@ public final class ClumpFileFormat {
     /** FP16 (half-precision float): 2 bytes per dimension. Halves I/O for hidden vectors. */
     public static final byte VECTOR_TYPE_FP16 = 2;
 
-    /** Header size: numMarkers (4) + dimension (4) + vectorDataType (1) = 9 bytes. */
+    /**
+     * Format version stored in the header to distinguish compressed vs uncompressed clump files.
+     * v3 = uncompressed (original), v4 = Huffman-compressed FP16 vectors.
+     */
+    public static final byte FORMAT_VERSION_V3 = 3;
+    public static final byte FORMAT_VERSION_V4_HUFFMAN = 4;
+
+    /**
+     * Header size for v3 (uncompressed): numMarkers (4) + dimension (4) + vectorDataType (1) = 9 bytes.
+     * Header size for v4 (Huffman): version (1) + numMarkers (4) + dimension (4) + vectorDataType (1)
+     *   + huffmanTreeSize (4) + huffmanTree (variable).
+     * Use {@link #headerBytesV4(int)} for v4.
+     */
     public static final int HEADER_BYTES = Integer.BYTES + Integer.BYTES + Byte.BYTES;
+
+    /** Fixed portion of v4 header before the Huffman tree: version(1) + numMarkers(4) + dimension(4) + vectorDataType(1) + huffTreeSize(4) = 14 bytes. */
+    public static final int HEADER_V4_FIXED_BYTES = Byte.BYTES + Integer.BYTES + Integer.BYTES + Byte.BYTES + Integer.BYTES;
 
     /** Each marker table entry: markerDocId (4) + numHidden (4) + clumpDataOffset (8) = 16 bytes. */
     public static final int MARKER_TABLE_ENTRY_BYTES = Integer.BYTES + Integer.BYTES + Long.BYTES;
 
     private ClumpFileFormat() {}
+
+    /**
+     * Total header size for a v4 (Huffman-compressed) clump file.
+     * @param huffmanTreeBytes the serialized size of the Huffman tree
+     */
+    public static int headerBytesV4(int huffmanTreeBytes) {
+        return HEADER_V4_FIXED_BYTES + huffmanTreeBytes;
+    }
 
     /**
      * Byte offset of the marker table (immediately after header).
@@ -101,6 +124,14 @@ public final class ClumpFileFormat {
     public static int vectorBytes(int dimension, byte vectorDataType) {
         return dimension * bytesPerElement(vectorDataType);
     }
+
+    /**
+     * v4 marker table entry: markerDocId (4) + numHidden (4) + clumpDataOffset (8) = 16 bytes.
+     * Same structure as v3, but clumpDataOffset points to the start of the compressed
+     * clump data block. The end of the block is determined by the next marker's offset
+     * (or the end of the clump data section for the last marker).
+     */
+    public static final int MARKER_TABLE_ENTRY_BYTES_V4 = MARKER_TABLE_ENTRY_BYTES;
 
     /**
      * Returns the byte size of one hidden entry (docId + vector) — total bytes per hidden

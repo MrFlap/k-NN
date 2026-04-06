@@ -221,6 +221,207 @@ public final class ClumpFileWriter {
         return offset;
     }
 
+    /**
+     * Writes a v4 Huffman-compressed clump file for FP16 vectors. The Huffman tree is
+     * built from all hidden + marker FP16 symbol frequencies, serialized into the header,
+     * and vector blocks are stored compressed. Doc IDs remain uncompressed.
+     * <p>
+     * The clump data layout per marker in v4:
+     * <pre>
+     *   [marker vector — raw FP16, D * 2 bytes]
+     *   [doc ID block — numHidden * 4 bytes, uncompressed]
+     *   [compressed vector block — variable length]
+     * </pre>
+     * The reader determines compressed block boundaries via adjacent marker offsets:
+     * start = offset[i] + vectorSize + docIdBlockSize, end = offset[i+1] (or clump data end).
+     */
+    public static void writeClumpFileHuffman(
+        SegmentWriteState state,
+        String fieldName,
+        int dimension,
+        List<Integer> markerDocIds,
+        List<Object> markerVectors,
+        IndexInput assignInput,
+        IndexInput tempInput,
+        int totalHidden
+    ) throws IOException {
+        byte vectorDataType = ClumpFileFormat.VECTOR_TYPE_FP16;
+        int numMarkers = markerDocIds.size();
+        int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
+        int spillEntrySize = Integer.BYTES + vectorSize;
+
+        // Build marker doc ID → marker index lookup
+        Map<Integer, Integer> markerDocIdToIndex = new HashMap<>(numMarkers);
+        for (int i = 0; i < numMarkers; i++) {
+            markerDocIdToIndex.put(markerDocIds.get(i), i);
+        }
+
+        // Pass 1: count numHiddenPerMarker and collect FP16 symbol frequencies
+        int[] numHiddenPerMarker = new int[numMarkers];
+        long[] symbolFrequencies = new long[HuffmanCodec.NUM_SYMBOLS];
+        byte[] vecBuf = new byte[vectorSize];
+
+        for (int h = 0; h < totalHidden; h++) {
+            long entryOffset = (long) h * spillEntrySize;
+            tempInput.seek(entryOffset);
+            int hiddenDocId = tempInput.readInt();
+
+            assignInput.seek((long) hiddenDocId * Integer.BYTES);
+            int markerDocId = assignInput.readInt();
+
+            Integer markerIndex = markerDocIdToIndex.get(markerDocId);
+            if (markerIndex != null) {
+                numHiddenPerMarker[markerIndex]++;
+            }
+
+            // Read vector bytes and tally FP16 symbol frequencies
+            tempInput.seek(entryOffset + Integer.BYTES);
+            tempInput.readBytes(vecBuf, 0, vectorSize);
+            java.nio.ByteBuffer vbb = java.nio.ByteBuffer.wrap(vecBuf).order(java.nio.ByteOrder.BIG_ENDIAN);
+            for (int d = 0; d < dimension; d++) {
+                int sym = Short.toUnsignedInt(vbb.getShort());
+                symbolFrequencies[sym]++;
+            }
+        }
+
+        // Also tally marker vector frequencies
+        for (Object mv : markerVectors) {
+            float[] fv = (float[]) mv;
+            for (float v : fv) {
+                int sym = Short.toUnsignedInt(Float.floatToFloat16(v));
+                symbolFrequencies[sym]++;
+            }
+        }
+
+        // Build Huffman codec
+        HuffmanCodec huffman = HuffmanCodec.buildFromFrequencies(symbolFrequencies);
+
+        // Pass 2: build the clump data with compressed vector blocks.
+        // We need to write marker vectors (raw), doc IDs (raw), and compressed vectors.
+        // Since compressed sizes are variable, we must compute them before writing the marker table.
+
+        // First, compress all marker vectors and hidden vector blocks per marker.
+        byte[][] compressedMarkerVecs = new byte[numMarkers][];
+        for (int i = 0; i < numMarkers; i++) {
+            float[] fv = (float[]) markerVectors.get(i);
+            short[] fp16 = new short[dimension];
+            for (int d = 0; d < dimension; d++) {
+                fp16[d] = Float.floatToFloat16(fv[d]);
+            }
+            compressedMarkerVecs[i] = huffman.encode(fp16);
+        }
+
+        // Collect hidden vectors per marker, compress each marker's vector block
+        // We'll re-scan the spill file, grouping vectors by marker.
+        // To keep heap bounded, we process one marker at a time via sorted spill entries.
+
+        // Build per-marker hidden doc IDs and compressed vector blocks via temp file
+        int[][] hiddenDocIdsPerMarker = new int[numMarkers][];
+        byte[][] compressedVecBlocks = new byte[numMarkers][];
+        int[] docIdCursors = new int[numMarkers];
+
+        // Allocate doc ID arrays
+        for (int i = 0; i < numMarkers; i++) {
+            hiddenDocIdsPerMarker[i] = new int[numHiddenPerMarker[i]];
+        }
+
+        // Collect per-marker FP16 bytes for compression
+        byte[][] rawVecBlocksPerMarker = new byte[numMarkers][];
+        int[] vecCursors = new int[numMarkers];
+        for (int i = 0; i < numMarkers; i++) {
+            rawVecBlocksPerMarker[i] = new byte[numHiddenPerMarker[i] * vectorSize];
+        }
+
+        for (int h = 0; h < totalHidden; h++) {
+            long entryOffset = (long) h * spillEntrySize;
+            tempInput.seek(entryOffset);
+            int hiddenDocId = tempInput.readInt();
+
+            assignInput.seek((long) hiddenDocId * Integer.BYTES);
+            int markerDocId = assignInput.readInt();
+
+            Integer markerIndex = markerDocIdToIndex.get(markerDocId);
+            if (markerIndex == null) {
+                continue;
+            }
+
+            hiddenDocIdsPerMarker[markerIndex][docIdCursors[markerIndex]++] = hiddenDocId;
+
+            tempInput.seek(entryOffset + Integer.BYTES);
+            int destOffset = vecCursors[markerIndex] * vectorSize;
+            tempInput.readBytes(rawVecBlocksPerMarker[markerIndex], destOffset, vectorSize);
+            vecCursors[markerIndex]++;
+        }
+
+        // Compress each marker's vector block
+        for (int i = 0; i < numMarkers; i++) {
+            if (numHiddenPerMarker[i] > 0) {
+                compressedVecBlocks[i] = huffman.encodeFromBytes(rawVecBlocksPerMarker[i]);
+            } else {
+                compressedVecBlocks[i] = new byte[0];
+            }
+            rawVecBlocksPerMarker[i] = null; // free raw data
+        }
+
+        // Compute clump data offsets. v4 layout per marker:
+        //   [raw marker vector: vectorSize bytes]
+        //   [doc ID block: numHidden * 4 bytes]
+        //   [compressed vector block: variable bytes]
+        int huffmanTreeSize = huffman.serializedSizeBytes();
+        long headerSize = ClumpFileFormat.headerBytesV4(huffmanTreeSize);
+        long markerTableSize = (long) numMarkers * ClumpFileFormat.MARKER_TABLE_ENTRY_BYTES;
+        long clumpDataBase = headerSize + markerTableSize;
+
+        long[] clumpDataOffsets = new long[numMarkers];
+        long currentOffset = clumpDataBase;
+        for (int i = 0; i < numMarkers; i++) {
+            clumpDataOffsets[i] = currentOffset;
+            currentOffset += vectorSize  // raw marker vector
+                + (long) numHiddenPerMarker[i] * Integer.BYTES  // doc ID block
+                + compressedVecBlocks[i].length;  // compressed vector block
+        }
+
+        // Write the final clump file
+        String clumpFileName = buildClumpFileName(state.segmentInfo.name, fieldName);
+        try (IndexOutput output = state.directory.createOutput(clumpFileName, state.context)) {
+            // v4 Header
+            output.writeByte(ClumpFileFormat.FORMAT_VERSION_V4_HUFFMAN);
+            output.writeInt(numMarkers);
+            output.writeInt(dimension);
+            output.writeByte(vectorDataType);
+            output.writeInt(huffmanTreeSize);
+            huffman.serialize(output);
+
+            // Marker table
+            for (int i = 0; i < numMarkers; i++) {
+                output.writeInt(markerDocIds.get(i));
+                output.writeInt(numHiddenPerMarker[i]);
+                output.writeLong(clumpDataOffsets[i]);
+            }
+
+            // Clump data
+            for (int i = 0; i < numMarkers; i++) {
+                // Raw marker vector (FP16)
+                writeVector(output, markerVectors.get(i), vectorDataType);
+
+                // Doc ID block (little-endian int32s)
+                for (int j = 0; j < numHiddenPerMarker[i]; j++) {
+                    output.writeInt(hiddenDocIdsPerMarker[i][j]);
+                }
+
+                // Compressed vector block
+                output.writeBytes(compressedVecBlocks[i], compressedVecBlocks[i].length);
+            }
+
+            CodecUtil.writeFooter(output);
+        }
+
+        log.debug(
+            "Wrote v4 Huffman clump file {} with {} markers, {} hidden vectors, dim={}, huffmanTreeSize={}",
+            clumpFileName, numMarkers, totalHidden, dimension, huffmanTreeSize
+        );
+    }
+
     private static void writeVector(IndexOutput output, Object vector, byte vectorDataType) throws IOException {
         if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT) {
             float[] fv = (float[]) vector;
