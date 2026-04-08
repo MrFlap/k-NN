@@ -24,7 +24,7 @@ public final class ClumpingContext {
 
     public static final int DEFAULT_CLUMPING_FACTOR = 8;
     public static final int MIN_CLUMPING_FACTOR = 2;
-    public static final int MAX_CLUMPING_FACTOR = 256;
+    public static final int MAX_CLUMPING_FACTOR = 1024;
 
     /**
      * The clumping factor n. Every nth vector (starting from 0) is a marker vector.

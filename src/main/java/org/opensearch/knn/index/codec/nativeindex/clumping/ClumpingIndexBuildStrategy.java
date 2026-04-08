@@ -118,7 +118,7 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
 
         final KNNEngine knnEngine = indexInfo.getKnnEngine();
         final String segmentName = indexInfo.getSegmentWriteState().segmentInfo.name;
-        final String fieldName = indexInfo.getFieldName();
+        final String fieldName = indexInfo.getField();
 
         // Build marker index into a temp file so we can load it for searching
         String tempEngineFileName = segmentName + "_" + fieldName + ".clumpidx";
@@ -207,11 +207,11 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             IndexOutputWithBuffer tempOutputWithBuffer = new IndexOutputWithBuffer(tempOutput);
 
             BuildIndexParams markerIndexParams = BuildIndexParams.builder()
-                .fieldName(indexInfo.getFieldName())
+                .field(indexInfo.getField())
                 .knnEngine(indexInfo.getKnnEngine())
                 .indexOutputWithBuffer(tempOutputWithBuffer)
                 .vectorDataType(indexInfo.getVectorDataType())
-                .parameters(indexInfo.getParameters())
+                .indexParameters(indexInfo.getIndexParameters())
                 .quantizationState(indexInfo.getQuantizationState())
                 .knnVectorValuesSupplier(() -> {
                     try {
@@ -449,7 +449,7 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         ) {
             IndexInputWithBuffer readStream = new IndexInputWithBuffer(tempInput);
             return AccessController.doPrivileged((PrivilegedAction<Long>) () ->
-                JNIService.loadIndex(readStream, indexInfo.getParameters(), knnEngine)
+                JNIService.loadIndex(readStream, indexInfo.getIndexParameters(), knnEngine)
             );
         }
     }
