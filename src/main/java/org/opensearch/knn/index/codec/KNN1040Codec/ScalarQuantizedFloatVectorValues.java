@@ -5,7 +5,7 @@
 
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
-import lombok.RequiredArgsConstructor;
+import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.lucene104.QuantizedByteVectorValues;
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.FloatVectorValues;
@@ -30,10 +30,15 @@ import java.io.IOException;
  * from the underlying {@link QuantizedByteVectorValues}. The quantized byte values hold the on-disk
  * slice that contains the quantized vector data and correction factors used during scoring.
  */
-@RequiredArgsConstructor
-class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasIndexSlice {
+@Log4j2
+public class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasIndexSlice {
     private final FloatVectorValues floatVectorValues;
     private final QuantizedByteVectorValues quantizedVectorValues;
+
+    public ScalarQuantizedFloatVectorValues(final FloatVectorValues floatVectorValues, final QuantizedByteVectorValues quantizedVectorValues) {
+        this.floatVectorValues = floatVectorValues;
+        this.quantizedVectorValues = quantizedVectorValues;
+    }
 
     @Override
     public int dimension() {

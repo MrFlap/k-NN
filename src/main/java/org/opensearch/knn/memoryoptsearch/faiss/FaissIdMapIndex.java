@@ -7,6 +7,7 @@ package org.opensearch.knn.memoryoptsearch.faiss;
 
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.VectorEncoding;
@@ -29,6 +30,7 @@ import java.io.IOException;
  * into the corresponding Lucene document ID.
  * If the mapping is an identity mapping, where each `i` is mapped to itself, we omit storing it to save memory.
  */
+@Log4j2
 public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvider {
     public static final String IXMP = "IxMp";
     public static final String IBMP = "IBMp";
@@ -86,10 +88,18 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
         if (idMappingReader == null) {
             // Handle 'dense' case where all documents have at least one KNN field, which has exactly one vector.
             // No re-mapping is required.
+            log.warn("[FAISS_ID_MAP] getFloatValues: idMappingReader is NULL (identity mapping), ntotal={}", totalNumberOfVectors);
             return nestedIndex.getFloatValues(indexInput);
         }
 
         // Re-mapping is required.
+        log.warn(
+            "[FAISS_ID_MAP] getFloatValues: idMappingReader NON-NULL, ntotal={}, ordToDoc(0)={}, ordToDoc(1)={}, ordToDoc(2)={}",
+            totalNumberOfVectors,
+            idMappingReader.get(0),
+            idMappingReader.get(1),
+            idMappingReader.get(2)
+        );
         return sparseFloatValues(indexInput);
     }
 
@@ -173,6 +183,24 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
 
     private FloatVectorValues sparseFloatValues(IndexInput indexInput) throws IOException {
         final FloatVectorValues vectorValues = nestedIndex.getFloatValues(indexInput);
+
+        // For the SQ/1-bit path, vectorValues is a ScalarQuantizedFloatVectorValues which holds
+        // a QuantizedByteVectorValues used for scoring. The scorer reads quantized data by ordinal,
+        // so we must also remap the QuantizedByteVectorValues ordinals via the id_map. Otherwise
+        // score(i) reads full-segment ordinal i instead of the marker at ordinal i.
+        if (vectorValues instanceof org.opensearch.knn.index.codec.KNN1040Codec.ScalarQuantizedFloatVectorValues) {
+            final org.apache.lucene.codecs.lucene104.QuantizedByteVectorValues qbvv =
+                org.opensearch.knn.index.codec.KNN1040Codec.KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(vectorValues);
+            if (qbvv != null) {
+                final org.apache.lucene.codecs.lucene104.QuantizedByteVectorValues sparseQbvv =
+                    new SparseQuantizedByteVectorValues(qbvv, idMappingReader);
+                // Rebuild ScalarQuantizedFloatVectorValues with the remapped QuantizedByteVectorValues
+                final FloatVectorValues remappedVectorValues =
+                    new org.opensearch.knn.index.codec.KNN1040Codec.ScalarQuantizedFloatVectorValues(vectorValues, sparseQbvv);
+                return new FaissFloatVectorValues.SparseFloatVectorValuesImpl(remappedVectorValues, idMappingReader);
+            }
+        }
+
         return new FaissFloatVectorValues.SparseFloatVectorValuesImpl(vectorValues, idMappingReader);
     }
 
