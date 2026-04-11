@@ -220,6 +220,14 @@ public class NativeEngineKnnVectorQuery extends Query {
     private Integer getFirstPassK(final boolean isShardLevelRescoringDisabled) {
         final RescoreContext rescoreContext = knnQuery.getRescoreContext();
         if (rescoreContext != null && rescoreContext.isRescoreEnabled()) {
+            // When clumping is enabled, skip the rescore phase entirely. Clumping expansion into FP16
+            // vectors serves as the quality-improvement step, making the 2*k oversample + exact rescore
+            // redundant. We search with just k and let the clumping expander handle the rest.
+            final boolean clumpingEnabled = knnQuery.getClumpingContext() != null && knnQuery.getClumpingContext().isEnabled();
+            if (clumpingEnabled) {
+                return null;
+            }
+
             // We need 2-phase search where using expanded `k` for the first stage search.
             final int dimension = knnQuery.getQueryVector().length;
             return rescoreContext.getFirstPassK(knnQuery.getK(), isShardLevelRescoringDisabled, dimension);

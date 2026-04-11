@@ -426,6 +426,80 @@ public final class ClumpFileReader {
     }
 
     /**
+     * Returns true if the given docId is a marker in the clump file's marker table.
+     * Used for assertion/debugging to verify ANN search returns correct marker docIDs.
+     */
+    public static boolean isMarkerDocId(
+        Directory directory, String segmentName, String fieldName, int docId
+    ) throws IOException {
+        CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
+        if (table == null) return false;
+        return Arrays.binarySearch(table.markerDocIds, docId) >= 0;
+    }
+
+    /**
+     * Re-scores marker vectors using the same FP16 similarity function used for hidden vectors.
+     * This is necessary because ANN search scores (ADC-based for SQ, HNSW graph scores for others)
+     * are on a different scale than the FP16 L2 scores computed for hidden vectors. Without
+     * re-scoring, markers always win in reduceToTopK and hidden vectors are never returned.
+     *
+     * @param directory          The segment directory
+     * @param segmentName        The segment name
+     * @param fieldName          The vector field name
+     * @param markerScoreDocs    The marker ScoreDocs from ANN search (scores will be replaced)
+     * @param floatQueryVector   The float query vector
+     * @param byteQueryVector    The byte query vector
+     * @param similarityFunction The similarity function
+     * @return New ScoreDoc array with re-scored markers, or the original array if not FP16
+     */
+    public static ScoreDoc[] rescoreMarkers(
+        Directory directory,
+        String segmentName,
+        String fieldName,
+        ScoreDoc[] markerScoreDocs,
+        float[] floatQueryVector,
+        byte[] byteQueryVector,
+        KNNVectorSimilarityFunction similarityFunction
+    ) throws IOException {
+        CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
+        if (table == null || table.vectorDataType != ClumpFileFormat.VECTOR_TYPE_FP16) {
+            // Only re-score for FP16 — float and byte paths use the same scorer as ANN search
+            return markerScoreDocs;
+        }
+
+        try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
+            ScoreDoc[] rescored = new ScoreDoc[markerScoreDocs.length];
+            for (int i = 0; i < markerScoreDocs.length; i++) {
+                int docId = markerScoreDocs[i].doc;
+                int markerIndex = Arrays.binarySearch(table.markerDocIds, docId);
+                if (markerIndex < 0) {
+                    // Not found in marker table — keep original score
+                    rescored[i] = markerScoreDocs[i];
+                    continue;
+                }
+
+                // Read the marker's FP16 vector and score it
+                long markerVecOffset = table.clumpDataOffsets[markerIndex];
+                byte[] vecBytes = new byte[table.vectorSize];
+                try (IndexInput cloned = input.clone()) {
+                    cloned.seek(markerVecOffset);
+                    cloned.readBytes(vecBytes, 0, vecBytes.length);
+                }
+
+                // Decode FP16 and score
+                java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                float[] vec = new float[table.dimension];
+                for (int d = 0; d < table.dimension; d++) {
+                    vec[d] = Float.float16ToFloat(vb.getShort());
+                }
+                float score = similarityFunction.compare(floatQueryVector, vec);
+                rescored[i] = new ScoreDoc(docId, score);
+            }
+            return rescored;
+        }
+    }
+
+    /**
      * Returns just the hidden doc IDs (without scoring) for backward compatibility
      * or cases where only doc IDs are needed.
      */

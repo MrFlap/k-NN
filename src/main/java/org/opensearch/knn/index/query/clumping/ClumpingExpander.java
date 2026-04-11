@@ -116,6 +116,7 @@ public final class ClumpingExpander {
         }
 
         if (hasClumpFile == false) {
+            log.warn("[CLUMPING DEBUG] No clump file found for segment={}, field={}", segmentName, fieldName);
             return leafResult;
         }
 
@@ -130,6 +131,12 @@ public final class ClumpingExpander {
         int[] markerDocIds = Arrays.stream(leafResult.getResult().scoreDocs)
             .mapToInt(sd -> sd.doc)
             .toArray();
+
+        log.warn(
+            "[CLUMPING DEBUG] segment={}, field={}, numMarkers={}, markerDocIds(first5)={}",
+            segmentName, fieldName, markerDocIds.length,
+            Arrays.toString(Arrays.copyOf(markerDocIds, Math.min(5, markerDocIds.length)))
+        );
 
         // Read hidden vectors from .clump file and score them inline
         List<ScoreDoc> scoredHidden;
@@ -148,9 +155,51 @@ public final class ClumpingExpander {
             return leafResult;
         }
 
+        log.warn("[CLUMPING DEBUG] segment={}, scoredHidden.size()={}", segmentName, scoredHidden.size());
+
         if (scoredHidden.isEmpty()) {
             return leafResult;
         }
+
+        // Re-score the markers using the same similarity function as the hidden vectors.
+        // The ANN search scores (ADC-based for SQ, HNSW-based for others) are on a different
+        // scale than the FP16 L2 scores used for hidden vectors. Re-scoring markers ensures
+        // all scores are comparable so reduceToTopK selects the true nearest neighbors.
+        ScoreDoc[] rescored;
+        try {
+            rescored = ClumpFileReader.rescoreMarkers(
+                clumpDirectory,
+                segmentName,
+                fieldName,
+                leafResult.getResult().scoreDocs,
+                queryVector,
+                byteQueryVector,
+                similarityFunction
+            );
+        } catch (IOException e) {
+            log.warn("Error rescoring markers from clump file, using original scores", e);
+            rescored = leafResult.getResult().scoreDocs;
+        }
+
+        // Assertion: every marker docID returned by ANN search must exist in the clump file's
+        // marker table. If not, the ANN search is returning wrong docIDs (e.g. ordinals instead
+        // of Lucene docIDs), which means the id_map translation is broken.
+        // Always log at WARN level so this shows up without debug logging enabled.
+        for (ScoreDoc sd : leafResult.getResult().scoreDocs) {
+            boolean isMarker = ClumpFileReader.isMarkerDocId(clumpDirectory, segmentName, fieldName, sd.doc);
+            if (!isMarker) {
+                log.warn(
+                    "[CLUMPING ASSERTION FAILED] ANN result docId={} is NOT a marker in the clump file "
+                        + "for segment={}, field={}. This indicates ordinal/docID confusion in the search path.",
+                    sd.doc, segmentName, fieldName
+                );
+            }
+        }
+        log.warn(
+            "[CLUMPING DEBUG] segment={}, field={}, numMarkers={}, markerDocIds(first5)={}",
+            segmentName, fieldName, markerDocIds.length,
+            Arrays.toString(Arrays.copyOf(markerDocIds, Math.min(5, markerDocIds.length)))
+        );
 
         // Remove any hidden docs that are already in the marker results
         Set<Integer> existingDocIds = new HashSet<>();
@@ -159,16 +208,15 @@ public final class ClumpingExpander {
         }
         scoredHidden.removeIf(sd -> existingDocIds.contains(sd.doc));
 
-        if (scoredHidden.isEmpty()) {
+        if (scoredHidden.isEmpty() && rescored == leafResult.getResult().scoreDocs) {
             return leafResult;
         }
 
-        // Merge marker results with scored hidden results
-        ScoreDoc[] markerDocs = leafResult.getResult().scoreDocs;
-        ScoreDoc[] merged = new ScoreDoc[markerDocs.length + scoredHidden.size()];
-        System.arraycopy(markerDocs, 0, merged, 0, markerDocs.length);
+        // Merge re-scored markers with scored hidden results
+        ScoreDoc[] merged = new ScoreDoc[rescored.length + scoredHidden.size()];
+        System.arraycopy(rescored, 0, merged, 0, rescored.length);
         for (int j = 0; j < scoredHidden.size(); j++) {
-            merged[markerDocs.length + j] = scoredHidden.get(j);
+            merged[rescored.length + j] = scoredHidden.get(j);
         }
 
         TotalHits totalHits = new TotalHits(merged.length, TotalHits.Relation.EQUAL_TO);
@@ -177,7 +225,7 @@ public final class ClumpingExpander {
         log.debug(
             "Clumping expansion: segment={}, markers={}, hidden={}, merged={}",
             segmentName,
-            markerDocIds.length,
+            rescored.length,
             scoredHidden.size(),
             merged.length
         );

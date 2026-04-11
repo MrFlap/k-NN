@@ -81,9 +81,11 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         KnnVectorValues vectorValues,
         float[] target
     ) throws IOException {
-        // For the sparse case, KnnVectorValues having `QuantizedByteVectorValues` might be wrapped to support
-        // vector ordinal to doc id mapping. For the dense case, it's not needed as vector ordinal is always the same
-        // as doc id.
+        // Preserve the outer vectorValues for ordToDoc (it may carry an id_map via SparseFloatVectorValuesImpl).
+        // We only unwrap to extract QuantizedByteVectorValues for scoring — the ordToDoc mapping must
+        // come from the original (possibly wrapped) vectorValues.
+        final KnnVectorValues outerVectorValues = vectorValues;
+
         if (vectorValues instanceof WrappedFloatVectorValues) {
             vectorValues = WrappedFloatVectorValues.getBottomFloatVectorValues(vectorValues);
         }
@@ -93,32 +95,55 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             quantizedByteVectorValues = (QuantizedByteVectorValues) vectorValues;
         } else {
             // Extract QuantizedByteVectorValues from `vectorValues`.
-            // This should not be null, otherwise it can't get entroid + correction factors.
+            // This should not be null, otherwise it can't get centroid + correction factors.
             quantizedByteVectorValues = KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(vectorValues);
         }
 
-        return new PrefetchableRandomVectorScorer(getScorer(similarityFunction, quantizedByteVectorValues, target));
+        return new PrefetchableRandomVectorScorer(getScorer(similarityFunction, quantizedByteVectorValues, target, outerVectorValues));
     }
 
     private RandomVectorScorer.AbstractRandomVectorScorer getScorer(
         final VectorSimilarityFunction similarityFunction,
         final QuantizedByteVectorValues quantizedByteVectorValues,
-        final float[] target
+        final float[] target,
+        final KnnVectorValues outerVectorValues
     ) throws IOException {
-        final IndexInput indexInput = quantizedByteVectorValues.getSlice();
-        final long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(indexInput, 0, indexInput.length());
-        if (addressAndSize != null) {
-            // Try bulk SIMD
-            return bulkSimdRandomVectorScorer(quantizedByteVectorValues, target, addressAndSize, similarityFunction);
+        // Only use SIMD bulk scoring when outerVectorValues is the same as the quantized values
+        // (dense case: ordinal == docID). When outerVectorValues is a WrappedFloatVectorValues
+        // (sparse/clumping case), the SIMD scorer would use wrong offsets because it indexes
+        // into the full-segment vector array by ordinal, but the HNSW graph ordinals map to
+        // non-contiguous docIDs via the id_map. Fall back to the non-SIMD path in that case.
+        final boolean isSparse = outerVectorValues instanceof WrappedFloatVectorValues;
+        if (!isSparse) {
+            final IndexInput indexInput = quantizedByteVectorValues.getSlice();
+            final long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(indexInput, 0, indexInput.length());
+            if (addressAndSize != null) {
+                return bulkSimdRandomVectorScorer(quantizedByteVectorValues, target, addressAndSize, similarityFunction, outerVectorValues);
+            }
         }
 
-        // Fallback
-        log.warn("Bulk SIMD for SQ is not supported, falling back to Lucene's random vector scorer");
-        return (RandomVectorScorer.AbstractRandomVectorScorer) super.getRandomVectorScorer(
-            similarityFunction,
-            quantizedByteVectorValues,
-            target
-        );
+        // Fallback: non-SIMD scoring (correct for both dense and sparse cases)
+        if (isSparse) {
+            log.debug("Using non-SIMD scorer for sparse/clumping case (ordinal != docID)");
+            // Create a scorer backed by quantizedByteVectorValues for scoring, but override
+            // ordToDoc to use outerVectorValues (which carries the id_map).
+            final RandomVectorScorer innerScorer = super.getRandomVectorScorer(
+                similarityFunction, quantizedByteVectorValues, target
+            );
+            return new RandomVectorScorer.AbstractRandomVectorScorer(outerVectorValues) {
+                @Override
+                public float score(int internalVectorId) throws IOException {
+                    return innerScorer.score(internalVectorId);
+                }
+            };
+        } else {
+            log.warn("Bulk SIMD for SQ is not supported, falling back to Lucene's random vector scorer");
+            return (RandomVectorScorer.AbstractRandomVectorScorer) super.getRandomVectorScorer(
+                similarityFunction,
+                quantizedByteVectorValues,
+                target
+            );
+        }
     }
 
     /**
@@ -145,7 +170,8 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         final QuantizedByteVectorValues quantizedByteVectorValues,
         final float[] target,
         final long[] addressAndSize,
-        final VectorSimilarityFunction similarityFunction
+        final VectorSimilarityFunction similarityFunction,
+        final KnnVectorValues outerVectorValues
     ) throws IOException {
         // Check encoding type
         final Lucene104ScalarQuantizedVectorsFormat.ScalarEncoding scalarEncoding = quantizedByteVectorValues.getScalarEncoding();
@@ -187,12 +213,12 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         // Transpose half-bytes (nibbles) for SIMD-friendly layout
         OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
 
-        // Return Bulk SIMD scorer
+        // Return Bulk SIMD scorer — use outerVectorValues for ordToDoc so the id_map is preserved
         return new BulkSimdRandomVectorScorer(
             targetQuantized,
             targetCorrectiveTerms,
             addressAndSize,
-            quantizedByteVectorValues,
+            outerVectorValues,
             similarityFunction,
             targetCopy.length,
             quantizedByteVectorValues.getCentroidDP()
@@ -228,7 +254,7 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             final byte[] targetQuantized,
             final OptimizedScalarQuantizer.QuantizationResult targetCorrectiveTerms,
             final long[] addressAndSize,
-            final QuantizedByteVectorValues knnVectorValues,
+            final KnnVectorValues knnVectorValues,
             final VectorSimilarityFunction similarityFunction,
             final int dimension,
             final float centroidDp
