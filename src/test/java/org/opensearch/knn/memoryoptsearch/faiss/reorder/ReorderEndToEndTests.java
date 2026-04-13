@@ -53,6 +53,32 @@ public class ReorderEndToEndTests extends OpenSearchTestCase {
      * - .vec bytes differ after reorder
      * - The same set of vectors is present (just in reversed order)
      */
+    /**
+     * Verify temp filenames match Lucene's codec filename pattern.
+     * This prevents the "invalid codec filename" error that only surfaces
+     * on real clusters with MMapDirectory (not caught by gradle run).
+     */
+    public void testTempFileNamesMatchLucenePattern() {
+        String[] inputs = {
+            "_0_NativeEngines990KnnVectorsFormat_0.vec",
+            "_1k_165_target_field.faiss",
+            "_3q_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vemf",
+        };
+        java.util.regex.Pattern lucenePattern = java.util.regex.Pattern.compile("_[a-z0-9]+(_.*)?\\..+");
+        for (String input : inputs) {
+            String temp = SegmentReorderService.tempName(input);
+            assertTrue(
+                "Temp filename '" + temp + "' (from '" + input + "') must match Lucene codec pattern",
+                lucenePattern.matcher(temp).matches()
+            );
+            // Must not start with the original segment prefix
+            assertFalse(
+                "Temp filename must not start with original segment prefix",
+                temp.startsWith(input.substring(0, input.indexOf('_', 1) + 1))
+            );
+        }
+    }
+
     public void testReorderProducesDifferentVecFileButSameVectors() throws Exception {
         Path tempDir = createTempDir("reorder-e2e");
         try (MMapDirectory dir = new MMapDirectory(tempDir)) {
@@ -196,8 +222,8 @@ public class ReorderEndToEndTests extends OpenSearchTestCase {
         assertNotNull(vecDataFileName);
         assertNotNull(vecMetaFileName);
 
-        String reorderedVecData = vecDataFileName + ".reorder";
-        String reorderedVecMeta = vecMetaFileName + ".reorder";
+        String reorderedVecData = "reorder_tmp_vec_" + vecDataFileName;
+        String reorderedVecMeta = "reorder_tmp_meta_" + vecMetaFileName;
 
         // Read original vectors and write in reordered order
         SegmentReadState readState = new SegmentReadState(

@@ -165,7 +165,7 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
                 );
                 if (totalLiveDocs >= SegmentReorderService.MIN_VECTORS_FOR_REORDER) {
                     SegmentReorderService reorderService = new SegmentReorderService(segmentWriteState, fieldInfo, reorderStrategy);
-                    reorderService.reorderSegmentFiles();
+                    reorderService.reorderSegmentFilesStandardHeaders();
                     log.info("Reordered .vec/.faiss for SQ field [{}], {} vectors", fieldInfo.getName(), totalLiveDocs);
                 }
             } catch (Exception e) {

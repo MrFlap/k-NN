@@ -43,7 +43,16 @@ public class SegmentReorderService {
     public static final int MIN_VECTORS_FOR_REORDER = 10_000;
     public static final int DEFAULT_REORDER_THREADS = 4;
 
-    private static final String REORDER_SUFFIX = ".reorder";
+    private static final String REORDER_TEMP_SEGMENT = "_reordertmp";
+
+    /** Generate a temp filename that matches Lucene's codec filename pattern: _[a-z0-9]+(_.*)?\..*  */
+    static String tempName(String originalFileName) {
+        // Extract the extension from the original (e.g., ".faiss", ".vec", ".vemf")
+        int dotIdx = originalFileName.indexOf('.');
+        String ext = dotIdx >= 0 ? originalFileName.substring(dotIdx) : ".tmp";
+        // Use a unique name based on the original to avoid collisions
+        return REORDER_TEMP_SEGMENT + "_" + Integer.toHexString(originalFileName.hashCode()) + ext;
+    }
 
     private final SegmentWriteState state;
     private final FieldInfo fieldInfo;
@@ -131,6 +140,106 @@ public class SegmentReorderService {
         rewriteFaissFile(directory, writeDir, engineFileName, reorderOrdMap);
 
         log.info("Merge-aware reorder complete for segment {}, field [{}]", segmentName, fieldInfo.name);
+    }
+
+    /**
+     * Reorder only the .vec file for the SQ path.
+     * Preserves standard Lucene codec headers so the SQ reader can still open the files.
+     * Does NOT rewrite .faiss — the graph uses quantized vectors for traversal,
+     * and the full-precision .vec is only used for rescoring. Reordering .vec
+     * improves rescore locality without needing to remap the graph.
+     */
+    public void reorderSegmentFilesStandardHeaders() throws IOException {
+        final Directory directory = state.directory;
+        final String segmentName = state.segmentInfo.name;
+
+        // Compute permutation from finalized .vec file
+        final int[] permutation = computePermutationFromVecFile(directory, segmentName);
+        final ReorderOrdMap reorderOrdMap = new ReorderOrdMap(permutation);
+
+        final Directory writeDir = new FilterDirectory(directory) {
+            @Override
+            public IndexOutput createOutput(String name, IOContext context) throws IOException {
+                return in.createOutput(name, state.context);
+            }
+        };
+
+        // Rewrite .vec data in permuted order, preserving standard codec headers
+        final String vecDataFileName = findFileWithSuffix(directory, segmentName, ".vec");
+        rewriteVecDataOnly(directory, writeDir, vecDataFileName, reorderOrdMap);
+    }
+
+    /**
+     * Rewrite only the vector data region of the .vec file in permuted order.
+     * Preserves the original Lucene99FlatVectorsFormatData codec header and footer.
+     * The .vemf metadata file is NOT modified.
+     */
+    private void rewriteVecDataOnly(
+        Directory readDir, Directory writeDir, String vecDataFileName, ReorderOrdMap reorderOrdMap
+    ) throws IOException {
+        final int numVectors = reorderOrdMap.newOrd2Old.length;
+        final FieldInfo readFieldInfo = buildFieldInfoForRead();
+        final FieldInfos fieldInfos = new FieldInfos(new FieldInfo[] { readFieldInfo });
+        final String segmentSuffix = extractSegmentSuffix(vecDataFileName, state.segmentInfo.name);
+
+        final SegmentReadState readState = new SegmentReadState(
+            readDir, state.segmentInfo, fieldInfos, IOContext.DEFAULT, segmentSuffix
+        );
+
+        // Use createTempOutput to get a valid Lucene temp filename
+        String reorderedVecData;
+        try (
+            IndexInput originalVec = readDir.openInput(vecDataFileName, IOContext.DEFAULT);
+            Lucene99FlatVectorsReader reader = new Lucene99FlatVectorsReader(readState, DefaultFlatVectorScorer.INSTANCE)
+        ) {
+            final FloatVectorValues vectorValues = reader.getFloatVectorValues(fieldInfo.name);
+            final int dimension = vectorValues.dimension();
+
+            CodecUtil.checkIndexHeader(
+                originalVec,
+                "Lucene99FlatVectorsFormatData",
+                0, 1,
+                state.segmentInfo.getId(),
+                segmentSuffix
+            );
+            final long headerEnd = originalVec.getFilePointer();
+            final long vectorDataOffset = alignUp(headerEnd, Float.BYTES);
+            final long footerStart = originalVec.length() - CodecUtil.footerLength();
+
+            reorderedVecData = tempName(vecDataFileName);
+            deleteIfExists(writeDir, reorderedVecData);
+            IndexOutput out = writeDir.createOutput(reorderedVecData, IOContext.DEFAULT);
+            try {
+                // Copy header verbatim
+                originalVec.seek(0);
+                out.copyBytes(originalVec, vectorDataOffset);
+
+                // Write vectors in permuted order
+                for (int newOrd = 0; newOrd < numVectors; newOrd++) {
+                    int oldOrd = reorderOrdMap.newOrd2Old[newOrd];
+                    float[] vector = vectorValues.vectorValue(oldOrd);
+                    for (float v : vector) {
+                        out.writeInt(Float.floatToIntBits(v));
+                    }
+                }
+
+                // Pad to match original alignment if needed
+                while (out.getFilePointer() < footerStart) {
+                    out.writeByte((byte) 0);
+                }
+
+                // Write a new footer with correct checksum for the rewritten data
+                CodecUtil.writeFooter(out);
+            } finally {
+                out.close();
+            }
+        }
+
+        // Atomic replace
+        readDir.deleteFile(vecDataFileName);
+        readDir.rename(reorderedVecData, vecDataFileName);
+
+        log.info("Reordered .vec data (standard headers) for segment {}, field [{}]", state.segmentInfo.name, fieldInfo.name);
     }
 
     public void reorderSegmentFiles() throws IOException {
@@ -249,13 +358,6 @@ public class SegmentReorderService {
     private void rewriteVecFile(
         Directory readDir, Directory writeDir, String vecDataFileName, String vecMetaFileName, ReorderOrdMap reorderOrdMap
     ) throws IOException {
-        final String reorderedVecData = vecDataFileName + REORDER_SUFFIX;
-        final String reorderedVecMeta = vecMetaFileName + REORDER_SUFFIX;
-
-        // Clean up any leftover reorder files
-        deleteIfExists(readDir, reorderedVecData);
-        deleteIfExists(readDir, reorderedVecMeta);
-
         final int numVectors = reorderOrdMap.newOrd2Old.length;
 
         // Build reader state
@@ -266,8 +368,16 @@ public class SegmentReorderService {
         final SegmentReadState readState = new SegmentReadState(
             readDir, state.segmentInfo, fieldInfos, IOContext.DEFAULT, segmentSuffix
         );
-        // write the new .vemf file
+
+        // Use createTempOutput for valid Lucene temp filenames
+        String reorderedVecData;
+        String reorderedVecMeta;
         try (IndexInput vecMetaInput = readDir.openInput(vecMetaFileName, IOContext.DEFAULT)) {
+            reorderedVecMeta = tempName(vecMetaFileName);
+            reorderedVecData = tempName(vecDataFileName);
+            deleteIfExists(writeDir, reorderedVecMeta);
+            deleteIfExists(writeDir, reorderedVecData);
+
             final ReorderedFlatVectorsWriter writer = new ReorderedFlatVectorsWriter(
                 writeDir, reorderedVecMeta, reorderedVecData, numVectors, vecMetaInput
             );
@@ -298,14 +408,17 @@ public class SegmentReorderService {
     }
 
     private void rewriteFaissFile(Directory readDir, Directory writeDir, String engineFileName, ReorderOrdMap reorderOrdMap) throws IOException {
-        final String reorderedFaiss = engineFileName + REORDER_SUFFIX;
-        deleteIfExists(readDir, reorderedFaiss);
+        String reorderedFaiss = tempName(engineFileName);
+        deleteIfExists(writeDir, reorderedFaiss);
 
         try (IndexInput faissInput = readDir.openInput(engineFileName, IOContext.DEFAULT)) {
             final FaissIndex faissIndex = FaissIndex.load(faissInput);
 
-            try (IndexOutput faissOutput = writeDir.createOutput(reorderedFaiss, IOContext.DEFAULT)) {
+            IndexOutput faissOutput = writeDir.createOutput(reorderedFaiss, IOContext.DEFAULT);
+            try {
                 FaissIndexReorderTransformer.transform(faissIndex, faissInput, faissOutput, reorderOrdMap);
+            } finally {
+                faissOutput.close();
             }
         }
 
