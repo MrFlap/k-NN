@@ -353,6 +353,17 @@ public abstract class KNNWeight extends Weight {
         // results less than K, though we have more than k filtered docs
         if (isExactSearchRequire(context, filterCardinality, topDocs.scoreDocs.length)) {
             final BitSetIterator docs = filterWeight != null ? new BitSetIterator(filterBitSet, filterCardinality) : null;
+            
+            // Log actual doc IDs for rescoring analysis
+            if (log.isDebugEnabled() && filterBitSet != null) {
+                final StringBuilder docIdList = new StringBuilder();
+                for (int docId = filterBitSet.nextSetBit(0); docId != DocIdSetIterator.NO_MORE_DOCS; docId = filterBitSet.nextSetBit(docId + 1)) {
+                    if (docIdList.length() > 0) docIdList.append(",");
+                    docIdList.append(docId);
+                }
+                log.debug("[KNN] ExactSearcher rescoring docIds: [{}], field: {}", docIdList, knnQuery.getField());
+            }
+
             final TopDocs result = doExactSearch(context, docs, filterCardinality, k);
             return new PerLeafResult(
                 filterWeight == null ? null : filterBitSet,

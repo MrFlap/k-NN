@@ -114,6 +114,7 @@ if (${CONFIG_FAISS} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON OR ${CONFIG_TEST} S
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_util.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_index_service.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_methods.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_memoryoptsearch_faiss_reorder_kmeansreorder_FaissKMeansService.cpp
     )
     target_link_libraries(${TARGET_LIB_FAISS} ${TARGET_LINK_FAISS_LIB} ${TARGET_LIB_UTIL} OpenMP::OpenMP_CXX)
     target_include_directories(${TARGET_LIB_FAISS} PRIVATE

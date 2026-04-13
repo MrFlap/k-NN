@@ -14,6 +14,7 @@ import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat.
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
 
 import java.io.IOException;
 
@@ -42,13 +43,22 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
         ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE
     );
 
+    private final VectorReorderStrategy reorderStrategy;
+
     public Faiss1040ScalarQuantizedKnnVectorsFormat() {
+        this(null);
+    }
+
+    public Faiss1040ScalarQuantizedKnnVectorsFormat(VectorReorderStrategy reorderStrategy) {
         super(FORMAT_NAME);
+        this.reorderStrategy = reorderStrategy;
     }
 
     @Override
     public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
-        return new Faiss1040ScalarQuantizedKnnVectorsWriter(state, faissSqFlatFormat.fieldsWriter(state), faissSqFlatFormat::fieldsReader);
+        return new Faiss1040ScalarQuantizedKnnVectorsWriter(
+            state, faissSqFlatFormat.fieldsWriter(state), faissSqFlatFormat::fieldsReader, reorderStrategy
+        );
     }
 
     /**

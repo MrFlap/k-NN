@@ -24,6 +24,8 @@ import org.apache.lucene.util.RamUsageEstimator;
 import org.opensearch.knn.index.codec.nativeindex.AbstractNativeEnginesKnnVectorsWriter;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.SegmentReorderService;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
 
 import java.io.IOException;
 
@@ -51,15 +53,18 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
     private FieldInfo fieldInfo;
     private boolean finished;
     private final IOFunction<SegmentReadState, FlatVectorsReader> quantizedFlatVectorsReaderSupplier;
+    private final VectorReorderStrategy reorderStrategy;
 
     Faiss1040ScalarQuantizedKnnVectorsWriter(
         @NonNull SegmentWriteState segmentWriteState,
         @NonNull FlatVectorsWriter flatVectorsWriter,
-        @NonNull IOFunction<SegmentReadState, FlatVectorsReader> quantizedFlatVectorsReaderSupplier
+        @NonNull IOFunction<SegmentReadState, FlatVectorsReader> quantizedFlatVectorsReaderSupplier,
+        VectorReorderStrategy reorderStrategy
     ) {
         this.segmentWriteState = segmentWriteState;
         this.flatVectorsWriter = flatVectorsWriter;
         this.quantizedFlatVectorsReaderSupplier = quantizedFlatVectorsReaderSupplier;
+        this.reorderStrategy = reorderStrategy;
     }
 
     /**
@@ -148,6 +153,24 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
             doMergeOneField(fieldInfo, mergeState, null, null, segmentWriteState, new NativeIndexBuildStrategyFactory(), quantizedValues);
         } finally {
             IOUtils.close(flatVectorsReader);
+        }
+
+        // Reorder .vec and .faiss after merge if strategy is configured and enough vectors
+        if (reorderStrategy != null) {
+            try {
+                final int totalLiveDocs = getLiveDocs(
+                    org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory.getKNNVectorValuesSupplierForMerge(
+                        org.opensearch.knn.common.FieldInfoExtractor.extractVectorDataType(fieldInfo), fieldInfo, mergeState
+                    ).get()
+                );
+                if (totalLiveDocs >= SegmentReorderService.MIN_VECTORS_FOR_REORDER) {
+                    SegmentReorderService reorderService = new SegmentReorderService(segmentWriteState, fieldInfo, reorderStrategy);
+                    reorderService.reorderSegmentFiles();
+                    log.info("Reordered .vec/.faiss for SQ field [{}], {} vectors", fieldInfo.getName(), totalLiveDocs);
+                }
+            } catch (Exception e) {
+                log.error("Failed to reorder SQ field [{}], continuing without reorder", fieldInfo.getName(), e);
+            }
         }
     }
 

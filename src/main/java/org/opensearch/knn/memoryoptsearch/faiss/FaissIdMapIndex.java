@@ -37,6 +37,10 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
     private FaissIndex nestedIndex;
     private FaissHNSWProvider hnswGetter;
     private DirectMonotonicReader idMappingReader;
+    // Raw ord-to-doc mapping array for reorder code that needs direct array access.
+    // Null when the mapping is identity (dense case).
+    @Getter
+    private int[] ordToDocs;
 
     public FaissIdMapIndex(final String indexType) {
         super(indexType);
@@ -74,6 +78,22 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
         // Another case is parent-child nested case. In which, this mapping table will map internal vector id to parent document id.
         // NOTE : If the mapping is an identity function that maps `i` to `i`, then the reader will be null.
         idMappingReader = MonotonicIntegerSequenceEncoder.encode(numElements, input);
+
+        // Populate ordToDocs array for reorder code that needs direct array access.
+        // If idMappingReader is null (identity mapping), ordToDocs stays null.
+        if (idMappingReader != null) {
+            ordToDocs = new int[numElements];
+            boolean isIdentical = true;
+            for (int i = 0; i < numElements; i++) {
+                ordToDocs[i] = (int) idMappingReader.get(i);
+                if (ordToDocs[i] != i) {
+                    isIdentical = false;
+                }
+            }
+            if (isIdentical) {
+                ordToDocs = null;
+            }
+        }
     }
 
     @Override
@@ -84,34 +104,22 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
     @Override
     public FloatVectorValues getFloatValues(IndexInput indexInput) throws IOException {
         if (idMappingReader == null) {
-            // Handle 'dense' case where all documents have at least one KNN field, which has exactly one vector.
-            // No re-mapping is required.
             return nestedIndex.getFloatValues(indexInput);
         }
-
-        // Re-mapping is required.
         return sparseFloatValues(indexInput);
     }
 
     @Override
     public ByteVectorValues getByteValues(IndexInput indexInput) throws IOException {
         if (idMappingReader == null) {
-            // Handle 'dense' case where all documents have at least one KNN field, which has exactly one vector.
-            // No re-mapping is required.
             return nestedIndex.getByteValues(indexInput);
         }
-
-        // Re-mapping is required.
         return sparseByteValues(indexInput);
     }
 
     /**
      * For sparse or nested cases, {@link ByteVectorValues} needs to be wrapped to correctly map an internal vector ID to a
      * Lucene document ID.
-     *
-     * @param indexInput A read stream to FAISS index file.
-     * @return {@link ByteVectorValues} which is a byte vector random accessor.
-     * @throws IOException
      */
     private ByteVectorValues sparseByteValues(IndexInput indexInput) throws IOException {
         final ByteVectorValues vectorValues = nestedIndex.getByteValues(indexInput);
@@ -132,7 +140,6 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
 
             @Override
             public int ordToDoc(int internalVectorId) {
-                // Convert an internal vector id to Lucene document id.
                 return (int) idMappingReader.get(internalVectorId);
             }
 
@@ -142,7 +149,6 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
                     return new Bits() {
                         @Override
                         public boolean get(int internalVectorId) {
-                            // Convert internal vector ordinal to Lucene document id, then check acceptDocs directly.
                             return acceptDocs.get((int) idMappingReader.get(internalVectorId));
                         }
 
@@ -152,13 +158,11 @@ public class FaissIdMapIndex extends FaissBinaryIndex implements FaissHNSWProvid
                         }
                     };
                 }
-
                 return null;
             }
 
             @Override
             public int size() {
-                // The number of vectors
                 return vectorValues.size();
             }
 

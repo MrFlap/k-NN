@@ -71,7 +71,7 @@ public class KNNLibraryLoader {
      * 3. AVX2 if supported and not disabled
      * 4. Default fallback library
      */
-    static void loadFaissLibrary() {
+    public static void loadFaissLibrary() {
         if (!isFaissAVX512SPRDisabled() && isAVX512SPRSupportedBySystem()) {
             loadLibrary(KNNConstants.FAISS_AVX512_SPR_JNI_LIBRARY_NAME);
         } else if (!isFaissAVX512Disabled() && isAVX512SupportedBySystem()) {
@@ -81,6 +81,14 @@ public class KNNLibraryLoader {
         } else {
             loadLibrary(KNNConstants.FAISS_JNI_LIBRARY_NAME);
         }
+    }
+
+    /**
+     * Loads the default Faiss library without checking cluster settings.
+     * Use this for standalone tools that run outside of OpenSearch.
+     */
+    public static void loadFaissLibraryDirect() {
+        loadLibrary(KNNConstants.FAISS_JNI_LIBRARY_NAME);
     }
 
     /**

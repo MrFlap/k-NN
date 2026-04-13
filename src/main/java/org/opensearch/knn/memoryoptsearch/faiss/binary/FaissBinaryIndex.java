@@ -23,6 +23,11 @@ public abstract class FaissBinaryIndex extends FaissIndex {
     protected int codeSize;
     // Metric type in Faiss. See MetricType.h
     protected int metricType;
+    // The raw is_trained byte from the FAISS header (deprecated, always true).
+    // Stored for faithful round-trip during reorder transforms.
+    protected byte isTrainedDeprecatedField;
+    // Alias for metricType used by reorder code for clarity
+    public int getOriginalMetricType() { return metricType; }
 
     public FaissBinaryIndex(final String indexType) {
         super(indexType);
@@ -41,7 +46,7 @@ public abstract class FaissBinaryIndex extends FaissIndex {
         totalNumberOfVectors = Math.toIntExact(inputStream.readLong());
 
         // Consume `is_trained`, which is always true.
-        inputStream.readByte();
+        isTrainedDeprecatedField = inputStream.readByte();
 
         // Consume `metric type`.
         metricType = inputStream.readInt();
