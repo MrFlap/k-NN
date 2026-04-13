@@ -8,6 +8,8 @@ package org.opensearch.knn.index.codec.backward_codecs;
 import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil;
+import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
@@ -21,6 +23,10 @@ import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.bpreorder.BipartiteReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.KMeansReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.MergeAwareKMeansReorderStrategy;
 
 import java.util.Map;
 import java.util.Optional;
@@ -163,7 +169,33 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
         // mapperService is already checked for null or valid instance type at caller, hence we don't need
         // addition isPresent check here.
         final int approximateThreshold = getApproximateThresholdValue();
-        return new NativeEngines990KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
+        final VectorReorderStrategy reorderStrategy = getReorderStrategy();
+        final boolean replacementFree = "replacement_free".equals(
+            mapperService.get().getIndexSettings().getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_SETTING)
+        );
+        return new NativeEngines990KnnVectorsFormat(
+            approximateThreshold,
+            nativeIndexBuildStrategyFactory,
+            reorderStrategy,
+            replacementFree
+        );
+    }
+
+    private VectorReorderStrategy getReorderStrategy() {
+        final IndexSettings indexSettings = mapperService.get().getIndexSettings();
+        final String strategy = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_STRATEGY_SETTING);
+        switch (strategy) {
+            case "kmeans":
+                final int numClusters = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING);
+                return new KMeansReorderStrategy(numClusters, 25);
+            case "kmeans_merge_aware":
+                final int numClustersMerge = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING);
+                return new MergeAwareKMeansReorderStrategy(numClustersMerge, 25);
+            case "none":
+                return null;
+            default:
+                return new BipartiteReorderStrategy();
+        }
     }
 
     private int getApproximateThresholdValue() {

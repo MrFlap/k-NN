@@ -98,6 +98,9 @@ public class KNNSettings {
     public static final String MODEL_INDEX_NUMBER_OF_REPLICAS = "knn.model.index.number_of_replicas";
     public static final String MODEL_CACHE_SIZE_LIMIT = "knn.model.cache.size.limit";
     public static final String ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD = "index.knn.advanced.filtered_exact_search_threshold";
+    public static final String INDEX_KNN_ADVANCED_REORDER_STRATEGY = "index.knn.advanced.reorder_strategy";
+    public static final String INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION = "index.knn.advanced.reorder_implementation";
+    public static final String INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS = "index.knn.advanced.reorder_kmeans_num_clusters";
     public static final String KNN_FAISS_AVX2_DISABLED = "knn.faiss.avx2.disabled";
     public static final String QUANTIZATION_STATE_CACHE_SIZE_LIMIT = "knn.quantization.cache.size.limit";
     public static final String QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES = "knn.quantization.cache.expiry.minutes";
@@ -149,6 +152,9 @@ public class KNNSettings {
     public static final String KNN_DEFAULT_VECTOR_STREAMING_MEMORY_LIMIT_PCT = "1%";
 
     public static final Integer ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_DEFAULT_VALUE = -1;
+    public static final String INDEX_KNN_ADVANCED_REORDER_STRATEGY_DEFAULT = "none";
+    public static final String INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_DEFAULT = "replacement_free";
+    public static final Integer INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_DEFAULT = 256;
     public static final Integer KNN_DEFAULT_QUANTIZATION_STATE_CACHE_SIZE_LIMIT_PERCENTAGE = 5; // By default, set aside 5% of the JVM for
     // the limit
     public static final Integer KNN_MAX_QUANTIZATION_STATE_CACHE_SIZE_LIMIT_PERCENTAGE = 10; // Quantization state cache limit cannot exceed
@@ -242,6 +248,42 @@ public class KNNSettings {
     public static final Setting<Integer> ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING = Setting.intSetting(
         ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD,
         ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_DEFAULT_VALUE,
+        IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<String> INDEX_KNN_ADVANCED_REORDER_STRATEGY_SETTING = Setting.simpleString(
+        INDEX_KNN_ADVANCED_REORDER_STRATEGY,
+        INDEX_KNN_ADVANCED_REORDER_STRATEGY_DEFAULT,
+        value -> {
+            if (!value.equals("bp") && !value.equals("kmeans") && !value.equals("kmeans_merge_aware") && !value.equals("none")) {
+                throw new IllegalArgumentException(
+                    "[" + INDEX_KNN_ADVANCED_REORDER_STRATEGY + "] must be one of [bp, kmeans, kmeans_merge_aware, none] but was [" + value + "]"
+                );
+            }
+        },
+        IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<String> INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_SETTING = Setting.simpleString(
+        INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION,
+        INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_DEFAULT,
+        value -> {
+            if (!value.equals("replacement") && !value.equals("replacement_free")) {
+                throw new IllegalArgumentException(
+                    "[" + INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION + "] must be one of [replacement, replacement_free] but was [" + value + "]"
+                );
+            }
+        },
+        IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Integer> INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING = Setting.intSetting(
+        INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS,
+        INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_DEFAULT,
+        1,
         IndexScope,
         Setting.Property.Dynamic
     );
@@ -749,6 +791,9 @@ public class KNNSettings {
             MODEL_INDEX_NUMBER_OF_REPLICAS_SETTING,
             MODEL_CACHE_SIZE_LIMIT_SETTING,
             ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING,
+            INDEX_KNN_ADVANCED_REORDER_STRATEGY_SETTING,
+            INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_SETTING,
+            INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING,
             KNN_FAISS_AVX2_DISABLED_SETTING,
             KNN_VECTOR_STREAMING_MEMORY_LIMIT_PCT_SETTING,
             KNN_FAISS_AVX512_DISABLED_SETTING,

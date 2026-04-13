@@ -83,7 +83,8 @@ public class Faiss1040ScalarQuantizedKnnVectorsWriterTests extends KNNTestCase {
         objectUnderTest = new Faiss1040ScalarQuantizedKnnVectorsWriter(
             segmentWriteState,
             flatVectorsWriter,
-            quantizedFlatVectorsReaderSupplier
+            quantizedFlatVectorsReaderSupplier,
+            null
         );
         mockedFlatFieldVectorsWriter = mock(FlatFieldVectorsWriter.class);
         Mockito.doNothing().when(mockedFlatFieldVectorsWriter).addValue(Mockito.anyInt(), Mockito.any());

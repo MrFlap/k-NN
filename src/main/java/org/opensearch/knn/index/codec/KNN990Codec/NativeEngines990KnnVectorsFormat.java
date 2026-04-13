@@ -15,8 +15,11 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
+import org.apache.lucene.codecs.hnsw.DefaultFlatVectorScorer;
 import org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
+import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
 import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
@@ -25,6 +28,8 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.ReorderedLucene99FlatVectorsReader111;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
 
 import java.io.IOException;
 
@@ -41,6 +46,8 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     private static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
     private final int approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
+    private final VectorReorderStrategy reorderStrategy;
+    private final boolean replacementFree;
 
     public NativeEngines990KnnVectorsFormat() {
         this(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_DEFAULT_VALUE);
@@ -54,9 +61,29 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
         int approximateThreshold,
         final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
     ) {
+        this(approximateThreshold, nativeIndexBuildStrategyFactory, null, false);
+    }
+
+    public NativeEngines990KnnVectorsFormat(
+        final FlatVectorsFormat flatVectorsFormat,
+        int approximateThreshold,
+        final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
+        final VectorReorderStrategy reorderStrategy
+    ) {
+        this(approximateThreshold, nativeIndexBuildStrategyFactory, reorderStrategy, false);
+    }
+
+    public NativeEngines990KnnVectorsFormat(
+        int approximateThreshold,
+        final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
+        final VectorReorderStrategy reorderStrategy,
+        boolean replacementFree
+    ) {
         super(FORMAT_NAME);
         this.approximateThreshold = approximateThreshold;
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
+        this.reorderStrategy = reorderStrategy;
+        this.replacementFree = replacementFree;
     }
 
     /**
@@ -66,11 +93,16 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsWriter fieldsWriter(final SegmentWriteState state) throws IOException {
+        final FlatVectorsWriter flatWriter = replacementFree
+            ? new ReorderAwareFlatVectorsWriter(state, FlatVectorScorerUtil.getLucene99FlatVectorsScorer(), false)
+            : flatVectorsFormat.fieldsWriter(state);
         return new NativeEngines990KnnVectorsWriter(
             state,
-            flatVectorsFormat.fieldsWriter(state),
+            flatWriter,
             approximateThreshold,
-            nativeIndexBuildStrategyFactory
+            nativeIndexBuildStrategyFactory,
+            reorderStrategy,
+            replacementFree
         );
     }
 
@@ -81,7 +113,25 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
+        // Try unified reader first (handles standard headers with mixed reordered/standard fields)
+        try {
+            UnifiedFlatVectorsReader unified = new UnifiedFlatVectorsReader(state,
+                FlatVectorScorerUtil.getLucene99FlatVectorsScorer());
+//            System.out.println("[Format] fieldsReader → UnifiedFlatVectorsReader for segment " + state.segmentInfo.name);
+            return new NativeEngines990KnnVectorsReader(state, unified);
+        } catch (org.apache.lucene.index.CorruptIndexException | NullPointerException e) {
+            // Not standard headers — try legacy reordered reader
+//            System.out.println("[Format] fieldsReader → UnifiedReader failed for " + state.segmentInfo.name + ": " + e.getMessage());
+        }
+        try {
+            final FlatVectorsReader reorderedFlatVectorsReader =
+                new ReorderedLucene99FlatVectorsReader111(state, FlatVectorScorerUtil.getLucene99FlatVectorsScorer());
+//            System.out.println("[Format] fieldsReader → ReorderedLucene99FlatVectorsReader111 for segment " + state.segmentInfo.name);
+            return new NativeEngines990KnnVectorsReader(state, reorderedFlatVectorsReader);
+        } catch (org.apache.lucene.index.CorruptIndexException | NullPointerException e) {
+//            System.out.println("[Format] fieldsReader → standard Lucene reader for segment " + state.segmentInfo.name);
+            return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
+        }
     }
 
     /**
@@ -103,12 +153,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
 
     @Override
     public String toString() {
-        return "NativeEngines99KnnVectorsFormat(name="
-            + this.getClass().getSimpleName()
-            + ", flatVectorsFormat="
-            + flatVectorsFormat
-            + ", approximateThreshold="
-            + approximateThreshold
-            + ")";
+        return "NativeEngines99KnnVectorsFormat(name=" + this.getClass().getSimpleName() + ", flatVectorsFormat=" + flatVectorsFormat
+               + ", approximateThreshold=" + approximateThreshold + ")";
     }
 }

@@ -14,6 +14,10 @@ import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsForm
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.CodecFormatResolver;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.VectorReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.bpreorder.BipartiteReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.KMeansReorderStrategy;
+import org.opensearch.knn.memoryoptsearch.faiss.reorder.kmeansreorder.MergeAwareKMeansReorderStrategy;
 
 import java.util.Map;
 import java.util.Optional;
@@ -52,7 +56,7 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
         int defaultBeamWidth
     ) {
         if (isSQOneBitEncoder(params)) {
-            return new Faiss1040ScalarQuantizedKnnVectorsFormat();
+            return new Faiss1040ScalarQuantizedKnnVectorsFormat(getReorderStrategy());
         }
         return resolve();
     }
@@ -60,7 +64,9 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
     @Override
     public KnnVectorsFormat resolve() {
         final int approximateThreshold = getApproximateThresholdValue();
-        return new NativeEngines990KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
+        final VectorReorderStrategy reorderStrategy = getReorderStrategy();
+        final boolean replacementFree = isReplacementFree();
+        return new NativeEngines990KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory, reorderStrategy, replacementFree);
     }
 
     /**
@@ -77,5 +83,30 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
 
     private static boolean isSQOneBitEncoder(Map<String, Object> params) {
         return FaissSQEncoder.isSQOneBit(params);
+    }
+
+    private VectorReorderStrategy getReorderStrategy() {
+        if (mapperService.isEmpty()) return null;
+        final IndexSettings indexSettings = mapperService.get().getIndexSettings();
+        final String strategy = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_STRATEGY_SETTING);
+        switch (strategy) {
+            case "kmeans":
+                final int numClusters = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING);
+                return new KMeansReorderStrategy(numClusters, 25);
+            case "kmeans_merge_aware":
+                final int numClustersMerge = indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_KMEANS_NUM_CLUSTERS_SETTING);
+                return new MergeAwareKMeansReorderStrategy(numClustersMerge, 25);
+            case "none":
+                return null;
+            default:
+                return new BipartiteReorderStrategy();
+        }
+    }
+
+    private boolean isReplacementFree() {
+        if (mapperService.isEmpty()) return false;
+        return "replacement_free".equals(
+            mapperService.get().getIndexSettings().getValue(KNNSettings.INDEX_KNN_ADVANCED_REORDER_IMPLEMENTATION_SETTING)
+        );
     }
 }

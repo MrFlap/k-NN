@@ -47,6 +47,7 @@ import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.query.QueryProfiler;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -285,6 +286,12 @@ public class NativeEngineKnnVectorQuery extends Query {
             return perLeafResult;
         }
         Set<Integer> docIds = Arrays.stream(perLeafResult.getResult().scoreDocs).map(scoreDoc -> scoreDoc.doc).collect(Collectors.toSet());
+        
+        // Log actual doc IDs for rescoring analysis
+        if (log.isDebugEnabled()) {
+            log.debug("[KNN] ExactSearcher rescoring docIds: {}, field: {}", docIds, knnQuery.getField());
+        }
+
         DocIdSetIterator allSiblings = queryUtils.getAllSiblings(
             leafReaderContext,
             docIds,
@@ -460,6 +467,27 @@ public class NativeEngineKnnVectorQuery extends Query {
                 final Set<Integer> docIds = Arrays.stream(perLeafeResult.getResult().scoreDocs)
                     .map(scoreDoc -> scoreDoc.doc)
                     .collect(Collectors.toSet());
+
+                // Write docIds to file for reorder analysis (one file per shard)
+//                try {
+//                    int shardId = knnQuery.getShardId();
+//                    Path docIdsPath = Path.of("/home/ec2-user/before-reordering/data/query_doc_ids/exactsearcher_docids_shard_" + shardId + ".txt");
+////                    Path docIdsPath = Path.of("/Users/finnrobl/Documents/k-NN-2/sift-binary/query_doc_ids/exactsearcher_docids_shard_" + shardId + ".txt");
+//                    try (java.io.BufferedWriter writer = java.nio.file.Files.newBufferedWriter(
+//                            docIdsPath, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)) {
+//                        writer.write("# shard=" + shardId + " field=" + knnQuery.getField() + " timestamp=" + java.time.Instant.now());
+//                        writer.newLine();
+//                        for (Integer docId : docIds) {
+//                            writer.write(docId.toString());
+//                            writer.newLine();
+//                        }
+//                        writer.write("-------");
+//                        writer.newLine();
+//                    }
+//                } catch (Exception e) {
+//                    log.warn("Failed to write docIds to file", e);
+//                }
+
                 DocIdSetIterator matchedDocs;
                 if (knnQuery.getParentsFilter() != null) {
                     matchedDocs = queryUtils.getAllSiblings(
