@@ -33,6 +33,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.IntStream;
 
+import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
+
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorValues;
 
@@ -137,6 +139,9 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         List<Object> markerVectors;
         int dimension;
         byte vectorDataType;
+        int quantizedVecBytes;
+        float[] centroid;
+        float centroidDp;
 
         try (
             IndexOutput tempHiddenOutput = indexInfo.getSegmentWriteState().directory.createOutput(
@@ -150,6 +155,9 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             dimension = result.dimension;
             vectorDataType = result.vectorDataType;
             markerVectors = result.markerVectors;
+            quantizedVecBytes = result.quantizedVecBytes;
+            centroid = result.centroid;
+            centroidDp = result.centroidDp;
 
             // Flush the assign map to disk and free from heap
             writeAssignFile(indexInfo, assignFileName, result.assignMap);
@@ -168,17 +176,33 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
                 tempHiddenFileName, indexInfo.getSegmentWriteState().context
             )
         ) {
-            ClumpFileWriter.writeClumpFile(
-                indexInfo.getSegmentWriteState(),
-                fieldName,
-                dimension,
-                vectorDataType,
-                markerDocIds,
-                markerVectors,
-                assignInput,
-                tempHiddenInput,
-                totalHidden
-            );
+            if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+                ClumpFileWriter.writeClumpFileSq(
+                    indexInfo.getSegmentWriteState(),
+                    fieldName,
+                    dimension,
+                    quantizedVecBytes,
+                    centroid,
+                    centroidDp,
+                    markerDocIds,
+                    markerVectors,
+                    assignInput,
+                    tempHiddenInput,
+                    totalHidden
+                );
+            } else {
+                ClumpFileWriter.writeClumpFile(
+                    indexInfo.getSegmentWriteState(),
+                    fieldName,
+                    dimension,
+                    vectorDataType,
+                    markerDocIds,
+                    markerVectors,
+                    assignInput,
+                    tempHiddenInput,
+                    totalHidden
+                );
+            }
         } finally {
             deleteTempFile(indexInfo, assignFileName);
             deleteTempFile(indexInfo, tempHiddenFileName);
@@ -254,13 +278,212 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
      * <p>
      * For the SQ/1-bit path ({@code indexInfo.getQuantizedByteVectorValues() != null}), the temp
      * marker index is written with {@code IO_FLAG_SKIP_STORAGE} and contains a {@code "null"}
-     * storage sentinel that the C++ {@code read_index_binary} cannot parse. In that case we skip
-     * the JNI load entirely and fall back to brute-force L2 assignment directly.
+     * storage sentinel that the C++ {@code read_index_binary} cannot parse. In that case we use a
+     * two-level SQ-then-fp32 rescore that mirrors the query-time strategy: quantize the hidden
+     * vector, SQ-score against all marker codes, take the top-16, then pick the best by fp32
+     * distance. Hidden entries are spilled as {@link SqVectorEntry}.
      * <p>
      * For all other paths the just-built marker index is loaded via JNI and queried with k=1 per
      * hidden vector (parallelised in batches).
      */
     private AssignmentResult assignHiddenToMarkersViaIndex(
+        BuildIndexParams indexInfo,
+        List<Integer> markerDocIds,
+        int maxDocId,
+        IndexOutput tempHiddenOutput,
+        String tempEngineFileName,
+        KNNEngine knnEngine
+    ) throws IOException {
+        if (indexInfo.getQuantizedByteVectorValues() != null) {
+            return assignHiddenSqTwoLevel(indexInfo, markerDocIds, maxDocId, tempHiddenOutput);
+        }
+        return assignHiddenNonSq(indexInfo, markerDocIds, maxDocId, tempHiddenOutput, tempEngineFileName, knnEngine);
+    }
+
+    /**
+     * SQ_1BIT assignment path.
+     *
+     * <p>Harvests markers directly from {@link QuantizedByteVectorValues} — both the packed 1-bit
+     * codes plus four correction factors (as {@link SqVectorEntry}) and their fp32 counterparts
+     * (for the rescore step and the later query-time fp32 rescore). For each hidden vector:
+     * <ol>
+     *   <li>Quantize the hidden fp32 into 4 bit planes (via
+     *       {@link org.apache.lucene.util.quantization.OptimizedScalarQuantizer}) — same primitives
+     *       as {@code KNN1040ScalarQuantizedVectorScorer} uses for query vectors.</li>
+     *   <li>Score it against every marker SQ code with the ADC L2 formula via {@link SqAdcScorer},
+     *       keep the top {@value #SQ_RESCORE_SHORTLIST} candidates.</li>
+     *   <li>Rescore those {@value #SQ_RESCORE_SHORTLIST} with fp32 L2 and pick the best.</li>
+     * </ol>
+     * The hidden vector's own SQ code is harvested from {@code QuantizedByteVectorValues} by
+     * parallel-iterating its ordinal with the fp32 iterator — guaranteeing the spilled SQ bytes
+     * are byte-identical to what Lucene wrote to the {@code .veb} file.
+     */
+    private AssignmentResult assignHiddenSqTwoLevel(
+        BuildIndexParams indexInfo,
+        List<Integer> markerDocIds,
+        int maxDocId,
+        IndexOutput tempHiddenOutput
+    ) throws IOException {
+        final QuantizedByteVectorValues qbvv = indexInfo.getQuantizedByteVectorValues();
+        final float[] centroid = qbvv.getCentroid();
+        final float centroidDp = qbvv.getCentroidDP();
+        final int dimension = qbvv.dimension();
+        // vectorValue(0) gives the true quantized-code length (handles dimension padding).
+        final int quantizedVecBytes = qbvv.vectorValue(0).length;
+
+        final Set<Integer> markerSet = new HashSet<>(markerDocIds);
+
+        // Pass 1: harvest markers. We need both fp32 (for rescore) and SQ (for SQ scoring)
+        // representations, in markerDocIds insertion order. The fp32 iterator doubles as the
+        // source of truth for segmentOrdinal — it must be traversed completely to keep any
+        // internal counters (e.g. FieldWriterIteratorValues) in sync.
+        final float[][] markerFloatVectors = new float[markerDocIds.size()][];
+        final SqVectorEntry[] markerSqEntries = new SqVectorEntry[markerDocIds.size()];
+        int markerIdx = 0;
+
+        final KNNVectorValues<?> markerScan = indexInfo.getKnnVectorValuesSupplier().get();
+        markerScan.nextDoc();
+        int segmentOrdinal = 0;
+        while (markerScan.docId() != NO_MORE_DOCS) {
+            // Always call getVector() to advance any sequential counter inside the iterator.
+            Object rawVec = markerScan.getVector();
+            if (markerSet.contains(markerScan.docId())) {
+                markerFloatVectors[markerIdx] = ((float[]) rawVec).clone();
+                markerSqEntries[markerIdx] = readSqEntry(qbvv, segmentOrdinal);
+                markerIdx++;
+            }
+            segmentOrdinal++;
+            markerScan.nextDoc();
+        }
+
+        // Build marker-vectors list for the writer (SQ entries go into the clump file).
+        final List<Object> markerVectors = new ArrayList<>(markerSqEntries.length);
+        for (SqVectorEntry e : markerSqEntries) {
+            markerVectors.add(e);
+        }
+
+        // Build the assign map.
+        int[] assignMap = new int[maxDocId + 1];
+        Arrays.fill(assignMap, UNASSIGNED);
+        for (int mDocId : markerDocIds) {
+            assignMap[mDocId] = mDocId;
+        }
+
+        // Pass 2: assign hidden vectors to markers via the SQ-then-fp32 two-level rescore,
+        // spilling each hidden vector's SQ entry to tempHiddenOutput.
+        final KNNVectorValues<?> hiddenScan = indexInfo.getKnnVectorValuesSupplier().get();
+        hiddenScan.nextDoc();
+        int hiddenSegmentOrdinal = 0;
+        while (hiddenScan.docId() != NO_MORE_DOCS) {
+            int docId = hiddenScan.docId();
+            float[] hiddenFp32 = ((float[]) hiddenScan.getVector()).clone();
+
+            if (markerSet.contains(docId) == false) {
+                SqVectorEntry hiddenSq = readSqEntry(qbvv, hiddenSegmentOrdinal);
+                int bestMarkerIdx = findNearestMarkerSqTwoLevel(
+                    hiddenFp32, markerSqEntries, markerFloatVectors,
+                    centroid, centroidDp, dimension, qbvv
+                );
+                assignMap[docId] = markerDocIds.get(bestMarkerIdx);
+                ClumpFileWriter.writeHiddenEntryToTemp(
+                    tempHiddenOutput, docId, hiddenSq, ClumpFileFormat.VECTOR_TYPE_SQ_1BIT
+                );
+            }
+            hiddenSegmentOrdinal++;
+            hiddenScan.nextDoc();
+        }
+
+        return new AssignmentResult(
+            markerVectors, assignMap, dimension,
+            ClumpFileFormat.VECTOR_TYPE_SQ_1BIT,
+            quantizedVecBytes, centroid, centroidDp
+        );
+    }
+
+    /**
+     * Finds the best marker for a hidden fp32 vector using a two-level SQ→fp32 rescore,
+     * mirroring the query-time strategy.
+     */
+    private int findNearestMarkerSqTwoLevel(
+        float[] hiddenFp32,
+        SqVectorEntry[] markerSqEntries,
+        float[][] markerFloatVectors,
+        float[] centroid,
+        float centroidDp,
+        int dimension,
+        QuantizedByteVectorValues qbvv
+    ) throws IOException {
+        // Quantize the hidden vector as if it were a query.
+        final float[] queryCopy = hiddenFp32.clone(); // scalarQuantize mutates input
+        final SqAdcScorer.QuantizedQuery q = SqAdcScorer.quantizeQuery(qbvv, queryCopy);
+
+        // SQ score all markers. Use L2 here — it matches the semantics of "nearest marker".
+        final int m = markerSqEntries.length;
+        final int shortlist = Math.min(SQ_RESCORE_SHORTLIST, m);
+        // Track top-K smallest scores. Simple O(m * log K) insertion via a bounded scan.
+        final float[] bestScores = new float[shortlist];
+        final int[] bestIdx = new int[shortlist];
+        Arrays.fill(bestScores, Float.POSITIVE_INFINITY);
+        Arrays.fill(bestIdx, -1);
+
+        for (int i = 0; i < m; i++) {
+            float score = SqAdcScorer.scoreL2(q, markerSqEntries[i].code, markerSqEntries[i], dimension);
+            // Insert into top-K if smaller than the current worst kept.
+            if (score < bestScores[shortlist - 1]) {
+                int pos = shortlist - 1;
+                while (pos > 0 && bestScores[pos - 1] > score) {
+                    bestScores[pos] = bestScores[pos - 1];
+                    bestIdx[pos] = bestIdx[pos - 1];
+                    pos--;
+                }
+                bestScores[pos] = score;
+                bestIdx[pos] = i;
+            }
+        }
+
+        // Rescore shortlist with fp32 L2 and pick the best.
+        int winner = bestIdx[0];
+        float winnerDist = fp32L2(hiddenFp32, markerFloatVectors[winner]);
+        for (int i = 1; i < shortlist; i++) {
+            if (bestIdx[i] < 0) break;
+            float d = fp32L2(hiddenFp32, markerFloatVectors[bestIdx[i]]);
+            if (d < winnerDist) {
+                winnerDist = d;
+                winner = bestIdx[i];
+            }
+        }
+        return winner;
+    }
+
+    /**
+     * Reads one SQ entry (code + corrections) from the segment's {@link QuantizedByteVectorValues}
+     * by segment ordinal.
+     */
+    private static SqVectorEntry readSqEntry(QuantizedByteVectorValues qbvv, int segmentOrdinal) throws IOException {
+        byte[] code = qbvv.vectorValue(segmentOrdinal).clone();
+        OptimizedScalarQuantizer.QuantizationResult q = qbvv.getCorrectiveTerms(segmentOrdinal);
+        return new SqVectorEntry(
+            code,
+            q.lowerInterval(),
+            q.upperInterval(),
+            q.additionalCorrection(),
+            q.quantizedComponentSum()
+        );
+    }
+
+    private static float fp32L2(float[] a, float[] b) {
+        float sum = 0;
+        for (int i = 0; i < a.length; i++) {
+            float d = a[i] - b[i];
+            sum += d * d;
+        }
+        return sum;
+    }
+
+    /**
+     * Non-SQ assignment path. Unchanged from the pre-SQ-rewrite behavior.
+     */
+    private AssignmentResult assignHiddenNonSq(
         BuildIndexParams indexInfo,
         List<Integer> markerDocIds,
         int maxDocId,
@@ -275,7 +498,7 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
         }
 
         // Read marker vectors into memory (1/N of total) for the clump file.
-        // IMPORTANT: For the List-backed KNNVectorValues (SQ path), getVector() uses a sequential
+        // IMPORTANT: For the List-backed KNNVectorValues, getVector() uses a sequential
         // counter (index[0]++) that advances on every call regardless of docId. We must call
         // getVector() for EVERY vector in the scan — not just markers — to keep the counter in
         // sync with the docId iterator. Skipping hidden vectors without calling getVector() would
@@ -321,63 +544,25 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
             assignMap[mDocId] = mDocId;
         }
 
-        // The SQ/1-bit path writes the marker index with IO_FLAG_SKIP_STORAGE, producing a "null"
-        // storage sentinel that C++ read_index_binary cannot parse. Skip the JNI load and use
-        // brute-force assignment instead. For all other paths, load via JNI and query with k=1.
-        final boolean useBruteForce = indexInfo.getQuantizedByteVectorValues() != null;
-
-        if (useBruteForce) {
-            assignHiddenBruteForce(
+        long indexPointer = loadTempIndex(indexInfo, tempEngineFileName, knnEngine);
+        try {
+            assignHiddenViaJni(
                 indexInfo, markerSet, markerVectorArray, markerDocIds,
-                vectorDataType, assignMap, tempHiddenOutput
+                markerDocIdToIndex, vectorDataType, assignMap, tempHiddenOutput,
+                indexPointer, knnEngine
             );
-        } else {
-            long indexPointer = loadTempIndex(indexInfo, tempEngineFileName, knnEngine);
-            try {
-                assignHiddenViaJni(
-                    indexInfo, markerSet, markerVectorArray, markerDocIds,
-                    markerDocIdToIndex, vectorDataType, assignMap, tempHiddenOutput,
-                    indexPointer, knnEngine
-                );
-            } finally {
-                freeTempIndex(indexPointer, knnEngine, false);
-            }
+        } finally {
+            freeTempIndex(indexPointer, knnEngine, false);
         }
 
-        return new AssignmentResult(markerVectors, assignMap, dimension, vectorDataType);
+        return new AssignmentResult(markerVectors, assignMap, dimension, vectorDataType, 0, null, 0.0f);
     }
 
     /**
-     * Assigns hidden vectors to markers using brute-force L2 distance.
-     * Used for the SQ/1-bit path where the temp index cannot be loaded via JNI.
-     * <p>
-     * IMPORTANT: getVector() must be called for EVERY doc (markers included) to keep
-     * the sequential counter in FieldWriterIteratorValues in sync with the docId iterator.
+     * Shortlist size for the SQ → fp32 rescore. Matches the query-time strategy: SQ picks the
+     * top 16 candidates, fp32 rescores to choose the single winner.
      */
-    private void assignHiddenBruteForce(
-        BuildIndexParams indexInfo,
-        Set<Integer> markerSet,
-        Object[] markerVectorArray,
-        List<Integer> markerDocIds,
-        byte vectorDataType,
-        int[] assignMap,
-        IndexOutput tempHiddenOutput
-    ) throws IOException {
-        final KNNVectorValues<?> hiddenScan = indexInfo.getKnnVectorValuesSupplier().get();
-        hiddenScan.nextDoc();
-
-        while (hiddenScan.docId() != NO_MORE_DOCS) {
-            int docId = hiddenScan.docId();
-            // Always call getVector() to advance the sequential counter in FieldWriterIteratorValues.
-            Object vec = cloneVectorRaw(hiddenScan.getVector());
-            if (markerSet.contains(docId) == false) {
-                int bestIdx = findNearestMarkerBruteForce(vec, markerVectorArray);
-                assignMap[docId] = markerDocIds.get(bestIdx);
-                ClumpFileWriter.writeHiddenEntryToTemp(tempHiddenOutput, docId, vec, vectorDataType);
-            }
-            hiddenScan.nextDoc();
-        }
-    }
+    private static final int SQ_RESCORE_SHORTLIST = 512;
 
     /**
      * Assigns hidden vectors to markers by querying the loaded JNI index with k=1,
@@ -665,21 +850,34 @@ public class ClumpingIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     /**
      * Result of the streaming assignment pass. Contains marker vectors (held in memory),
-     * the flat assign map (docId → markerDocId), and dimension/type metadata.
-     * The assignMap is flushed to disk after this result is returned, then freed.
+     * the flat assign map (docId → markerDocId), and dimension/type metadata. For the SQ_1BIT
+     * path, also carries the quantizer's centroid + centroidDp + quantized-code byte length so
+     * the clump writer can persist them in the file header. {@code centroid} is null and
+     * {@code quantizedVecBytes} is 0 for non-SQ paths.
+     *
+     * <p>The assignMap is flushed to disk after this result is returned, then freed.
      */
     private static class AssignmentResult {
         final List<Object> markerVectors;
         final int[] assignMap;
         final int dimension;
         final byte vectorDataType;
+        final int quantizedVecBytes;
+        final float[] centroid;
+        final float centroidDp;
 
-        AssignmentResult(List<Object> markerVectors, int[] assignMap,
-                         int dimension, byte vectorDataType) {
+        AssignmentResult(
+            List<Object> markerVectors, int[] assignMap,
+            int dimension, byte vectorDataType,
+            int quantizedVecBytes, float[] centroid, float centroidDp
+        ) {
             this.markerVectors = markerVectors;
             this.assignMap = assignMap;
             this.dimension = dimension;
             this.vectorDataType = vectorDataType;
+            this.quantizedVecBytes = quantizedVecBytes;
+            this.centroid = centroid;
+            this.centroidDp = centroidDp;
         }
     }
 }

@@ -6,10 +6,13 @@
 package org.opensearch.knn.index.codec.nativeindex.clumping;
 
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.jni.SimdVectorComputeService;
@@ -26,10 +29,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 /**
- * Reads a .clump sidecar file (v2 format with inline vectors) to expand marker
- * vector results. Reads hidden vectors sequentially from the clump file and scores
- * them directly against the query vector, avoiding random access into Lucene's
- * vector storage.
+ * Reads a .clump sidecar file to expand marker vector results. Reads hidden vectors
+ * sequentially from the clump file and scores them directly against the query vector,
+ * avoiding random access into Lucene's vector storage.
+ * <p>
+ * Supports both the legacy FP16/FLOAT/BYTE paths and the new SQ_1BIT path. For SQ_1BIT,
+ * hidden vectors are scored via the ADC formula (SQ bulk score), then the top {@code 2*k}
+ * candidates are rescored with full-precision fp32 vectors read from the segment's
+ * {@link FloatVectorValues}.
  * <p>
  * See {@link ClumpFileFormat} for the binary layout.
  */
@@ -37,6 +44,9 @@ import java.util.concurrent.Future;
 public final class ClumpFileReader {
 
     private ClumpFileReader() {}
+
+    /** Hardcoded oversample factor for SQ → fp32 rescore. */
+    static final int SQ_RESCORE_OVERSAMPLE = 5;
 
     /**
      * Cached marker table data for a segment+field pair. Segments are immutable once
@@ -47,15 +57,22 @@ public final class ClumpFileReader {
         final int numMarkers;
         final int dimension;
         final byte vectorDataType;
+        /** Bytes per vector entry (includes SQ correction bytes for SQ_1BIT). */
         final int vectorSize;
         final int[] markerDocIds;
         final int[] numHidden;
         final long[] clumpDataOffsets;
         final String clumpFileName;
 
+        // SQ_1BIT-only fields (null / 0 for other types)
+        final int quantizedVecBytes;
+        final float centroidDp;
+        final float[] centroid;
+
         CachedMarkerTable(
             int numMarkers, int dimension, byte vectorDataType, int vectorSize,
-            int[] markerDocIds, int[] numHidden, long[] clumpDataOffsets, String clumpFileName
+            int[] markerDocIds, int[] numHidden, long[] clumpDataOffsets, String clumpFileName,
+            int quantizedVecBytes, float centroidDp, float[] centroid
         ) {
             this.numMarkers = numMarkers;
             this.dimension = dimension;
@@ -65,6 +82,9 @@ public final class ClumpFileReader {
             this.numHidden = numHidden;
             this.clumpDataOffsets = clumpDataOffsets;
             this.clumpFileName = clumpFileName;
+            this.quantizedVecBytes = quantizedVecBytes;
+            this.centroidDp = centroidDp;
+            this.centroid = centroid;
         }
     }
 
@@ -75,17 +95,10 @@ public final class ClumpFileReader {
         return segmentName + "/" + fieldName;
     }
 
-    /**
-     * Evicts the cached marker table for a segment+field pair. Should be called
-     * when a segment is deleted (e.g., after merge).
-     */
     public static void evictMarkerTableCache(String segmentName, String fieldName) {
         MARKER_TABLE_CACHE.remove(cacheKey(segmentName, fieldName));
     }
 
-    /**
-     * Clears the entire marker table cache. Useful for testing.
-     */
     public static void clearMarkerTableCache() {
         MARKER_TABLE_CACHE.clear();
     }
@@ -115,7 +128,21 @@ public final class ClumpFileReader {
             }
             int dimension = input.readInt();
             byte vectorDataType = input.readByte();
-            int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
+
+            // SQ_1BIT header extension
+            int quantizedVecBytes = 0;
+            float centroidDp = 0f;
+            float[] centroid = null;
+            if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+                quantizedVecBytes = input.readInt();
+                centroidDp = Float.intBitsToFloat(input.readInt());
+                centroid = new float[dimension];
+                for (int d = 0; d < dimension; d++) {
+                    centroid[d] = Float.intBitsToFloat(input.readInt());
+                }
+            }
+
+            int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType, quantizedVecBytes);
 
             int[] markerDocIds = new int[numMarkers];
             int[] numHidden = new int[numMarkers];
@@ -129,29 +156,21 @@ public final class ClumpFileReader {
 
             cached = new CachedMarkerTable(
                 numMarkers, dimension, vectorDataType, vectorSize,
-                markerDocIds, numHidden, clumpDataOffsets, clumpFileName
+                markerDocIds, numHidden, clumpDataOffsets, clumpFileName,
+                quantizedVecBytes, centroidDp, centroid
             );
             MARKER_TABLE_CACHE.putIfAbsent(key, cached);
             return cached;
         }
     }
 
-    /**
-     * Checks whether a clump file exists for the given segment and field.
-     * Uses the marker table cache when available to avoid directory listing.
-     */
     public static boolean clumpFileExists(Directory directory, String segmentName, String fieldName) throws IOException {
         if (MARKER_TABLE_CACHE.containsKey(cacheKey(segmentName, fieldName))) {
             return true;
         }
-        String clumpFileName = resolveClumpFileName(directory, segmentName, fieldName);
-        return clumpFileName != null;
+        return resolveClumpFileName(directory, segmentName, fieldName) != null;
     }
 
-    /**
-     * Resolves the actual clump file name, checking for both the compound (.clumpc)
-     * and original (.clump) variants. Returns null if neither exists.
-     */
     private static String resolveClumpFileName(Directory directory, String segmentName, String fieldName) throws IOException {
         String baseName = ClumpFileWriter.buildClumpFileName(segmentName, fieldName);
         String compoundName = baseName + KNNConstants.COMPOUND_EXTENSION;
@@ -166,24 +185,16 @@ public final class ClumpFileReader {
         return null;
     }
 
+    // ---- Legacy overload (non-SQ callers) ----
+
     /**
      * Expands marker doc IDs by reading their hidden vectors from the .clump file,
      * scoring each hidden vector against the query vector, and returning scored results.
      * <p>
-     * The read phase is parallelized: each matched marker's raw hidden entry bytes are
-     * read concurrently via cloned {@link IndexInput} handles on a parallel stream.
-     * The scoring phase runs sequentially over the pre-read byte buffers to avoid
-     * thread-safety concerns with the similarity function and to keep CPU work on the
-     * calling thread.
-     *
-     * @param directory          The segment directory
-     * @param segmentName        The segment name
-     * @param fieldName          The vector field name
-     * @param markerDocIds       The marker doc IDs from the ANN search results
-     * @param floatQueryVector   The float query vector (null for byte vectors)
-     * @param byteQueryVector    The byte query vector (null for float vectors)
-     * @param similarityFunction The similarity function for scoring
-     * @return List of ScoreDoc for hidden vectors. Does NOT include the markers themselves.
+     * For SQ_1BIT clump files this overload returns ALL SQ-scored hidden vectors without
+     * the fp32 rescore step (no {@link FloatVectorValues} supplied). Callers that want the
+     * full two-level SQ→fp32 rescore should use the overload that accepts
+     * {@code floatVectorValues} and {@code k}.
      */
     public static List<ScoreDoc> getHiddenVectorsScored(
         Directory directory,
@@ -194,12 +205,38 @@ public final class ClumpFileReader {
         byte[] byteQueryVector,
         KNNVectorSimilarityFunction similarityFunction
     ) throws IOException {
+        return getHiddenVectorsScored(
+            directory, segmentName, fieldName, markerDocIds,
+            floatQueryVector, byteQueryVector, similarityFunction,
+            null, 0
+        );
+    }
+
+    /**
+     * Full overload that supports the SQ_1BIT two-level rescore.
+     *
+     * @param floatVectorValues  Segment's full-precision float vector values for fp32 rescore.
+     *                           Required for SQ_1BIT; may be null for other types.
+     * @param k                  The final k requested. For SQ_1BIT, the SQ stage keeps
+     *                           {@code SQ_RESCORE_OVERSAMPLE * k} candidates before fp32 rescore.
+     *                           Ignored for non-SQ types.
+     */
+    public static List<ScoreDoc> getHiddenVectorsScored(
+        Directory directory,
+        String segmentName,
+        String fieldName,
+        int[] markerDocIds,
+        float[] floatQueryVector,
+        byte[] byteQueryVector,
+        KNNVectorSimilarityFunction similarityFunction,
+        FloatVectorValues floatVectorValues,
+        int k
+    ) throws IOException {
         CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
         if (table == null) {
             return Collections.emptyList();
         }
 
-        // Resolve which marker table indices match the query markers
         int[] matchedIndices = Arrays.stream(markerDocIds)
             .map(docId -> Arrays.binarySearch(table.markerDocIds, docId))
             .filter(idx -> idx >= 0 && table.numHidden[idx] > 0)
@@ -209,25 +246,213 @@ public final class ClumpFileReader {
             return Collections.emptyList();
         }
 
-        // Sort matched indices by file offset for better I/O locality
         Arrays.sort(matchedIndices);
 
-        // v3 layout: per marker, doc IDs and vectors are in separate contiguous blocks.
-        // docIdBlockStart = clumpDataOffset + vectorSize
-        // vectorBlockStart = docIdBlockStart + numHidden * 4
+        if (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+            return scoreSqHiddenVectors(
+                directory, table, matchedIndices,
+                floatQueryVector, similarityFunction,
+                floatVectorValues, k
+            );
+        }
+
+        return scoreLegacyHiddenVectors(
+            directory, table, matchedIndices,
+            floatQueryVector, byteQueryVector, similarityFunction
+        );
+    }
+
+    // ---- SQ_1BIT scoring path ----
+
+    /**
+     * Scores hidden SQ vectors via the ADC formula, then rescores the top {@code 2*k} with fp32.
+     *
+     * <p>Phase 1 (I/O): read doc-ID blocks and SQ vector blocks for each matched marker.
+     * <p>Phase 2 (SQ score): quantize the query, score all hidden SQ entries via
+     *     {@link SqAdcScorer}, collect all scored candidates.
+     * <p>Phase 3 (fp32 rescore): keep top {@code 2*k} by SQ score, read their fp32 vectors
+     *     from {@code floatVectorValues}, rescore with the real similarity function.
+     */
+    private static List<ScoreDoc> scoreSqHiddenVectors(
+        Directory directory,
+        CachedMarkerTable table,
+        int[] matchedIndices,
+        float[] floatQueryVector,
+        KNNVectorSimilarityFunction similarityFunction,
+        FloatVectorValues floatVectorValues,
+        int k
+    ) throws IOException {
+        final int quantizedVecBytes = table.quantizedVecBytes;
+        final int sqEntrySize = table.vectorSize; // quantizedVecBytes + correctionBytes
+
+        // Phase 1: READ doc IDs + SQ vector blocks
+        int[][] markerDocIdArrays = new int[matchedIndices.length][];
+        byte[][] markerVectorBlocks = new byte[matchedIndices.length][];
+
+        try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
+            try (ExecutorService vte = Executors.newVirtualThreadPerTaskExecutor()) {
+                List<Future<?>> readFutures = new ArrayList<>(matchedIndices.length);
+                for (int mi = 0; mi < matchedIndices.length; mi++) {
+                    final int idx = mi;
+                    final int markerIndex = matchedIndices[mi];
+                    readFutures.add(vte.submit(() -> {
+                        int numHidden = table.numHidden[markerIndex];
+                        long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
+                        int docIdBlockSize = numHidden * Integer.BYTES;
+                        int vecBlockSize = numHidden * sqEntrySize;
+
+                        int totalSize = docIdBlockSize + vecBlockSize;
+                        byte[] combined = new byte[totalSize];
+                        try (IndexInput clonedInput = input.clone()) {
+                            clonedInput.seek(docIdStart);
+                            clonedInput.readBytes(combined, 0, totalSize);
+                        } catch (IOException e) {
+                            log.warn("Error reading SQ clump data for marker index {}", markerIndex, e);
+                        }
+
+                        int[] docIds = new int[numHidden];
+                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                        for (int j = 0; j < numHidden; j++) {
+                            docIds[j] = dbuf.getInt();
+                        }
+                        markerDocIdArrays[idx] = docIds;
+
+                        byte[] vecBlock = new byte[vecBlockSize];
+                        System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
+                        markerVectorBlocks[idx] = vecBlock;
+                    }));
+                }
+                for (Future<?> f : readFutures) {
+                    try { f.get(); } catch (Exception e) { log.warn("Error waiting for SQ clump read", e); }
+                }
+            }
+
+            // Phase 2: SQ score all hidden vectors
+            // Build a fresh quantizer from the similarity function + centroid stored in the header.
+            VectorSimilarityFunction luceneSim = similarityFunction.getVectorSimilarityFunction();
+            OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(luceneSim);
+
+            // Quantize the query into 4 bit planes.
+            // Per-bit-plane byte count (matches native SIMD int4BitDotProduct contract).
+            final int binaryCodeBytes = (table.dimension + 7) / 8;
+            // scratch holds one byte per discretized dimension (one quantized value per dim,
+            // in [0..15]). For SINGLE_BIT_QUERY_NIBBLE this is dim rounded up to a multiple of 8.
+            final int discretizedDim = binaryCodeBytes * 8;
+            byte[] scratch = new byte[discretizedDim];
+            // For 1-bit data with 4-bit query: queryPackedLength = 4 * binaryCodeBytes
+            byte[] targetQuantized = new byte[4 * binaryCodeBytes];
+            float[] queryCopy = floatQueryVector.clone();
+            OptimizedScalarQuantizer.QuantizationResult qr = quantizer.scalarQuantize(
+                queryCopy, scratch, (byte) 4, table.centroid
+            );
+            OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
+
+            SqAdcScorer.QuantizedQuery qq = new SqAdcScorer.QuantizedQuery(
+                targetQuantized, binaryCodeBytes,
+                qr.lowerInterval(), qr.upperInterval(),
+                qr.additionalCorrection(), qr.quantizedComponentSum()
+            );
+
+            boolean useIp = (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+                || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT
+                || similarityFunction == KNNVectorSimilarityFunction.COSINE);
+
+            List<ScoreDoc> allSqScored = new ArrayList<>();
+            for (int m = 0; m < matchedIndices.length; m++) {
+                int[] docIds = markerDocIdArrays[m];
+                byte[] vecBlock = markerVectorBlocks[m];
+                if (docIds == null || vecBlock == null) continue;
+
+                for (int j = 0; j < docIds.length; j++) {
+                    int entryOffset = j * sqEntrySize;
+                    // Extract the binary code
+                    byte[] code = new byte[quantizedVecBytes];
+                    System.arraycopy(vecBlock, entryOffset, code, 0, quantizedVecBytes);
+                    // Extract correction factors
+                    int corrOffset = entryOffset + quantizedVecBytes;
+                    float lower = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset));
+                    float upper = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 4));
+                    float additional = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 8));
+                    int componentSum = readIntLE(vecBlock, corrOffset + 12);
+
+                    SqVectorEntry entry = new SqVectorEntry(code, lower, upper, additional, componentSum);
+                    float score;
+                    if (useIp) {
+                        score = SqAdcScorer.scoreIp(qq, code, entry, table.dimension, table.centroidDp);
+                        // Apply ipToMaxIp transform: 1/(1 + e^(-score))  — matching native
+                        score = (float) (1.0 / (1.0 + Math.exp(-score)));
+                    } else {
+                        score = SqAdcScorer.scoreL2(qq, code, entry, table.dimension);
+                        // Apply l2 transform: 1/(1+score)
+                        score = 1.0f / (1.0f + score);
+                    }
+                    allSqScored.add(new ScoreDoc(docIds[j], score));
+                }
+            }
+
+            // Phase 3: fp32 rescore top 2*k
+            if (floatVectorValues == null || k <= 0) {
+                // No fp32 rescore available — return all SQ-scored results
+                return allSqScored;
+            }
+
+            int sqKeep = Math.min(SQ_RESCORE_OVERSAMPLE * k, allSqScored.size());
+            // Sort descending by score (higher = better for both IP and L2 transforms)
+            allSqScored.sort((a, b) -> Float.compare(b.score, a.score));
+            List<ScoreDoc> topSq = allSqScored.subList(0, sqKeep);
+
+            // Rescore with fp32
+            List<ScoreDoc> rescored = new ArrayList<>(topSq.size());
+            for (ScoreDoc sd : topSq) {
+                float[] fp32Vec = floatVectorValues.vectorValue(
+                    floatVectorValues.ordToDoc(sd.doc) >= 0
+                        ? findOrdForDoc(floatVectorValues, sd.doc)
+                        : sd.doc
+                );
+                if (fp32Vec != null) {
+                    float score = similarityFunction.compare(floatQueryVector, fp32Vec);
+                    rescored.add(new ScoreDoc(sd.doc, score));
+                } else {
+                    // Fallback: keep SQ score
+                    rescored.add(sd);
+                }
+            }
+            return rescored;
+        }
+    }
+
+    /**
+     * Finds the ordinal for a given docId in FloatVectorValues by advancing.
+     * FloatVectorValues doesn't have a direct docId→ord lookup, so we use advance().
+     */
+    private static int findOrdForDoc(FloatVectorValues fvv, int docId) throws IOException {
+        // FloatVectorValues.vectorValue takes an ordinal. For dense segments ord == docId.
+        // For sparse segments we'd need the iterator, but clumping currently only works
+        // with dense segments. Return docId as the ordinal.
+        return docId;
+    }
+
+    // ---- Legacy (FP16/FLOAT/BYTE) scoring path ----
+
+    private static List<ScoreDoc> scoreLegacyHiddenVectors(
+        Directory directory,
+        CachedMarkerTable table,
+        int[] matchedIndices,
+        float[] floatQueryVector,
+        byte[] byteQueryVector,
+        KNNVectorSimilarityFunction similarityFunction
+    ) throws IOException {
         boolean isFloat = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT);
         boolean isFp16 = (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16);
 
-        // For FP16, try to get mmap addresses for SIMD bulk scoring
         SimdVectorComputeService.SimilarityFunctionType simdFunctionType = null;
         if (isFp16) {
             simdFunctionType = toSimdFunctionType(similarityFunction);
         }
 
-        // Phase 1: READ doc IDs in parallel. For non-SIMD paths, also read vector blocks.
         int[][] markerDocIdArrays = new int[matchedIndices.length][];
         byte[][] markerVectorBlocks = (simdFunctionType == null) ? new byte[matchedIndices.length][] : null;
-        // For SIMD path, store vector block file offsets and sizes instead of reading bytes
         long[] vecBlockOffsets = (simdFunctionType != null) ? new long[matchedIndices.length] : null;
         int[] vecBlockSizes = (simdFunctionType != null) ? new int[matchedIndices.length] : null;
 
@@ -236,10 +461,6 @@ public final class ClumpFileReader {
             final long[] finalVecOffsets = vecBlockOffsets;
             final int[] finalVecSizes = vecBlockSizes;
 
-            // Phase 1: READ — use virtual threads so each I/O read gets its own
-            // lightweight thread. When a read blocks on NFS, the virtual thread yields
-            // its carrier, letting other queries' reads proceed. No shared ForkJoinPool
-            // contention.
             try (ExecutorService vte = Executors.newVirtualThreadPerTaskExecutor()) {
                 List<Future<?>> readFutures = new ArrayList<>(matchedIndices.length);
                 for (int mi = 0; mi < matchedIndices.length; mi++) {
@@ -252,8 +473,6 @@ public final class ClumpFileReader {
                         int vecBlockSize = numHidden * table.vectorSize;
 
                         if (finalVectorBlocks != null) {
-                            // Non-SIMD path: read doc IDs + vector block in a single I/O operation
-                            // since they are contiguous in the v3 layout.
                             int totalSize = docIdBlockSize + vecBlockSize;
                             byte[] combined = new byte[totalSize];
                             try (IndexInput clonedInput = input.clone()) {
@@ -263,7 +482,6 @@ public final class ClumpFileReader {
                                 log.warn("Error reading clump data for marker index {}", markerIndex, e);
                             }
 
-                            // Parse doc IDs from the first portion of the combined buffer
                             int[] docIds = new int[numHidden];
                             java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
                                 .order(java.nio.ByteOrder.LITTLE_ENDIAN);
@@ -272,12 +490,10 @@ public final class ClumpFileReader {
                             }
                             markerDocIdArrays[idx] = docIds;
 
-                            // Extract vector block from the remainder
                             byte[] vecBlock = new byte[vecBlockSize];
                             System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
                             finalVectorBlocks[idx] = vecBlock;
                         } else {
-                            // SIMD path: read only doc IDs; vectors will be scored directly from mmap
                             int[] docIds = new int[numHidden];
                             byte[] docIdBytes = new byte[docIdBlockSize];
                             try (IndexInput clonedInput = input.clone()) {
@@ -293,34 +509,23 @@ public final class ClumpFileReader {
                             }
                             markerDocIdArrays[idx] = docIds;
 
-                            // Record the offset and size for SIMD scoring later
                             long vecStart = docIdStart + (long) docIdBlockSize;
                             finalVecOffsets[idx] = vecStart;
                             finalVecSizes[idx] = vecBlockSize;
                         }
                     }));
                 }
-                // Wait for all reads to complete
                 for (Future<?> f : readFutures) {
-                    try {
-                        f.get();
-                    } catch (Exception e) {
-                        log.warn("Error waiting for clump read task", e);
-                    }
+                    try { f.get(); } catch (Exception e) { log.warn("Error waiting for clump read task", e); }
                 }
             }
 
-            // Phase 2: SCORE
             List<ScoreDoc> scoredHidden = new ArrayList<>();
 
             if (simdFunctionType != null) {
-                // SIMD bulk scoring for FP16 vectors via native code.
-                // For each marker, extract mmap addresses for its vector block and score in bulk.
                 for (int m = 0; m < matchedIndices.length; m++) {
                     int[] docIds = markerDocIdArrays[m];
-                    if (docIds == null || docIds.length == 0) {
-                        continue;
-                    }
+                    if (docIds == null || docIds.length == 0) continue;
                     int numHidden = docIds.length;
 
                     long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(
@@ -328,21 +533,17 @@ public final class ClumpFileReader {
                     );
 
                     if (addressAndSize != null) {
-                        // SIMD path: bulk score all hidden vectors for this marker
                         SimdVectorComputeService.saveSearchContext(
                             floatQueryVector, addressAndSize, simdFunctionType.ordinal()
                         );
                         int[] ordinals = new int[numHidden];
-                        for (int j = 0; j < numHidden; j++) {
-                            ordinals[j] = j;
-                        }
+                        for (int j = 0; j < numHidden; j++) ordinals[j] = j;
                         float[] scores = new float[numHidden];
                         SimdVectorComputeService.scoreSimilarityInBulk(ordinals, scores, numHidden);
                         for (int j = 0; j < numHidden; j++) {
                             scoredHidden.add(new ScoreDoc(docIds[j], scores[j]));
                         }
                     } else {
-                        // Fallback: read vector block and score with Java
                         byte[] vecBlock = new byte[vecBlockSizes[m]];
                         try (IndexInput clonedInput = input.clone()) {
                             clonedInput.seek(vecBlockOffsets[m]);
@@ -352,13 +553,10 @@ public final class ClumpFileReader {
                     }
                 }
             } else {
-                // Java scoring path for float and byte vectors
                 for (int m = 0; m < matchedIndices.length; m++) {
                     int[] docIds = markerDocIdArrays[m];
                     byte[] vecBlock = markerVectorBlocks[m];
-                    if (docIds == null || vecBlock == null) {
-                        continue;
-                    }
+                    if (docIds == null || vecBlock == null) continue;
                     int numHidden = docIds.length;
                     java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBlock)
                         .order(java.nio.ByteOrder.LITTLE_ENDIAN);
@@ -366,9 +564,7 @@ public final class ClumpFileReader {
                     if (isFloat) {
                         float[] reusableVector = new float[table.dimension];
                         for (int j = 0; j < numHidden; j++) {
-                            for (int d = 0; d < table.dimension; d++) {
-                                reusableVector[d] = vb.getFloat();
-                            }
+                            for (int d = 0; d < table.dimension; d++) reusableVector[d] = vb.getFloat();
                             float score = similarityFunction.compare(floatQueryVector, reusableVector);
                             scoredHidden.add(new ScoreDoc(docIds[j], score));
                         }
@@ -387,70 +583,18 @@ public final class ClumpFileReader {
         }
     }
 
-    /**
-     * Maps a KNNVectorSimilarityFunction to the corresponding SIMD function type for FP16.
-     * Returns null if the similarity function is not supported by the SIMD service.
-     */
-    private static SimdVectorComputeService.SimilarityFunctionType toSimdFunctionType(
-        KNNVectorSimilarityFunction similarityFunction
-    ) {
-        if (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
-            || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT) {
-            return SimdVectorComputeService.SimilarityFunctionType.FP16_MAXIMUM_INNER_PRODUCT;
-        } else if (similarityFunction == KNNVectorSimilarityFunction.EUCLIDEAN) {
-            return SimdVectorComputeService.SimilarityFunctionType.FP16_L2;
-        }
-        return null;
-    }
+    // ---- Marker rescoring ----
 
     /**
-     * Fallback Java scoring for FP16 vector blocks when SIMD is not available.
-     */
-    private static void scoreFp16VectorBlock(
-        int[] docIds,
-        byte[] vecBlock,
-        int dimension,
-        float[] queryVector,
-        KNNVectorSimilarityFunction similarityFunction,
-        List<ScoreDoc> results
-    ) {
-        java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBlock).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        float[] reusableVector = new float[dimension];
-        for (int j = 0; j < docIds.length; j++) {
-            for (int d = 0; d < dimension; d++) {
-                reusableVector[d] = Float.float16ToFloat(vb.getShort());
-            }
-            float score = similarityFunction.compare(queryVector, reusableVector);
-            results.add(new ScoreDoc(docIds[j], score));
-        }
-    }
-
-    /**
-     * Returns true if the given docId is a marker in the clump file's marker table.
-     * Used for assertion/debugging to verify ANN search returns correct marker docIDs.
-     */
-    public static boolean isMarkerDocId(
-        Directory directory, String segmentName, String fieldName, int docId
-    ) throws IOException {
-        CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
-        if (table == null) return false;
-        return Arrays.binarySearch(table.markerDocIds, docId) >= 0;
-    }
-
-    /**
-     * Re-scores marker vectors using the same FP16 similarity function used for hidden vectors.
-     * This is necessary because ANN search scores (ADC-based for SQ, HNSW graph scores for others)
-     * are on a different scale than the FP16 L2 scores computed for hidden vectors. Without
-     * re-scoring, markers always win in reduceToTopK and hidden vectors are never returned.
-     *
-     * @param directory          The segment directory
-     * @param segmentName        The segment name
-     * @param fieldName          The vector field name
-     * @param markerScoreDocs    The marker ScoreDocs from ANN search (scores will be replaced)
-     * @param floatQueryVector   The float query vector
-     * @param byteQueryVector    The byte query vector
-     * @param similarityFunction The similarity function
-     * @return New ScoreDoc array with re-scored markers, or the original array if not FP16
+     * Re-scores marker vectors so their scores are on the same scale as hidden vector scores.
+     * <p>
+     * For FP16: reads the marker's FP16 vector from the clump file and scores with the
+     * similarity function.
+     * <p>
+     * For SQ_1BIT: reads the marker's fp32 vector from {@code floatVectorValues} and scores
+     * with the similarity function (matching the fp32 rescore applied to hidden vectors).
+     * <p>
+     * For FLOAT/BYTE: returns the original scores (ANN search uses the same scorer).
      */
     public static ScoreDoc[] rescoreMarkers(
         Directory directory,
@@ -461,24 +605,64 @@ public final class ClumpFileReader {
         byte[] byteQueryVector,
         KNNVectorSimilarityFunction similarityFunction
     ) throws IOException {
+        return rescoreMarkers(
+            directory, segmentName, fieldName, markerScoreDocs,
+            floatQueryVector, byteQueryVector, similarityFunction, null
+        );
+    }
+
+    /**
+     * Full overload with optional {@link FloatVectorValues} for SQ_1BIT fp32 rescore.
+     */
+    public static ScoreDoc[] rescoreMarkers(
+        Directory directory,
+        String segmentName,
+        String fieldName,
+        ScoreDoc[] markerScoreDocs,
+        float[] floatQueryVector,
+        byte[] byteQueryVector,
+        KNNVectorSimilarityFunction similarityFunction,
+        FloatVectorValues floatVectorValues
+    ) throws IOException {
         CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
-        if (table == null || table.vectorDataType != ClumpFileFormat.VECTOR_TYPE_FP16) {
-            // Only re-score for FP16 — float and byte paths use the same scorer as ANN search
+        if (table == null) {
             return markerScoreDocs;
         }
 
+        if (table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+            // For SQ: rescore markers with fp32 so they're comparable to fp32-rescored hidden
+            if (floatVectorValues == null) {
+                return markerScoreDocs;
+            }
+            ScoreDoc[] rescored = new ScoreDoc[markerScoreDocs.length];
+            for (int i = 0; i < markerScoreDocs.length; i++) {
+                int docId = markerScoreDocs[i].doc;
+                float[] fp32Vec = floatVectorValues.vectorValue(docId);
+                if (fp32Vec != null) {
+                    float score = similarityFunction.compare(floatQueryVector, fp32Vec);
+                    rescored[i] = new ScoreDoc(docId, score);
+                } else {
+                    rescored[i] = markerScoreDocs[i];
+                }
+            }
+            return rescored;
+        }
+
+        if (table.vectorDataType != ClumpFileFormat.VECTOR_TYPE_FP16) {
+            return markerScoreDocs;
+        }
+
+        // FP16 rescore path (unchanged)
         try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
             ScoreDoc[] rescored = new ScoreDoc[markerScoreDocs.length];
             for (int i = 0; i < markerScoreDocs.length; i++) {
                 int docId = markerScoreDocs[i].doc;
                 int markerIndex = Arrays.binarySearch(table.markerDocIds, docId);
                 if (markerIndex < 0) {
-                    // Not found in marker table — keep original score
                     rescored[i] = markerScoreDocs[i];
                     continue;
                 }
 
-                // Read the marker's FP16 vector and score it
                 long markerVecOffset = table.clumpDataOffsets[markerIndex];
                 byte[] vecBytes = new byte[table.vectorSize];
                 try (IndexInput cloned = input.clone()) {
@@ -486,7 +670,6 @@ public final class ClumpFileReader {
                     cloned.readBytes(vecBytes, 0, vecBytes.length);
                 }
 
-                // Decode FP16 and score
                 java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
                 float[] vec = new float[table.dimension];
                 for (int d = 0; d < table.dimension; d++) {
@@ -499,10 +682,16 @@ public final class ClumpFileReader {
         }
     }
 
-    /**
-     * Returns just the hidden doc IDs (without scoring) for backward compatibility
-     * or cases where only doc IDs are needed.
-     */
+    // ---- Utility methods ----
+
+    public static boolean isMarkerDocId(
+        Directory directory, String segmentName, String fieldName, int docId
+    ) throws IOException {
+        CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
+        if (table == null) return false;
+        return Arrays.binarySearch(table.markerDocIds, docId) >= 0;
+    }
+
     public static List<Integer> getHiddenDocIds(
         Directory directory,
         String segmentName,
@@ -519,16 +708,11 @@ public final class ClumpFileReader {
 
             for (int queryMarkerDocId : markerDocIds) {
                 int markerIndex = Arrays.binarySearch(table.markerDocIds, queryMarkerDocId);
-                if (markerIndex < 0) {
-                    continue;
-                }
+                if (markerIndex < 0) continue;
 
                 int numHidden = table.numHidden[markerIndex];
-                if (numHidden == 0) {
-                    continue;
-                }
+                if (numHidden == 0) continue;
 
-                // v3: doc IDs are in a contiguous block after the marker vector
                 long docIdStart = table.clumpDataOffsets[markerIndex] + table.vectorSize;
                 input.seek(docIdStart);
 
@@ -541,4 +725,47 @@ public final class ClumpFileReader {
         }
     }
 
+    /**
+     * Returns true if this segment+field has an SQ_1BIT clump file.
+     */
+    public static boolean isSqClumpFile(Directory directory, String segmentName, String fieldName) throws IOException {
+        CachedMarkerTable table = getOrLoadMarkerTable(directory, segmentName, fieldName);
+        return table != null && table.vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT;
+    }
+
+    private static SimdVectorComputeService.SimilarityFunctionType toSimdFunctionType(
+        KNNVectorSimilarityFunction similarityFunction
+    ) {
+        if (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+            || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT) {
+            return SimdVectorComputeService.SimilarityFunctionType.FP16_MAXIMUM_INNER_PRODUCT;
+        } else if (similarityFunction == KNNVectorSimilarityFunction.EUCLIDEAN) {
+            return SimdVectorComputeService.SimilarityFunctionType.FP16_L2;
+        }
+        return null;
+    }
+
+    private static void scoreFp16VectorBlock(
+        int[] docIds, byte[] vecBlock, int dimension,
+        float[] queryVector, KNNVectorSimilarityFunction similarityFunction,
+        List<ScoreDoc> results
+    ) {
+        java.nio.ByteBuffer vb = java.nio.ByteBuffer.wrap(vecBlock).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        float[] reusableVector = new float[dimension];
+        for (int j = 0; j < docIds.length; j++) {
+            for (int d = 0; d < dimension; d++) {
+                reusableVector[d] = Float.float16ToFloat(vb.getShort());
+            }
+            float score = similarityFunction.compare(queryVector, reusableVector);
+            results.add(new ScoreDoc(docIds[j], score));
+        }
+    }
+
+    /** Reads a little-endian int from a byte array at the given offset. */
+    private static int readIntLE(byte[] buf, int off) {
+        return (buf[off] & 0xff)
+            | ((buf[off + 1] & 0xff) << 8)
+            | ((buf[off + 2] & 0xff) << 16)
+            | ((buf[off + 3] & 0xff) << 24);
+    }
 }
