@@ -267,11 +267,23 @@ public final class ClumpFileReader {
     /**
      * Scores hidden SQ vectors via the ADC formula, then rescores the top {@code 2*k} with fp32.
      *
-     * <p>Phase 1 (I/O): read doc-ID blocks and SQ vector blocks for each matched marker.
-     * <p>Phase 2 (SQ score): quantize the query, score all hidden SQ entries via
-     *     {@link SqAdcScorer}, collect all scored candidates.
-     * <p>Phase 3 (fp32 rescore): keep top {@code 2*k} by SQ score, read their fp32 vectors
-     *     from {@code floatVectorValues}, rescore with the real similarity function.
+     * <p>Phase 1 (I/O): read doc-ID blocks for each matched marker and stash the file offset/
+     *     size of its SQ vector block. Vector bytes are NOT eagerly read — when the directory is
+     *     mmap-backed, the native SIMD path reads them directly from mapped memory.
+     * <p>Phase 2 (SIMD-first SQ score): extract the mmap address for each matched marker's
+     *     SQ vector block via {@link MemorySegmentAddressExtractorUtil}, set up the native SQ
+     *     search context via
+     *     {@link SimdVectorComputeService#saveSQSearchContext}, and bulk-score via
+     *     {@link SimdVectorComputeService#scoreSimilarityInBulk}. If mmap extraction fails,
+     *     falls back to a pure-Java path using {@link SqAdcScorer} — same formula, no SIMD.
+     * <p>Phase 3 (fp32 rescore): keep top {@code SQ_RESCORE_OVERSAMPLE * k} by SQ score, read
+     *     their fp32 vectors from {@code floatVectorValues}, rescore with the real similarity
+     *     function.
+     *
+     * <p>The exact per-vector byte layout written by
+     * {@link ClumpFileWriter#writeClumpFileSq} ({@code [binaryCode][lower][upper][additional][componentSum]},
+     * each correction factor in little-endian) matches the on-disk layout the native SIMD SQ
+     * context expects, so no data marshalling is needed at query time.
      */
     private static List<ScoreDoc> scoreSqHiddenVectors(
         Directory directory,
@@ -282,12 +294,13 @@ public final class ClumpFileReader {
         FloatVectorValues floatVectorValues,
         int k
     ) throws IOException {
-        final int quantizedVecBytes = table.quantizedVecBytes;
-        final int sqEntrySize = table.vectorSize; // quantizedVecBytes + correctionBytes
+        final int sqEntrySize = table.vectorSize; // quantizedVecBytes + 16
 
-        // Phase 1: READ doc IDs + SQ vector blocks
+        // Phase 1: READ doc IDs in parallel. Capture vector-block file offsets + sizes so the
+        // SIMD path can mmap them; only materialise bytes for the Java fallback path.
         int[][] markerDocIdArrays = new int[matchedIndices.length][];
-        byte[][] markerVectorBlocks = new byte[matchedIndices.length][];
+        long[] vecBlockOffsets = new long[matchedIndices.length];
+        int[] vecBlockSizes = new int[matchedIndices.length];
 
         try (IndexInput input = directory.openInput(table.clumpFileName, IOContext.DEFAULT)) {
             try (ExecutorService vte = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -301,26 +314,23 @@ public final class ClumpFileReader {
                         int docIdBlockSize = numHidden * Integer.BYTES;
                         int vecBlockSize = numHidden * sqEntrySize;
 
-                        int totalSize = docIdBlockSize + vecBlockSize;
-                        byte[] combined = new byte[totalSize];
+                        // Read only the doc-ID block; leave vectors on disk for mmap.
+                        byte[] docIdBytes = new byte[docIdBlockSize];
                         try (IndexInput clonedInput = input.clone()) {
                             clonedInput.seek(docIdStart);
-                            clonedInput.readBytes(combined, 0, totalSize);
+                            clonedInput.readBytes(docIdBytes, 0, docIdBytes.length);
                         } catch (IOException e) {
-                            log.warn("Error reading SQ clump data for marker index {}", markerIndex, e);
+                            log.warn("Error reading SQ doc-IDs for marker index {}", markerIndex, e);
                         }
-
                         int[] docIds = new int[numHidden];
-                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(combined, 0, docIdBlockSize)
+                        java.nio.ByteBuffer dbuf = java.nio.ByteBuffer.wrap(docIdBytes)
                             .order(java.nio.ByteOrder.LITTLE_ENDIAN);
                         for (int j = 0; j < numHidden; j++) {
                             docIds[j] = dbuf.getInt();
                         }
                         markerDocIdArrays[idx] = docIds;
-
-                        byte[] vecBlock = new byte[vecBlockSize];
-                        System.arraycopy(combined, docIdBlockSize, vecBlock, 0, vecBlockSize);
-                        markerVectorBlocks[idx] = vecBlock;
+                        vecBlockOffsets[idx] = docIdStart + (long) docIdBlockSize;
+                        vecBlockSizes[idx] = vecBlockSize;
                     }));
                 }
                 for (Future<?> f : readFutures) {
@@ -328,94 +338,72 @@ public final class ClumpFileReader {
                 }
             }
 
-            // Phase 2: SQ score all hidden vectors
-            // Build a fresh quantizer from the similarity function + centroid stored in the header.
-            VectorSimilarityFunction luceneSim = similarityFunction.getVectorSimilarityFunction();
-            OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(luceneSim);
-
-            // Quantize the query into 4 bit planes.
-            // Per-bit-plane byte count (matches native SIMD int4BitDotProduct contract).
-            final int binaryCodeBytes = (table.dimension + 7) / 8;
-            // scratch holds one byte per discretized dimension (one quantized value per dim,
-            // in [0..15]). For SINGLE_BIT_QUERY_NIBBLE this is dim rounded up to a multiple of 8.
-            final int discretizedDim = binaryCodeBytes * 8;
-            byte[] scratch = new byte[discretizedDim];
-            // For 1-bit data with 4-bit query: queryPackedLength = 4 * binaryCodeBytes
-            byte[] targetQuantized = new byte[4 * binaryCodeBytes];
-            float[] queryCopy = floatQueryVector.clone();
-            OptimizedScalarQuantizer.QuantizationResult qr = quantizer.scalarQuantize(
-                queryCopy, scratch, (byte) 4, table.centroid
-            );
-            OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
-
-            SqAdcScorer.QuantizedQuery qq = new SqAdcScorer.QuantizedQuery(
-                targetQuantized, binaryCodeBytes,
-                qr.lowerInterval(), qr.upperInterval(),
-                qr.additionalCorrection(), qr.quantizedComponentSum()
-            );
-
-            boolean useIp = (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
-                || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT
-                || similarityFunction == KNNVectorSimilarityFunction.COSINE);
+            // Phase 2: SQ score. Quantize the query once, then try the SIMD bulk path per marker
+            // and fall back to Java when mmap extraction fails.
+            final SqQueryContext qc = quantizeSqQuery(floatQueryVector, table, similarityFunction);
 
             List<ScoreDoc> allSqScored = new ArrayList<>();
             for (int m = 0; m < matchedIndices.length; m++) {
                 int[] docIds = markerDocIdArrays[m];
-                byte[] vecBlock = markerVectorBlocks[m];
-                if (docIds == null || vecBlock == null) continue;
+                if (docIds == null || docIds.length == 0) continue;
+                int numHidden = docIds.length;
 
-                for (int j = 0; j < docIds.length; j++) {
-                    int entryOffset = j * sqEntrySize;
-                    // Extract the binary code
-                    byte[] code = new byte[quantizedVecBytes];
-                    System.arraycopy(vecBlock, entryOffset, code, 0, quantizedVecBytes);
-                    // Extract correction factors
-                    int corrOffset = entryOffset + quantizedVecBytes;
-                    float lower = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset));
-                    float upper = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 4));
-                    float additional = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 8));
-                    int componentSum = readIntLE(vecBlock, corrOffset + 12);
+                long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(
+                    input, vecBlockOffsets[m], vecBlockSizes[m]
+                );
 
-                    SqVectorEntry entry = new SqVectorEntry(code, lower, upper, additional, componentSum);
-                    float score;
-                    if (useIp) {
-                        score = SqAdcScorer.scoreIp(qq, code, entry, table.dimension, table.centroidDp);
-                        // Apply ipToMaxIp transform: 1/(1 + e^(-score))  — matching native
-                        score = (float) (1.0 / (1.0 + Math.exp(-score)));
-                    } else {
-                        score = SqAdcScorer.scoreL2(qq, code, entry, table.dimension);
-                        // Apply l2 transform: 1/(1+score)
-                        score = 1.0f / (1.0f + score);
+                if (addressAndSize != null) {
+                    // SIMD path: score the whole block at once via native ADC.
+                    SimdVectorComputeService.saveSQSearchContext(
+                        qc.targetQuantized,
+                        qc.quantResult.lowerInterval(),
+                        qc.quantResult.upperInterval(),
+                        qc.quantResult.additionalCorrection(),
+                        qc.quantResult.quantizedComponentSum(),
+                        addressAndSize,
+                        qc.simdFunctionType.ordinal(),
+                        table.dimension,
+                        table.centroidDp
+                    );
+                    int[] ordinals = new int[numHidden];
+                    for (int j = 0; j < numHidden; j++) ordinals[j] = j;
+                    float[] scores = new float[numHidden];
+                    SimdVectorComputeService.scoreSimilarityInBulk(ordinals, scores, numHidden);
+                    for (int j = 0; j < numHidden; j++) {
+                        allSqScored.add(new ScoreDoc(docIds[j], scores[j]));
                     }
-                    allSqScored.add(new ScoreDoc(docIds[j], score));
+                } else {
+                    // Java fallback: read the vector block into heap and score via SqAdcScorer.
+                    byte[] vecBlock = new byte[vecBlockSizes[m]];
+                    try (IndexInput clonedInput = input.clone()) {
+                        clonedInput.seek(vecBlockOffsets[m]);
+                        clonedInput.readBytes(vecBlock, 0, vecBlock.length);
+                    }
+                    scoreSqBlockWithJavaFallback(
+                        docIds, vecBlock, sqEntrySize, table.quantizedVecBytes,
+                        qc, table.dimension, table.centroidDp,
+                        qc.isIp, allSqScored
+                    );
                 }
             }
 
             // Phase 3: fp32 rescore top 2*k
             if (floatVectorValues == null || k <= 0) {
-                // No fp32 rescore available — return all SQ-scored results
                 return allSqScored;
             }
 
             int sqKeep = Math.min(SQ_RESCORE_OVERSAMPLE * k, allSqScored.size());
-            // Sort descending by score (higher = better for both IP and L2 transforms)
             allSqScored.sort((a, b) -> Float.compare(b.score, a.score));
             List<ScoreDoc> topSq = allSqScored.subList(0, sqKeep);
 
-            // Rescore with fp32
             List<ScoreDoc> rescored = new ArrayList<>(topSq.size());
             for (ScoreDoc sd : topSq) {
-                float[] fp32Vec = floatVectorValues.vectorValue(
-                    floatVectorValues.ordToDoc(sd.doc) >= 0
-                        ? findOrdForDoc(floatVectorValues, sd.doc)
-                        : sd.doc
-                );
+                float[] fp32Vec = floatVectorValues.vectorValue(sd.doc);
                 if (fp32Vec != null) {
                     float score = similarityFunction.compare(floatQueryVector, fp32Vec);
                     rescored.add(new ScoreDoc(sd.doc, score));
                 } else {
-                    // Fallback: keep SQ score
-                    rescored.add(sd);
+                    rescored.add(sd); // keep SQ score if fp32 unavailable
                 }
             }
             return rescored;
@@ -423,15 +411,105 @@ public final class ClumpFileReader {
     }
 
     /**
-     * Finds the ordinal for a given docId in FloatVectorValues by advancing.
-     * FloatVectorValues doesn't have a direct docId→ord lookup, so we use advance().
+     * Quantizes the float query vector into 4 bit planes using Lucene's
+     * {@link OptimizedScalarQuantizer} + {@code transposeHalfByte}, then picks the SIMD function
+     * type. Mirrors {@code KNN1040ScalarQuantizedVectorScorer.bulkSimdRandomVectorScorer}.
      */
-    private static int findOrdForDoc(FloatVectorValues fvv, int docId) throws IOException {
-        // FloatVectorValues.vectorValue takes an ordinal. For dense segments ord == docId.
-        // For sparse segments we'd need the iterator, but clumping currently only works
-        // with dense segments. Return docId as the ordinal.
-        return docId;
+    private static SqQueryContext quantizeSqQuery(
+        float[] floatQueryVector,
+        CachedMarkerTable table,
+        KNNVectorSimilarityFunction similarityFunction
+    ) {
+        VectorSimilarityFunction luceneSim = similarityFunction.getVectorSimilarityFunction();
+        OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(luceneSim);
+
+        final int binaryCodeBytes = (table.dimension + 7) / 8;
+        final int discretizedDim = binaryCodeBytes * 8;
+        byte[] scratch = new byte[discretizedDim];
+        byte[] targetQuantized = new byte[4 * binaryCodeBytes]; // queryPackedLength for 1-bit data + 4-bit query
+
+        float[] queryCopy = floatQueryVector.clone();
+        OptimizedScalarQuantizer.QuantizationResult quantResult = quantizer.scalarQuantize(
+            queryCopy, scratch, (byte) 4, table.centroid
+        );
+        OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
+
+        boolean isIp = (similarityFunction == KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+            || similarityFunction == KNNVectorSimilarityFunction.DOT_PRODUCT
+            || similarityFunction == KNNVectorSimilarityFunction.COSINE);
+        SimdVectorComputeService.SimilarityFunctionType simdFn = isIp
+            ? SimdVectorComputeService.SimilarityFunctionType.SQ_IP
+            : SimdVectorComputeService.SimilarityFunctionType.SQ_L2;
+
+        return new SqQueryContext(targetQuantized, binaryCodeBytes, quantResult, simdFn, isIp);
     }
+
+    /**
+     * Pure-Java SQ scoring fallback used when the directory isn't mmap-backed (so the SIMD path
+     * can't obtain a direct address). Uses {@link SqAdcScorer}, which implements the same ADC
+     * formula as the native SIMD path and produces identical scores.
+     */
+    private static void scoreSqBlockWithJavaFallback(
+        int[] docIds,
+        byte[] vecBlock,
+        int sqEntrySize,
+        int quantizedVecBytes,
+        SqQueryContext qc,
+        int dimension,
+        float centroidDp,
+        boolean isIp,
+        List<ScoreDoc> out
+    ) {
+        SqAdcScorer.QuantizedQuery qq = new SqAdcScorer.QuantizedQuery(
+            qc.targetQuantized, qc.binaryCodeBytes,
+            qc.quantResult.lowerInterval(), qc.quantResult.upperInterval(),
+            qc.quantResult.additionalCorrection(), qc.quantResult.quantizedComponentSum()
+        );
+        byte[] code = new byte[quantizedVecBytes];
+        for (int j = 0; j < docIds.length; j++) {
+            int entryOffset = j * sqEntrySize;
+            System.arraycopy(vecBlock, entryOffset, code, 0, quantizedVecBytes);
+            int corrOffset = entryOffset + quantizedVecBytes;
+            float lower = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset));
+            float upper = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 4));
+            float additional = Float.intBitsToFloat(readIntLE(vecBlock, corrOffset + 8));
+            int componentSum = readIntLE(vecBlock, corrOffset + 12);
+
+            SqVectorEntry entry = new SqVectorEntry(code, lower, upper, additional, componentSum);
+            float score = isIp
+                ? SqAdcScorer.scoreIp(qq, code, entry, dimension, centroidDp)
+                : SqAdcScorer.scoreL2(qq, code, entry, dimension);
+            // Apply the same Faiss→Lucene score transform the native path applies, so fallback
+            // scores are directly comparable to SIMD scores.
+            score = isIp
+                ? (float) (1.0 / (1.0 + Math.exp(-score)))
+                : (1.0f / (1.0f + score));
+            out.add(new ScoreDoc(docIds[j], score));
+        }
+    }
+
+    /** Carrier for the quantized SQ query used by both the SIMD and the Java fallback paths. */
+    private static final class SqQueryContext {
+        final byte[] targetQuantized;
+        final int binaryCodeBytes;
+        final OptimizedScalarQuantizer.QuantizationResult quantResult;
+        final SimdVectorComputeService.SimilarityFunctionType simdFunctionType;
+        final boolean isIp;
+
+        SqQueryContext(
+            byte[] targetQuantized, int binaryCodeBytes,
+            OptimizedScalarQuantizer.QuantizationResult quantResult,
+            SimdVectorComputeService.SimilarityFunctionType simdFunctionType,
+            boolean isIp
+        ) {
+            this.targetQuantized = targetQuantized;
+            this.binaryCodeBytes = binaryCodeBytes;
+            this.quantResult = quantResult;
+            this.simdFunctionType = simdFunctionType;
+            this.isIp = isIp;
+        }
+    }
+
 
     // ---- Legacy (FP16/FLOAT/BYTE) scoring path ----
 
