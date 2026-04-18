@@ -7,6 +7,7 @@ package org.opensearch.knn.index.query.clumping;
 
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.ScoreDoc;
@@ -74,7 +75,7 @@ public final class ClumpingExpander {
         for (int i = 0; i < perLeafResults.size(); i++) {
             final PerLeafResult leafResult = perLeafResults.get(i);
             final LeafReaderContext leafCtx = leafReaderContexts.get(i);
-            tasks.add(() -> expandLeaf(leafResult, leafCtx, fieldName, queryVector, byteQueryVector));
+            tasks.add(() -> expandLeaf(leafResult, leafCtx, fieldName, queryVector, byteQueryVector, k));
         }
         return taskExecutor.invokeAll(tasks);
     }
@@ -88,7 +89,8 @@ public final class ClumpingExpander {
         LeafReaderContext leafCtx,
         String fieldName,
         float[] queryVector,
-        byte[] byteQueryVector
+        byte[] byteQueryVector,
+        int k
     ) throws IOException {
         if (leafResult.getResult().scoreDocs.length == 0) {
             return leafResult;
@@ -138,6 +140,22 @@ public final class ClumpingExpander {
             Arrays.toString(Arrays.copyOf(markerDocIds, Math.min(5, markerDocIds.length)))
         );
 
+        // For SQ_1BIT clump files, obtain FloatVectorValues for the fp32 rescore step.
+        FloatVectorValues floatVectorValues = null;
+        boolean isSq = false;
+        try {
+            isSq = ClumpFileReader.isSqClumpFile(clumpDirectory, segmentName, fieldName);
+        } catch (IOException e) {
+            log.warn("Error checking SQ clump type for segment {}", segmentName, e);
+        }
+        if (isSq) {
+            try {
+                floatVectorValues = reader.getFloatVectorValues(fieldName);
+            } catch (IOException e) {
+                log.warn("Could not obtain FloatVectorValues for SQ rescore, segment {}", segmentName, e);
+            }
+        }
+
         // Read hidden vectors from .clump file and score them inline
         List<ScoreDoc> scoredHidden;
         try {
@@ -148,7 +166,9 @@ public final class ClumpingExpander {
                 markerDocIds,
                 queryVector,
                 byteQueryVector,
-                similarityFunction
+                similarityFunction,
+                floatVectorValues,
+                k
             );
         } catch (IOException e) {
             log.warn("Error reading clump file, skipping expansion for segment {}", segmentName, e);
@@ -174,7 +194,8 @@ public final class ClumpingExpander {
                 leafResult.getResult().scoreDocs,
                 queryVector,
                 byteQueryVector,
-                similarityFunction
+                similarityFunction,
+                floatVectorValues
             );
         } catch (IOException e) {
             log.warn("Error rescoring markers from clump file, using original scores", e);

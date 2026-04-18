@@ -28,7 +28,8 @@ import java.util.Map;
  * ({@code .clumpassign}) where the int at offset {@code 4 * docId} is the marker
  * doc ID for that vector. Markers point to themselves. Hidden vector data is read
  * from a separate spill file ({@code .clumptmp}) that contains entries in encounter
- * order, each of fixed size ({@code 4 + dimension * elementSize} bytes).
+ * order, each of fixed size ({@code 4 + vectorBytes} bytes — for SQ the vectorBytes
+ * includes the packed correction factors).
  * <p>
  * To avoid O(H) heap, the writer uses a two-pass approach with O(M) auxiliary arrays:
  * <ol>
@@ -46,18 +47,8 @@ public final class ClumpFileWriter {
     private ClumpFileWriter() {}
 
     /**
-     * Writes the clump file using O(M) heap. Hidden entries are placed into their
-     * correct positions via a seekable temp file, avoiding any O(H) in-memory structures.
-     *
-     * @param state          Segment write state for creating output files
-     * @param fieldName      The vector field name
-     * @param dimension      The vector dimension
-     * @param vectorDataType The vector data type code (see {@link ClumpFileFormat})
-     * @param markerDocIds   Ordered list of marker doc IDs
-     * @param markerVectors  Marker vectors in same order as markerDocIds (float[] or byte[])
-     * @param assignInput    IndexInput for the assign file (flat int array, 4 bytes per doc ID)
-     * @param tempInput      IndexInput for the hidden vector spill file
-     * @param totalHidden    Total number of hidden vectors in the spill file
+     * Writes a FLOAT/BYTE/FP16 clump file. For the SQ_1BIT path use
+     * {@link #writeClumpFileSq}.
      */
     public static void writeClumpFile(
         SegmentWriteState state,
@@ -70,9 +61,61 @@ public final class ClumpFileWriter {
         IndexInput tempInput,
         int totalHidden
     ) throws IOException {
+        if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+            throw new IllegalArgumentException("SQ_1BIT clump files must be written via writeClumpFileSq");
+        }
+        writeClumpFileInternal(
+            state, fieldName, dimension, vectorDataType,
+            0, null, 0.0f,
+            markerDocIds, markerVectors,
+            assignInput, tempInput, totalHidden
+        );
+    }
+
+    /**
+     * Writes a SQ_1BIT clump file. Marker vectors must be {@link SqVectorEntry} instances.
+     * The quantizer's {@code centroid} and {@code centroidDp} are persisted in the header so the
+     * query-time reader can quantize a fresh query vector without reopening the segment's
+     * {@code QuantizedByteVectorValues}.
+     */
+    public static void writeClumpFileSq(
+        SegmentWriteState state,
+        String fieldName,
+        int dimension,
+        int quantizedVecBytes,
+        float[] centroid,
+        float centroidDp,
+        List<Integer> markerDocIds,
+        List<Object> markerVectors,
+        IndexInput assignInput,
+        IndexInput tempInput,
+        int totalHidden
+    ) throws IOException {
+        writeClumpFileInternal(
+            state, fieldName, dimension, ClumpFileFormat.VECTOR_TYPE_SQ_1BIT,
+            quantizedVecBytes, centroid, centroidDp,
+            markerDocIds, markerVectors,
+            assignInput, tempInput, totalHidden
+        );
+    }
+
+    private static void writeClumpFileInternal(
+        SegmentWriteState state,
+        String fieldName,
+        int dimension,
+        byte vectorDataType,
+        int quantizedVecBytes,
+        float[] centroid,
+        float centroidDp,
+        List<Integer> markerDocIds,
+        List<Object> markerVectors,
+        IndexInput assignInput,
+        IndexInput tempInput,
+        int totalHidden
+    ) throws IOException {
         int numMarkers = markerDocIds.size();
-        int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType);
-        // Spill file still uses the old interleaved format (docId + vector per entry)
+        int vectorSize = ClumpFileFormat.vectorBytes(dimension, vectorDataType, quantizedVecBytes);
+        // Spill file uses an interleaved format (docId + vector entry per hidden vector)
         int spillEntrySize = Integer.BYTES + vectorSize;
 
         // Build marker doc ID → marker index lookup
@@ -97,45 +140,37 @@ public final class ClumpFileWriter {
             }
         }
 
-        // v3 layout per marker: [markerVector][docId0..docIdN][vec0..vecN]
-        // Compute each marker's offsets within the clump data section.
-        long[] docIdBlockOffset = new long[numMarkers];  // offset of doc ID block within temp file
-        long[] vectorBlockOffset = new long[numMarkers];  // offset of vector block within temp file
+        // Per-marker layout in temp clump-data file: [markerVector][docIdBlock][vectorBlock]
+        long[] docIdBlockOffset = new long[numMarkers];
+        long[] vectorBlockOffset = new long[numMarkers];
         long runningOffset = 0;
         for (int i = 0; i < numMarkers; i++) {
-            // marker vector
-            runningOffset += vectorSize;
-            // doc ID block
+            runningOffset += vectorSize; // marker vector
             docIdBlockOffset[i] = runningOffset;
             runningOffset += (long) numHiddenPerMarker[i] * Integer.BYTES;
-            // vector block
             vectorBlockOffset[i] = runningOffset;
             runningOffset += (long) numHiddenPerMarker[i] * vectorSize;
         }
         long totalClumpDataSize = runningOffset;
 
-        // Write clump file: header + marker table + clump data via seekable temp file.
         String clumpFileName = buildClumpFileName(state.segmentInfo.name, fieldName);
         Path clumpDataTempPath = Files.createTempFile("clumpdata", ".tmp");
 
         try {
-            // Pass 2: write marker vectors, then scatter hidden doc IDs and vectors
-            // into their separate blocks within the temp file.
             int[] docIdCursors = new int[numMarkers];
             int[] vectorCursors = new int[numMarkers];
 
             try (RandomAccessFile raf = new RandomAccessFile(clumpDataTempPath.toFile(), "rw")) {
-                // Pre-allocate the file to its final size
                 raf.setLength(totalClumpDataSize);
 
-                // Write marker vectors at their known offsets (start of each marker's clump data)
+                // Marker vectors at the start of each marker's clump data region
                 for (int i = 0; i < numMarkers; i++) {
-                    long mvOffset = docIdBlockOffset[i] - vectorSize; // marker vec is right before doc ID block
+                    long mvOffset = docIdBlockOffset[i] - vectorSize;
                     raf.seek(mvOffset);
-                    writeVectorToRaf(raf, markerVectors.get(i), vectorDataType);
+                    writeVectorToRaf(raf, markerVectors.get(i), vectorDataType, vectorSize);
                 }
 
-                // Scan spill file once, placing doc IDs and vectors into separate blocks
+                // Scatter hidden entries into separate doc-ID and vector blocks
                 byte[] vecBuf = new byte[vectorSize];
                 byte[] docIdBuf = new byte[Integer.BYTES];
                 for (int h = 0; h < totalHidden; h++) {
@@ -151,7 +186,6 @@ public final class ClumpFileWriter {
                         continue;
                     }
 
-                    // Write doc ID to the doc ID block
                     long docIdDest = docIdBlockOffset[markerIndex]
                         + (long) docIdCursors[markerIndex] * Integer.BYTES;
                     docIdBuf[0] = (byte) hiddenDocId;
@@ -162,10 +196,9 @@ public final class ClumpFileWriter {
                     raf.write(docIdBuf);
                     docIdCursors[markerIndex]++;
 
-                    // Write vector to the vector block
                     long vecDest = vectorBlockOffset[markerIndex]
                         + (long) vectorCursors[markerIndex] * vectorSize;
-                    tempInput.seek(spillOffset + Integer.BYTES); // skip docId in spill entry
+                    tempInput.seek(spillOffset + Integer.BYTES); // skip docId
                     tempInput.readBytes(vecBuf, 0, vectorSize);
                     raf.seek(vecDest);
                     raf.write(vecBuf);
@@ -173,15 +206,24 @@ public final class ClumpFileWriter {
                 }
             }
 
-            // Assemble the final clump file: header + marker table + clump data from temp
+            // Assemble the final clump file
             try (IndexOutput output = state.directory.createOutput(clumpFileName, state.context)) {
-                // Header
+                // Common header
                 output.writeInt(numMarkers);
                 output.writeInt(dimension);
                 output.writeByte(vectorDataType);
 
+                // SQ-specific header extension
+                if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+                    output.writeInt(quantizedVecBytes);
+                    output.writeInt(Float.floatToRawIntBits(centroidDp));
+                    for (float v : centroid) {
+                        output.writeInt(Float.floatToRawIntBits(v));
+                    }
+                }
+
                 // Marker table — clumpDataOffset points to the start of each marker's data
-                long clumpDataBase = ClumpFileFormat.clumpDataStart(numMarkers);
+                long clumpDataBase = ClumpFileFormat.clumpDataStart(numMarkers, vectorDataType, dimension);
                 long currentOffset = clumpDataBase;
                 for (int i = 0; i < numMarkers; i++) {
                     output.writeInt(markerDocIds.get(i));
@@ -192,25 +234,34 @@ public final class ClumpFileWriter {
                         + (long) numHiddenPerMarker[i] * vectorSize;
                 }
 
-                // Append clump data from the temp file
                 appendFileToOutput(clumpDataTempPath, output);
-
                 CodecUtil.writeFooter(output);
             }
 
             log.debug(
-                "Wrote v3 clump file {} with {} markers, {} hidden vectors, dim={}, type={}",
+                "Wrote clump file {} with {} markers, {} hidden vectors, dim={}, type={}",
                 clumpFileName, numMarkers, totalHidden, dimension,
-                vectorDataType == ClumpFileFormat.VECTOR_TYPE_FP16 ? "fp16"
-                    : vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT ? "float" : "byte"
+                typeLabel(vectorDataType)
             );
         } finally {
             Files.deleteIfExists(clumpDataTempPath);
         }
     }
 
+    private static String typeLabel(byte t) {
+        switch (t) {
+            case ClumpFileFormat.VECTOR_TYPE_FLOAT: return "float";
+            case ClumpFileFormat.VECTOR_TYPE_BYTE:  return "byte";
+            case ClumpFileFormat.VECTOR_TYPE_FP16:  return "fp16";
+            case ClumpFileFormat.VECTOR_TYPE_SQ_1BIT: return "sq1bit";
+            default: return "type" + t;
+        }
+    }
+
     /**
      * Writes a single hidden entry (docId + vector) to a temp IndexOutput for spilling.
+     * {@code vector} must match the {@code vectorDataType}: {@code float[]} for FLOAT/FP16,
+     * {@code byte[]} for BYTE, {@link SqVectorEntry} for SQ_1BIT.
      *
      * @return the file offset where this entry was written
      */
@@ -232,6 +283,13 @@ public final class ClumpFileWriter {
             for (float v : fv) {
                 output.writeShort(Float.floatToFloat16(v));
             }
+        } else if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+            SqVectorEntry sq = (SqVectorEntry) vector;
+            output.writeBytes(sq.code, sq.code.length);
+            output.writeInt(Float.floatToRawIntBits(sq.lowerInterval));
+            output.writeInt(Float.floatToRawIntBits(sq.upperInterval));
+            output.writeInt(Float.floatToRawIntBits(sq.additionalCorrection));
+            output.writeInt(sq.quantizedComponentSum);
         } else {
             byte[] bv = (byte[]) vector;
             output.writeBytes(bv, bv.length);
@@ -240,17 +298,17 @@ public final class ClumpFileWriter {
 
     /**
      * Writes a vector to a RandomAccessFile in little-endian format (matching Lucene's
-     * DataOutput convention). Float vectors are converted to their IEEE 754 byte
-     * representation in little-endian order.
+     * DataOutput convention).
+     *
+     * @param vectorSize expected total bytes for the entry; used for safety checks
      */
-    private static void writeVectorToRaf(RandomAccessFile raf, Object vector, byte vectorDataType) throws IOException {
+    private static void writeVectorToRaf(RandomAccessFile raf, Object vector, byte vectorDataType, int vectorSize) throws IOException {
         if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_FLOAT) {
             float[] fv = (float[]) vector;
             byte[] buf = new byte[fv.length * Float.BYTES];
             for (int i = 0; i < fv.length; i++) {
                 int bits = Float.floatToIntBits(fv[i]);
                 int off = i * Float.BYTES;
-                // Little-endian: least significant byte first
                 buf[off] = (byte) bits;
                 buf[off + 1] = (byte) (bits >> 8);
                 buf[off + 2] = (byte) (bits >> 16);
@@ -263,15 +321,37 @@ public final class ClumpFileWriter {
             for (int i = 0; i < fv.length; i++) {
                 short fp16 = Float.floatToFloat16(fv[i]);
                 int off = i * Short.BYTES;
-                // Little-endian
                 buf[off] = (byte) fp16;
                 buf[off + 1] = (byte) (fp16 >> 8);
             }
+            raf.write(buf);
+        } else if (vectorDataType == ClumpFileFormat.VECTOR_TYPE_SQ_1BIT) {
+            SqVectorEntry sq = (SqVectorEntry) vector;
+            byte[] buf = new byte[vectorSize];
+            int off = 0;
+            System.arraycopy(sq.code, 0, buf, off, sq.code.length);
+            off += sq.code.length;
+            off = writeFloatLE(buf, off, sq.lowerInterval);
+            off = writeFloatLE(buf, off, sq.upperInterval);
+            off = writeFloatLE(buf, off, sq.additionalCorrection);
+            writeIntLE(buf, off, sq.quantizedComponentSum);
             raf.write(buf);
         } else {
             byte[] bv = (byte[]) vector;
             raf.write(bv);
         }
+    }
+
+    private static int writeFloatLE(byte[] buf, int off, float v) {
+        return writeIntLE(buf, off, Float.floatToRawIntBits(v));
+    }
+
+    private static int writeIntLE(byte[] buf, int off, int bits) {
+        buf[off]     = (byte) bits;
+        buf[off + 1] = (byte) (bits >>> 8);
+        buf[off + 2] = (byte) (bits >>> 16);
+        buf[off + 3] = (byte) (bits >>> 24);
+        return off + 4;
     }
 
     private static void appendFileToOutput(Path filePath, IndexOutput output) throws IOException {
