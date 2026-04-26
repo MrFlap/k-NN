@@ -46,7 +46,7 @@ public final class ClumpFileReader {
     private ClumpFileReader() {}
 
     /** Hardcoded oversample factor for SQ → fp32 rescore. */
-    static final int SQ_RESCORE_OVERSAMPLE = 5;
+    static final int SQ_RESCORE_OVERSAMPLE = 2;
 
     /**
      * Cached marker table data for a segment+field pair. Segments are immutable once
