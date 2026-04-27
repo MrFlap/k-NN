@@ -342,7 +342,29 @@ public final class ClumpFileReader {
             // and fall back to Java when mmap extraction fails.
             final SqQueryContext qc = quantizeSqQuery(floatQueryVector, table, similarityFunction);
 
-            List<ScoreDoc> allSqScored = new ArrayList<>();
+            // Compute total hidden count to size primitive result buffers exactly.
+            int totalHidden = 0;
+            int maxPerMarker = 0;
+            for (int m = 0; m < matchedIndices.length; m++) {
+                int[] docIds = markerDocIdArrays[m];
+                if (docIds == null) continue;
+                totalHidden += docIds.length;
+                if (docIds.length > maxPerMarker) maxPerMarker = docIds.length;
+            }
+            if (totalHidden == 0) {
+                return Collections.emptyList();
+            }
+
+            // Parallel primitive buffers — no ScoreDoc allocation until the final result.
+            final int[] allDocs = new int[totalHidden];
+            final float[] allScores = new float[totalHidden];
+            int writePos = 0;
+
+            // Reusable scratch buffers sized to the largest per-marker block.
+            final int[] ordinalsScratch = new int[maxPerMarker];
+            for (int i = 0; i < maxPerMarker; i++) ordinalsScratch[i] = i;
+            final float[] scoresScratch = new float[maxPerMarker];
+
             for (int m = 0; m < matchedIndices.length; m++) {
                 int[] docIds = markerDocIdArrays[m];
                 if (docIds == null || docIds.length == 0) continue;
@@ -365,13 +387,10 @@ public final class ClumpFileReader {
                         table.dimension,
                         table.centroidDp
                     );
-                    int[] ordinals = new int[numHidden];
-                    for (int j = 0; j < numHidden; j++) ordinals[j] = j;
-                    float[] scores = new float[numHidden];
-                    SimdVectorComputeService.scoreSimilarityInBulk(ordinals, scores, numHidden);
-                    for (int j = 0; j < numHidden; j++) {
-                        allSqScored.add(new ScoreDoc(docIds[j], scores[j]));
-                    }
+                    SimdVectorComputeService.scoreSimilarityInBulk(ordinalsScratch, scoresScratch, numHidden);
+                    System.arraycopy(docIds, 0, allDocs, writePos, numHidden);
+                    System.arraycopy(scoresScratch, 0, allScores, writePos, numHidden);
+                    writePos += numHidden;
                 } else {
                     // Java fallback: read the vector block into heap and score via SqAdcScorer.
                     byte[] vecBlock = new byte[vecBlockSizes[m]];
@@ -379,34 +398,103 @@ public final class ClumpFileReader {
                         clonedInput.seek(vecBlockOffsets[m]);
                         clonedInput.readBytes(vecBlock, 0, vecBlock.length);
                     }
-                    scoreSqBlockWithJavaFallback(
+                    writePos += scoreSqBlockWithJavaFallback(
                         docIds, vecBlock, sqEntrySize, table.quantizedVecBytes,
-                        qc, table.dimension, table.centroidDp,
-                        qc.isIp, allSqScored
+                        qc, table.dimension, table.centroidDp, qc.isIp,
+                        allDocs, allScores, writePos
                     );
                 }
             }
 
-            // Phase 3: fp32 rescore top 2*k
+            // Phase 3: select top candidates and (optionally) fp32 rescore.
+            // When rescore is disabled, return all scored hidden vectors as-is.
             if (floatVectorValues == null || k <= 0) {
-                return allSqScored;
+                List<ScoreDoc> out = new ArrayList<>(writePos);
+                for (int i = 0; i < writePos; i++) {
+                    out.add(new ScoreDoc(allDocs[i], allScores[i]));
+                }
+                return out;
             }
 
-            int sqKeep = Math.min(SQ_RESCORE_OVERSAMPLE * k, allSqScored.size());
-            allSqScored.sort((a, b) -> Float.compare(b.score, a.score));
-            List<ScoreDoc> topSq = allSqScored.subList(0, sqKeep);
+            final int sqKeep = Math.min(SQ_RESCORE_OVERSAMPLE * k, writePos);
+            // Bounded top-K via min-heap — O(N log K) vs O(N log N) full sort.
+            final int[] topDocs = new int[sqKeep];
+            final float[] topScores = new float[sqKeep];
+            selectTopKDescending(allDocs, allScores, writePos, topDocs, topScores);
 
-            List<ScoreDoc> rescored = new ArrayList<>(topSq.size());
-            for (ScoreDoc sd : topSq) {
-                float[] fp32Vec = floatVectorValues.vectorValue(sd.doc);
+            List<ScoreDoc> rescored = new ArrayList<>(sqKeep);
+            for (int i = 0; i < sqKeep; i++) {
+                float[] fp32Vec = floatVectorValues.vectorValue(topDocs[i]);
                 if (fp32Vec != null) {
                     float score = similarityFunction.compare(floatQueryVector, fp32Vec);
-                    rescored.add(new ScoreDoc(sd.doc, score));
+                    rescored.add(new ScoreDoc(topDocs[i], score));
                 } else {
-                    rescored.add(sd); // keep SQ score if fp32 unavailable
+                    rescored.add(new ScoreDoc(topDocs[i], topScores[i]));
                 }
             }
             return rescored;
+        }
+    }
+
+    /**
+     * Selects the top {@code k = topDocs.length} entries (largest scores first) from
+     * {@code allScores[0..n)} using a bounded min-heap. On return, {@code topDocs} and
+     * {@code topScores} hold the winners in descending score order.
+     *
+     * <p>Complexity: O(n log k) time, O(k) auxiliary heap — vs O(n log n) for a full sort.
+     */
+    private static void selectTopKDescending(
+        int[] allDocs, float[] allScores, int n,
+        int[] topDocs, float[] topScores
+    ) {
+        final int k = topDocs.length;
+        // Min-heap over indices into the allDocs/allScores arrays, keyed by score ascending.
+        // Size-k heap keeps the k largest seen so far; root is the smallest kept.
+        final int[] heap = new int[k];
+        int heapSize = 0;
+
+        for (int i = 0; i < n; i++) {
+            float s = allScores[i];
+            if (heapSize < k) {
+                heap[heapSize++] = i;
+                siftUp(heap, heapSize - 1, allScores);
+            } else if (s > allScores[heap[0]]) {
+                heap[0] = i;
+                siftDown(heap, 0, heapSize, allScores);
+            }
+        }
+
+        // Extract in ascending order by repeatedly popping the root, then reverse.
+        for (int out = heapSize - 1; out >= 0; out--) {
+            int rootIdx = heap[0];
+            topDocs[out] = allDocs[rootIdx];
+            topScores[out] = allScores[rootIdx];
+            heap[0] = heap[--heapSize];
+            if (heapSize > 0) siftDown(heap, 0, heapSize, allScores);
+        }
+    }
+
+    private static void siftUp(int[] heap, int pos, float[] scores) {
+        while (pos > 0) {
+            int parent = (pos - 1) >>> 1;
+            if (scores[heap[pos]] < scores[heap[parent]]) {
+                int t = heap[pos]; heap[pos] = heap[parent]; heap[parent] = t;
+                pos = parent;
+            } else break;
+        }
+    }
+
+    private static void siftDown(int[] heap, int pos, int size, float[] scores) {
+        final int half = size >>> 1;
+        while (pos < half) {
+            int left = (pos << 1) + 1;
+            int right = left + 1;
+            int smallest = left;
+            if (right < size && scores[heap[right]] < scores[heap[left]]) smallest = right;
+            if (scores[heap[smallest]] < scores[heap[pos]]) {
+                int t = heap[pos]; heap[pos] = heap[smallest]; heap[smallest] = t;
+                pos = smallest;
+            } else break;
         }
     }
 
@@ -448,8 +536,11 @@ public final class ClumpFileReader {
      * Pure-Java SQ scoring fallback used when the directory isn't mmap-backed (so the SIMD path
      * can't obtain a direct address). Uses {@link SqAdcScorer}, which implements the same ADC
      * formula as the native SIMD path and produces identical scores.
+     *
+     * <p>Writes doc IDs and scores into the caller-provided primitive arrays starting at
+     * {@code writePos}. Returns the number of entries written.
      */
-    private static void scoreSqBlockWithJavaFallback(
+    private static int scoreSqBlockWithJavaFallback(
         int[] docIds,
         byte[] vecBlock,
         int sqEntrySize,
@@ -458,7 +549,9 @@ public final class ClumpFileReader {
         int dimension,
         float centroidDp,
         boolean isIp,
-        List<ScoreDoc> out
+        int[] outDocs,
+        float[] outScores,
+        int writePos
     ) {
         SqAdcScorer.QuantizedQuery qq = new SqAdcScorer.QuantizedQuery(
             qc.targetQuantized, qc.binaryCodeBytes,
@@ -484,8 +577,10 @@ public final class ClumpFileReader {
             score = isIp
                 ? (float) (1.0 / (1.0 + Math.exp(-score)))
                 : (1.0f / (1.0f + score));
-            out.add(new ScoreDoc(docIds[j], score));
+            outDocs[writePos + j] = docIds[j];
+            outScores[writePos + j] = score;
         }
+        return docIds.length;
     }
 
     /** Carrier for the quantized SQ query used by both the SIMD and the Java fallback paths. */
