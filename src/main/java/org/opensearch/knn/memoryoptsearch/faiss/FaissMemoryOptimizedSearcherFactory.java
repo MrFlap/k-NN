@@ -8,6 +8,7 @@ package org.opensearch.knn.memoryoptsearch.faiss;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.VectorEncoding;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -40,11 +41,23 @@ public class FaissMemoryOptimizedSearcherFactory implements VectorSearcherFactor
             // Try load it. Not all FAISS index types are currently supported at the moment.
             final FaissIndex faissIndex = FaissIndex.load(indexInput);
             FaissFlatIndexFactory.maybeSetFlatBinaryIndex(faissIndex, fieldInfo, flatVectorsReader);
-            final FlatVectorsScorer vectorScorer = FlatVectorsScorerProvider.getFlatVectorsScorer(
-                fieldInfo,
-                faissIndex.getVectorSimilarityFunction(),
-                flatVectorsReader.getFlatVectorScorer()
-            );
+
+            // When clumping is enabled for an SQ field, the marker index on disk is a plain fp32
+            // HNSW (not a binary HNSW with null storage), so the SQ scorer — which extracts
+            // QuantizedByteVectorValues from a ScalarQuantizedFloatVectorValues wrapper — doesn't
+            // apply. Detect this by checking the loaded index's vector encoding and use the
+            // Lucene99 fp32 scorer instead.
+            final boolean indexOnDiskIsFp32 = faissIndex.getVectorEncoding() == VectorEncoding.FLOAT32;
+            final FlatVectorsScorer vectorScorer;
+            if (indexOnDiskIsFp32) {
+                vectorScorer = FlatVectorsScorerProvider.getLucene99FlatVectorsScorer();
+            } else {
+                vectorScorer = FlatVectorsScorerProvider.getFlatVectorsScorer(
+                    fieldInfo,
+                    faissIndex.getVectorSimilarityFunction(),
+                    flatVectorsReader.getFlatVectorScorer()
+                );
+            }
             return new FaissMemoryOptimizedSearcher(indexInput, faissIndex, fieldInfo, vectorScorer);
         } catch (UnsupportedFaissIndexException e) {
             // Clean up input stream.

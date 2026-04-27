@@ -31,7 +31,7 @@ import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorV
  * the vectors were transferred
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
-final class MemOptimizedNativeIndexBuildStrategy implements NativeIndexBuildStrategy {
+public final class MemOptimizedNativeIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     private static MemOptimizedNativeIndexBuildStrategy INSTANCE = new MemOptimizedNativeIndexBuildStrategy();
 
