@@ -10,6 +10,7 @@
  */
 
 #include "sq/faiss_sq_flat.h"
+#include "memory_util.h"
 
 #include <cstdint>
 #include <cstring>
@@ -375,7 +376,7 @@ TEST_P(FaissSQDistanceComputerTest, GetDistanceComputerIntegration) {
 
     // Populate the storage
     auto buf = makeBuffer(NUM_VECS, qvb);
-    flat.quantizedVectorsAndCorrectionFactors.assign(buf.data.begin(), buf.data.end());
+    flat.quantizedVectorsAndCorrectionFactors.append(buf.data.data(), buf.data.size());
     flat.ntotal = NUM_VECS;
 
     // get_distance_computer should pick the right template
@@ -551,7 +552,7 @@ TEST_P(FaissSQDistanceComputerTest, GetDistanceComputerIntegrationNonMultipleOf8
     FaissSQFlat flat(NUM_VECS, qvb, CENTROID_DP, dim, metric);
 
     auto buf = makeBuffer(NUM_VECS, qvb);
-    flat.quantizedVectorsAndCorrectionFactors.assign(buf.data.begin(), buf.data.end());
+    flat.quantizedVectorsAndCorrectionFactors.append(buf.data.data(), buf.data.size());
     flat.ntotal = NUM_VECS;
 
     // get_distance_computer should pick IsBytesMultipleOf8=false since oneElementSize=23
