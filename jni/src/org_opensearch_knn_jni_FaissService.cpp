@@ -610,7 +610,7 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_addDocsToSQIndex
         // Get the next batch of vectors to be added to HNSW
         // Note that we've already inserted quantized vectors in storage, just that it's not visible yet.
         auto* vecPtr = faissSQFlat->quantizedVectorsAndCorrectionFactors.data()
-                       + (numAdded * faissSQFlat->oneElementSize);
+                       + (static_cast<size_t>(numAdded) * faissSQFlat->oneElementSize);
 
         // Keep building HNSW
         binaryIdMap->add_with_ids(numDocs, vecPtr, &docIds[0]);
@@ -634,11 +634,9 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_passSQVectorsWit
             env->ReleasePrimitiveArrayCritical(buffer, jb, 0);
         });
 
-        // This does not involve memory doubling, we already allocated required memory space
-        faissSQFlat->quantizedVectorsAndCorrectionFactors.insert(
-            faissSQFlat->quantizedVectorsAndCorrectionFactors.end(),
+        faissSQFlat->quantizedVectorsAndCorrectionFactors.append(
             reinterpret_cast<uint8_t*>(jb),
-            reinterpret_cast<uint8_t*>(jb) + numElements * faissSQFlat->oneElementSize
+            static_cast<size_t>(numElements) * faissSQFlat->oneElementSize
         );
     } catch (...) {
         jniUtil.CatchCppExceptionAndThrowJava(env);

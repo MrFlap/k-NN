@@ -5,7 +5,7 @@
 #include "faiss/IndexBinary.h"
 #include "faiss/MetricType.h"
 #include "faiss/impl/DistanceComputer.h"
-#include "memory_util.h"
+#include "sq/huge_memory_buffer.h"
 
 #include <cstdint>
 #include <cstring>
@@ -73,7 +73,7 @@ namespace knn_jni {
 
         void set_query(const float* x) final {
             // The query pointer comes from FaissSQFlat::quantizedVectorsAndCorrectionFactors
-            // which uses NBytesAlignedAllocator<uint8_t, 8> (8-byte aligned base) with a
+            // which uses HugeMemoryBuffer (page-aligned base via mmap on Linux) with a
             // stride of oneElementByteSize that is always a multiple of 8 (quantizedVectorBytes
             // is a multiple of 8 by formula, plus 16 bytes of correction factors).
             // Therefore x is guaranteed 8-byte aligned when IsBytesMultipleOf8 is true.
@@ -266,8 +266,7 @@ namespace knn_jni {
         int32_t quantizedVectorBytes;
         float centroidDp;
         int32_t oneElementSize;
-        // For safely casting uint8_t* to float*, we should enforce 8-byte alignment for the vector.
-        std::vector<uint8_t, knn_jni::NBytesAlignedAllocator<uint8_t, 8>> quantizedVectorsAndCorrectionFactors;
+        HugeMemoryBuffer quantizedVectorsAndCorrectionFactors;
         int32_t dimension;
 
         FaissSQFlat(int64_t _numVectors, int32_t _quantizedVectorBytes, float _centroidDp, int32_t _dimension, faiss::MetricType _metric)
@@ -276,13 +275,9 @@ namespace knn_jni {
             quantizedVectorBytes(_quantizedVectorBytes),
             centroidDp(_centroidDp),
             oneElementSize(_quantizedVectorBytes + 3 * sizeof(float) + sizeof(int32_t)),
-            // Pre allocate vector storage space
-            quantizedVectorsAndCorrectionFactors(_numVectors * oneElementSize),
+            quantizedVectorsAndCorrectionFactors(static_cast<size_t>(_numVectors) * static_cast<size_t>(oneElementSize)),
             dimension(_dimension) {
 
-            // Just changing the size, not shrinking, thus allocated memory capacity remains the same.
-            // This is to avoid reallocations when adding elements later on since we know the exact required memory space upfront.
-            quantizedVectorsAndCorrectionFactors.resize(0);
             // Rewriting code_size to the full element size so that hnsw_add_vertices
             // strides correctly through the packed buffer when computing:
             //   x + (pt_id - n0) * index_hnsw.code_size
