@@ -174,7 +174,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
 
         // LuceneFieldMapper attributes
         if (this.isLuceneEngine) {
-            this.fieldType = vectorDataType.createKnnVectorFieldType(knnMappingConfig.getDimension(), knnVectorSimilarityFunction);
+            // POC: pad+rotate expands the vector to 4*D before it reaches Lucene.
+            final int luceneDim = vectorDataType == VectorDataType.FLOAT
+                ? PadRotateTransformer.paddedDim(knnMappingConfig.getDimension())
+                : knnMappingConfig.getDimension();
+            this.fieldType = vectorDataType.createKnnVectorFieldType(luceneDim, knnVectorSimilarityFunction);
 
             if (this.hasDocValues) {
                 this.vectorFieldType = buildDocValuesFieldType(resolvedKnnMethodContext.getKnnEngine());
@@ -261,10 +265,12 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
     @Override
     protected List<Field> getFieldsForFloatVector(final float[] array, boolean isDerivedSourceEnabled) {
         if (this.isLuceneEngine) {
+            // POC: pad to 4*D and apply fixed rotation before handing to Lucene.
+            final float[] indexed = PadRotateTransformer.padAndRotate(array);
             final List<Field> fields = new ArrayList<>();
-            fields.add(new DerivedKnnFloatVectorField(name(), array, fieldType, isDerivedSourceEnabled));
+            fields.add(new DerivedKnnFloatVectorField(name(), indexed, fieldType, isDerivedSourceEnabled));
             if (hasDocValues && vectorFieldType != null) {
-                fields.add(new VectorField(name(), array, vectorFieldType));
+                fields.add(new VectorField(name(), indexed, vectorFieldType));
             }
             if (stored) {
                 fields.add(createStoredFieldForFloatVector(name(), array));

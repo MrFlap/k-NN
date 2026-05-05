@@ -208,21 +208,28 @@ public class KNNVectorFieldType extends MappedFieldType {
             return vector;
         }
         final Optional<KNNMethodContext> knnMethodContext = knnMappingConfig.getKnnMethodContext();
+        final float[] transformed;
         if (knnMethodContext.isPresent()) {
             KNNMethodContext context = knnMethodContext.get();
-            return VectorTransformerFactory.getVectorTransformer(
+            transformed = VectorTransformerFactory.getVectorTransformer(
                 context.getKnnEngine(),
                 context.getSpaceType(),
                 context.getMethodComponentContext()
             ).transform(vector, false);
-        }
-        final Optional<String> modelId = knnMappingConfig.getModelId();
-        if (modelId.isPresent()) {
+        } else {
+            final Optional<String> modelId = knnMappingConfig.getModelId();
+            if (modelId.isEmpty()) {
+                throw new IllegalStateException("Either KNN method context or Model Id should be configured");
+            }
             ModelDao modelDao = ModelDao.OpenSearchKNNModelDao.getInstance();
             final ModelMetadata metadata = modelDao.getMetadata(modelId.get());
-            return VectorTransformerFactory.getVectorTransformer(metadata.getKnnEngine(), metadata.getSpaceType(), null)
+            transformed = VectorTransformerFactory.getVectorTransformer(metadata.getKnnEngine(), metadata.getSpaceType(), null)
                 .transform(vector, false);
         }
-        throw new IllegalStateException("Either KNN method context or Model Id should be configured");
+        // POC: apply the same pad+rotate used at index time, but only for the Lucene engine.
+        if (knnMethodContext.isPresent() && KNNEngine.LUCENE.equals(knnMethodContext.get().getKnnEngine())) {
+            return PadRotateTransformer.padAndRotate(transformed);
+        }
+        return transformed;
     }
 }
