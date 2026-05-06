@@ -27,6 +27,7 @@ import java.util.Set;
 
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_PAD_ROTATE;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_FP16;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
@@ -124,9 +125,16 @@ public class FaissMethodResolver extends AbstractMethodResolver {
         }
 
         if (CompressionLevel.x8 == resolvedCompressionLevel) {
-            encoderComponentContext = new MethodComponentContext(QFrameBitEncoder.NAME, new HashMap<>());
-            encoder = encoderMap.get(QFrameBitEncoder.NAME);
-            encoderComponentContext.getParameters().put(QFrameBitEncoder.BITCOUNT_PARAM, CompressionLevel.x8.numBitsForFloat32());
+            if (shouldUseSQOneBitWithPadRotateForX8(knnMethodConfigContext, encoderMap)) {
+                encoderComponentContext = new MethodComponentContext(ENCODER_SQ, new HashMap<>());
+                encoder = encoderMap.get(ENCODER_SQ);
+                encoderComponentContext.getParameters().put(SQ_BITS, FaissSQEncoder.Bits.ONE.getValue());
+                encoderComponentContext.getParameters().put(FAISS_SQ_PAD_ROTATE, Boolean.TRUE);
+            } else {
+                encoderComponentContext = new MethodComponentContext(QFrameBitEncoder.NAME, new HashMap<>());
+                encoder = encoderMap.get(QFrameBitEncoder.NAME);
+                encoderComponentContext.getParameters().put(QFrameBitEncoder.BITCOUNT_PARAM, CompressionLevel.x8.numBitsForFloat32());
+            }
         }
 
         if (CompressionLevel.x16 == resolvedCompressionLevel) {
@@ -227,6 +235,18 @@ public class FaissMethodResolver extends AbstractMethodResolver {
      * TODO: Enable once the Faiss1040ScalarQuantizedKnnVectorsWriter pipeline is validated end-to-end.
      */
     private static boolean shouldUseSQOneBitForX32(KNNMethodConfigContext knnMethodConfigContext, Map<String, Encoder> encoderMap) {
+        return knnMethodConfigContext.getVersionCreated() != null
+            && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)
+            && encoderMap.containsKey(ENCODER_SQ);
+    }
+
+    /**
+     * Starting 3.6.0, x8 compression uses sq(bits=1) with pad-and-rotate instead of the older
+     * {@code QFrameBitEncoder} 4-bit path. Pad-and-rotate expands each D-dim vector to 4*D and
+     * applies a deterministic random rotation before single-bit quantization, giving higher
+     * recall than the 4-bit alternative at the same effective compression.
+     */
+    private static boolean shouldUseSQOneBitWithPadRotateForX8(KNNMethodConfigContext knnMethodConfigContext, Map<String, Encoder> encoderMap) {
         return knnMethodConfigContext.getVersionCreated() != null
             && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)
             && encoderMap.containsKey(ENCODER_SQ);

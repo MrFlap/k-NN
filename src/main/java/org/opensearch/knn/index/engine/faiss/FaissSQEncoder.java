@@ -31,6 +31,7 @@ import java.util.stream.Collectors;
 
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.FAISS_FLAT_DESCRIPTION;
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_PAD_ROTATE;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_DESCRIPTION;
@@ -98,6 +99,10 @@ public class FaissSQEncoder implements Encoder {
             }
             return VALID_BITS.contains(v);
         }))
+        .addParameter(
+            FAISS_SQ_PAD_ROTATE,
+            new Parameter.BooleanParameter(FAISS_SQ_PAD_ROTATE, false, (v, context) -> Objects.nonNull(v))
+        )
         .setKnnLibraryIndexingContextGenerator(((methodComponent, methodComponentContext, knnMethodConfigContext) -> {
             Map<String, Object> params = methodComponentContext.getParameters();
             Object bitsObj = params.get(SQ_BITS);
@@ -134,11 +139,30 @@ public class FaissSQEncoder implements Encoder {
         if (methodComponentContext != null && methodComponentContext.getParameters().containsKey(SQ_BITS)) {
             Object bitsObj = methodComponentContext.getParameters().get(SQ_BITS);
             if (bitsObj instanceof Integer) {
-                return Bits.fromValue((Integer) bitsObj).getCompressionLevel();
+                Bits bits = Bits.fromValue((Integer) bitsObj);
+                // sq(bits=1) + pad_rotate_mode=true is treated as x8 compression: single-bit SQ on
+                // 4x-padded rotated vectors. Plain sq(bits=1) remains x32.
+                if (bits == Bits.ONE && isPadRotateModeEnabled(methodComponentContext)) {
+                    return CompressionLevel.x8;
+                }
+                return bits.getCompressionLevel();
             }
         }
         // Legacy path — type=fp16 is x2
         return CompressionLevel.x2;
+    }
+
+    /**
+     * Returns true when the sq encoder context has the pad-rotate marker set to {@code true}.
+     * Used by compression-level resolution to distinguish x32 (plain 1-bit SQ) from x8
+     * (1-bit SQ on 4x-padded rotated vectors).
+     */
+    public static boolean isPadRotateModeEnabled(MethodComponentContext methodComponentContext) {
+        if (methodComponentContext == null) {
+            return false;
+        }
+        Object mode = methodComponentContext.getParameters().get(FAISS_SQ_PAD_ROTATE);
+        return mode instanceof Boolean && (Boolean) mode;
     }
 
     // TODO: The Encoder interface's validateEncoderConfig uses TrainingConfigValidation* types that were
@@ -228,7 +252,11 @@ public class FaissSQEncoder implements Encoder {
             // Validate compression level compatibility if explicitly set
             CompressionLevel configuredCompression = configContext.getCompressionLevel();
             if (CompressionLevel.isConfigured(configuredCompression)) {
+                // bits=1 normally implies x32, but bits=1 + pad_rotate_mode=true implies x8.
                 CompressionLevel expectedCompression = Bits.fromValue(bits).getCompressionLevel();
+                if (bits == Bits.ONE.getValue() && isPadRotateModeEnabled(encoderContext)) {
+                    expectedCompression = CompressionLevel.x8;
+                }
                 if (configuredCompression != expectedCompression) {
                     return builder.valid(false)
                         .errorMessage(

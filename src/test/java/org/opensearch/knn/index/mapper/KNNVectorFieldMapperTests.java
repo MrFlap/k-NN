@@ -2571,23 +2571,31 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
         assertFalse(builder.getOriginalParameters().getResolvedKnnMethodContext().getMethodComponentContext().getParameters().isEmpty());
 
         if (shouldUsesBinaryQFramework) {
-            String encoderName = ((MethodComponentContext) builder.getOriginalParameters()
+            MethodComponentContext encoderCtx = (MethodComponentContext) builder.getOriginalParameters()
                 .getResolvedKnnMethodContext()
                 .getMethodComponentContext()
                 .getParameters()
-                .get(METHOD_ENCODER_PARAMETER)).getName();
+                .get(METHOD_ENCODER_PARAMETER);
+            String encoderName = encoderCtx.getName();
             assertTrue(
                 "Expected binary, sq(bits=1) encoder but got: " + encoderName,
                 QFrameBitEncoder.NAME.equals(encoderName) || ENCODER_SQ.equals(encoderName)
             );
-            assertEquals(
-                expectedResolvedCompressionLevel.numBitsForFloat32(),
-                (int) ((MethodComponentContext) builder.getOriginalParameters()
-                    .getResolvedKnnMethodContext()
-                    .getMethodComponentContext()
-                    .getParameters()
-                    .get(METHOD_ENCODER_PARAMETER)).getParameters().get(QFrameBitEncoder.BITCOUNT_PARAM)
-            );
+            if (ENCODER_SQ.equals(encoderName)) {
+                // sq(bits=1) path: the encoder stores SQ_BITS=1 regardless of whether the
+                // compression is x32 (plain 1-bit SQ) or x8 (1-bit SQ with pad-and-rotate). The
+                // discriminator is the pad_rotate_mode marker; the compression level is computed
+                // from both.
+                assertEquals(
+                    1,
+                    (int) encoderCtx.getParameters().get(org.opensearch.knn.common.KNNConstants.SQ_BITS)
+                );
+            } else {
+                assertEquals(
+                    expectedResolvedCompressionLevel.numBitsForFloat32(),
+                    (int) encoderCtx.getParameters().get(QFrameBitEncoder.BITCOUNT_PARAM)
+                );
+            }
         } else {
             assertTrue(
                 builder.getOriginalParameters().getResolvedKnnMethodContext().getMethodComponentContext().getParameters().isEmpty()

@@ -136,6 +136,13 @@ public class KNNConstants {
     public static final String FAISS_FLAT_DESCRIPTION = "Flat";
     public static final String FAISS_PQ_DESCRIPTION = "PQ";
     public static final String ENCODER_SQ = "sq";
+    /**
+     * Internal marker parameter on the {@value #ENCODER_SQ} encoder context. When {@code true}
+     * alongside {@code bits=1}, the flat vectors format pads each input vector to
+     * {@code 4 * dimension} and applies a deterministic random rotation before single-bit scalar
+     * quantization, giving an effective 8x compression with higher recall than plain 32x SQ.
+     */
+    public static final String FAISS_SQ_PAD_ROTATE = "pad_rotate_mode";
     public static final String SQ_BITS = "bits";
     public static final String FAISS_SQ_DESCRIPTION = "SQ";
     public static final String FAISS_SQ_TYPE = "type";
