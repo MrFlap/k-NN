@@ -226,10 +226,8 @@ public class KNNVectorFieldType extends MappedFieldType {
             transformed = VectorTransformerFactory.getVectorTransformer(metadata.getKnnEngine(), metadata.getSpaceType(), null)
                 .transform(vector, false);
         }
-        // POC: apply the same pad+rotate used at index time, but only for the Lucene engine.
-        if (knnMethodContext.isPresent() && KNNEngine.LUCENE.equals(knnMethodContext.get().getKnnEngine())) {
-            return PadRotateTransformer.padAndRotate(transformed);
-        }
-        return transformed;
+        // POC: apply the same pad+rotate used at index time. Matches EngineFieldMapper's applyPadRotate
+        // predicate — any FLOAT vector, regardless of engine.
+        return PadRotateTransformer.padAndRotate(transformed);
     }
 }

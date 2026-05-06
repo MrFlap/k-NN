@@ -60,6 +60,7 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
     private final VectorValidator vectorValidator;
     private final VectorTransformer vectorTransformer;
     private final boolean isLuceneEngine;
+    private final boolean applyPadRotate;
 
     public static EngineFieldMapper createFieldMapper(
         String fullname,
@@ -166,6 +167,9 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
         KNNMappingConfig knnMappingConfig = mappedFieldType.getKnnMappingConfig();
         VectorDataType vectorDataType = mappedFieldType.getVectorDataType();
         KNNMethodContext resolvedKnnMethodContext = originalMappingParameters.getResolvedKnnMethodContext();
+        // POC: pad+rotate applies to any FLOAT vector regardless of engine. Keeps index-time
+        // and query-time in lockstep; see KNNVectorFieldType#transformQueryVector for the mirror.
+        this.applyPadRotate = vectorDataType == VectorDataType.FLOAT;
 
         final KNNVectorSimilarityFunction knnVectorSimilarityFunction = resolvedKnnMethodContext.getSpaceType()
             .getKnnVectorSimilarityFunction();
@@ -174,8 +178,8 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
 
         // LuceneFieldMapper attributes
         if (this.isLuceneEngine) {
-            // POC: pad+rotate expands the vector to 4*D before it reaches Lucene.
-            final int luceneDim = vectorDataType == VectorDataType.FLOAT
+            // POC: pad+rotate expands the vector before it reaches Lucene.
+            final int luceneDim = applyPadRotate
                 ? PadRotateTransformer.paddedDim(knnMappingConfig.getDimension())
                 : knnMappingConfig.getDimension();
             this.fieldType = vectorDataType.createKnnVectorFieldType(luceneDim, knnVectorSimilarityFunction);
@@ -192,8 +196,12 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
             this.useLuceneBasedVectorField = KNNVectorFieldMapperUtil.useLuceneKNNVectorsFormat(indexCreatedVersion);
             KNNEngine knnEngine = resolvedKnnMethodContext.getKnnEngine();
             QuantizationConfig quantizationConfig = knnLibraryIndexingContext.getQuantizationConfig();
+            // POC: FAISS/NMSLIB see the padded dimension too, so the native graph is built in 4*D space.
+            final int nativeDim = applyPadRotate
+                ? PadRotateTransformer.paddedDim(knnMappingConfig.getDimension())
+                : knnMappingConfig.getDimension();
             this.fieldType = new FieldType(KNNVectorFieldMapper.Defaults.FIELD_TYPE);
-            this.fieldType.putAttribute(DIMENSION, String.valueOf(knnMappingConfig.getDimension()));
+            this.fieldType.putAttribute(DIMENSION, String.valueOf(nativeDim));
             this.fieldType.putAttribute(SPACE_TYPE, resolvedKnnMethodContext.getSpaceType().getValue());
 
             if (isSQOneBitEncoder(resolvedKnnMethodContext)) {
@@ -221,9 +229,8 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
             }
 
             if (useLuceneBasedVectorField) {
-                int adjustedDimension = mappedFieldType.vectorDataType == VectorDataType.BINARY
-                    ? knnMappingConfig.getDimension() / 8
-                    : knnMappingConfig.getDimension();
+                final int baseDimension = applyPadRotate ? nativeDim : knnMappingConfig.getDimension();
+                int adjustedDimension = mappedFieldType.vectorDataType == VectorDataType.BINARY ? baseDimension / 8 : baseDimension;
                 final VectorEncoding encoding = mappedFieldType.vectorDataType == VectorDataType.FLOAT
                     ? VectorEncoding.FLOAT32
                     : VectorEncoding.BYTE;
@@ -264,13 +271,27 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
 
     @Override
     protected List<Field> getFieldsForFloatVector(final float[] array, boolean isDerivedSourceEnabled) {
+        // POC: pad+rotate before handing to the engine. Stored fields still hold the original vector
+        // so _source / derived source returns what the user sent in.
+        final float[] indexed = applyPadRotate ? PadRotateTransformer.padAndRotate(array) : array;
         if (this.isLuceneEngine) {
-            // POC: pad to 4*D and apply fixed rotation before handing to Lucene.
-            final float[] indexed = PadRotateTransformer.padAndRotate(array);
             final List<Field> fields = new ArrayList<>();
             fields.add(new DerivedKnnFloatVectorField(name(), indexed, fieldType, isDerivedSourceEnabled));
             if (hasDocValues && vectorFieldType != null) {
                 fields.add(new VectorField(name(), indexed, vectorFieldType));
+            }
+            if (stored) {
+                fields.add(createStoredFieldForFloatVector(name(), array));
+            }
+            return fields;
+        }
+        if (applyPadRotate) {
+            // Mirror KNNVectorFieldMapper#getFieldsForFloatVector but with the padded vector.
+            final List<Field> fields = new ArrayList<>();
+            if (useLuceneBasedVectorField) {
+                fields.add(new DerivedKnnFloatVectorField(name(), indexed, fieldType, isDerivedSourceEnabled));
+            } else {
+                fields.add(new VectorField(name(), indexed, fieldType));
             }
             if (stored) {
                 fields.add(createStoredFieldForFloatVector(name(), array));
