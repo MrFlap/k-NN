@@ -8,6 +8,7 @@ package org.opensearch.knn.index.query.lucenelib;
 import org.apache.lucene.search.KnnByteVectorQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.knn.KnnSearchStrategy;
 
 /**
  * OpenSearch wrapper around Lucene's KnnByteVectorQuery that customizes
@@ -17,6 +18,10 @@ import org.apache.lucene.search.TopDocs;
  * documents are returned, maintaining consistency with OpenSearch's k-NN query behavior.
  */
 public final class OSKnnByteVectorQuery extends KnnByteVectorQuery {
+    // Matches MemoryOptimizedKNNWeight.DEFAULT_HNSW_SEARCH_STRATEGY: ACORN-style filtered HNSW
+    // traversal kicks in when the filter passes < 60% of docs.
+    private static final KnnSearchStrategy SEARCH_STRATEGY = new KnnSearchStrategy.Hnsw(60);
+
     private final int k;
 
     public OSKnnByteVectorQuery(
@@ -26,7 +31,7 @@ public final class OSKnnByteVectorQuery extends KnnByteVectorQuery {
         final Query filterQuery,
         final int k
     ) {
-        super(fieldName, byteQueryVector, luceneK, filterQuery);
+        super(fieldName, byteQueryVector, luceneK, filterQuery, SEARCH_STRATEGY);
         this.k = k;
     }
 
