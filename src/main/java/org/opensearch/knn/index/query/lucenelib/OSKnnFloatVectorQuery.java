@@ -18,9 +18,7 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
  * documents are returned, maintaining consistency with OpenSearch's k-NN query behavior.
  */
 public final class OSKnnFloatVectorQuery extends KnnFloatVectorQuery {
-    // Matches MemoryOptimizedKNNWeight.DEFAULT_HNSW_SEARCH_STRATEGY: ACORN-style filtered HNSW
-    // traversal kicks in when the filter passes < 60% of docs.
-    private static final KnnSearchStrategy SEARCH_STRATEGY = new KnnSearchStrategy.Hnsw(60);
+    private static final KnnSearchStrategy SEARCH_STRATEGY = KnnSearchStrategy.Hnsw.DEFAULT;
 
     private final int k;
     private final boolean needsRescore;

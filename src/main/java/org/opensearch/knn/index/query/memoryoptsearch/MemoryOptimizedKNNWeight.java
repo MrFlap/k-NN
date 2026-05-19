@@ -47,8 +47,7 @@ import static org.opensearch.knn.plugin.stats.KNNCounter.GRAPH_QUERY_ERRORS;
  */
 @Log4j2
 public class MemoryOptimizedKNNWeight extends KNNWeight {
-    // Enable ACORN optimization when having filtering rate < 60%.
-    private static final KnnSearchStrategy.Hnsw DEFAULT_HNSW_SEARCH_STRATEGY = new KnnSearchStrategy.Hnsw(60);
+    private static final KnnSearchStrategy.Hnsw DEFAULT_HNSW_SEARCH_STRATEGY = KnnSearchStrategy.Hnsw.DEFAULT;
 
     private final KnnCollectorManager knnCollectorManager;
     @Setter
