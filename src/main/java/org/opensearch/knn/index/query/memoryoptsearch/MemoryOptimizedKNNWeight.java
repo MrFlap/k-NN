@@ -97,13 +97,21 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
     }
 
     /**
-     * Mirrors Lucene's post-ANN fallback: if the approximate search returned fewer hits than
-     * {@code perLeafTopK}, the graph walk under-explored relative to its budget, so fall back to
-     * exact search.
+     * Mirrors Lucene's post-ANN fallback in {@code AbstractKnnVectorQuery.getLeafResults}: fall
+     * back to exact search if either (a) HNSW exhausted its visit budget — signalled by a
+     * non-{@code EQUAL_TO} {@code TotalHits.Relation} — or (b) it returned fewer than
+     * {@code perLeafTopK} hits. The relation signal is the load-bearing one when the collector
+     * fills its queue but with low-quality candidates because most visits were rejected by the
+     * filter.
      */
     @Override
-    protected boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final int annResultCount) {
-        if (super.isExactSearchRequire(context, filterIdsCount, annResultCount)) {
+    protected boolean isExactSearchRequire(
+        final LeafReaderContext context,
+        final int filterIdsCount,
+        final TopDocs annResult,
+        final int annResultCount
+    ) {
+        if (super.isExactSearchRequire(context, filterIdsCount, annResult, annResultCount)) {
             return true;
         }
         if (getFilterWeight() == null || collectorK <= 0) {
@@ -112,8 +120,12 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         if (KNNSettings.isKnnIndexFaissEfficientFilterExactSearchDisabled(knnQuery.getIndexName())) {
             return false;
         }
+        if (filterIdsCount < collectorK) {
+            return false;
+        }
         final int perLeafTopK = computePerLeafTopK(context);
-        return filterIdsCount >= perLeafTopK && annResultCount < perLeafTopK;
+        final boolean visitBudgetExhausted = annResult.totalHits.relation() != TotalHits.Relation.EQUAL_TO;
+        return visitBudgetExhausted || annResultCount < perLeafTopK;
     }
 
     private int computePerLeafTopK(final LeafReaderContext context) {
@@ -255,7 +267,10 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         // Align `hitCount` logic with the non-memory-optimized path by setting it to the size of the result set.
         // Note: DefaultKNNWeight defines `hitCount` as the number of results returned per Lucene segment,
         // while Lucene’s implementation interprets it as the total number of vectors visited during search.
-        topDocs = new TopDocs(new TotalHits(topDocs.scoreDocs.length, TotalHits.Relation.EQUAL_TO), topDocs.scoreDocs);
+        // Preserve the original Relation so post-ANN logic can detect when HNSW exhausted its visit limit
+        // (Relation.GREATER_THAN_OR_EQUAL_TO) and fall back to exact search, mirroring Lucene's
+        // AbstractKnnVectorQuery.getLeafResults behavior.
+        topDocs = new TopDocs(new TotalHits(topDocs.scoreDocs.length, topDocs.totalHits.relation()), topDocs.scoreDocs);
         if (topDocs.scoreDocs.length == 0) {
             log.debug("[KNN] Query yielded 0 results");
             return EMPTY_TOPDOCS;

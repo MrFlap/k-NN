@@ -351,7 +351,7 @@ public abstract class KNNWeight extends Weight {
         // See whether we have to perform exact search based on approx search results
         // This is required if there are no native engine files or if approximate search returned
         // results less than K, though we have more than k filtered docs
-        if (isExactSearchRequire(context, filterCardinality, topDocs.scoreDocs.length)) {
+        if (isExactSearchRequire(context, filterCardinality, topDocs)) {
             final BitSetIterator docs = filterWeight != null ? new BitSetIterator(filterBitSet, filterCardinality) : null;
             final TopDocs result = doExactSearch(context, docs, filterCardinality, k);
             return new PerLeafResult(
@@ -667,7 +667,16 @@ public abstract class KNNWeight extends Weight {
      * @param annResultCount Count of Nearest Neighbours we got after doing filtered ANN Search.
      * @return boolean - true if exactSearch needs to be done after ANNSearch.
      */
-    protected boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final int annResultCount) {
+    protected final boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final TopDocs annResult) {
+        return isExactSearchRequire(context, filterIdsCount, annResult, annResult.scoreDocs.length);
+    }
+
+    protected boolean isExactSearchRequire(
+        final LeafReaderContext context,
+        final int filterIdsCount,
+        final TopDocs annResult,
+        final int annResultCount
+    ) {
         if (annResultCount == 0 && isMissingNativeEngineFiles(context)) {
             log.debug("Perform exact search after approximate search since no native engine files are available");
             return true;
