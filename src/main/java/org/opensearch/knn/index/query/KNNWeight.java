@@ -331,7 +331,7 @@ public abstract class KNNWeight extends Weight {
          * . Hence, if filtered results are less than K and filter query is present we should shift to exact search.
          * This improves the recall.
          */
-        if (isFilteredExactSearchPreferred(filterCardinality)) {
+        if (isFilteredExactSearchPreferred(context, filterCardinality)) {
             final TopDocs result = doExactSearch(context, new BitSetIterator(filterBitSet, filterCardinality), filterCardinality, k);
             return new PerLeafResult(
                 filterWeight == null ? null : filterBitSet,
@@ -613,7 +613,7 @@ public abstract class KNNWeight extends Weight {
         return -score + 1;
     }
 
-    private boolean isFilteredExactSearchPreferred(final int filterIdsCount) {
+    protected boolean isFilteredExactSearchPreferred(final LeafReaderContext context, final int filterIdsCount) {
         if (filterWeight == null) {
             return false;
         }
@@ -667,7 +667,7 @@ public abstract class KNNWeight extends Weight {
      * @param annResultCount Count of Nearest Neighbours we got after doing filtered ANN Search.
      * @return boolean - true if exactSearch needs to be done after ANNSearch.
      */
-    private boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final int annResultCount) {
+    protected boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final int annResultCount) {
         if (annResultCount == 0 && isMissingNativeEngineFiles(context)) {
             log.debug("Perform exact search after approximate search since no native engine files are available");
             return true;
@@ -703,7 +703,7 @@ public abstract class KNNWeight extends Weight {
      * @param annResultCount Count of Nearest Neighbours we got after doing filtered ANN Search.
      * @return boolean - true if exactSearch needs to be done after ANNSearch.
      */
-    private boolean isFilteredExactSearchRequireAfterANNSearch(final int filterIdsCount, final int annResultCount) {
+    protected boolean isFilteredExactSearchRequireAfterANNSearch(final int filterIdsCount, final int annResultCount) {
         return filterWeight != null && filterIdsCount >= knnQuery.getK() && knnQuery.getK() > annResultCount;
     }
 

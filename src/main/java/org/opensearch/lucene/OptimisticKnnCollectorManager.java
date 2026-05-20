@@ -79,7 +79,7 @@ public class OptimisticKnnCollectorManager implements KnnCollectorManager {
      * says there is a 95% probability that this segment's contribution to the global top K hits are
      * <= perLeafTopK.
      */
-    private static int perLeafTopKCalculation(int k, float leafProportion) {
+    public static int perLeafTopKCalculation(int k, float leafProportion) {
         return (int) Math.max(1, k * leafProportion + LAMBDA * Math.sqrt(k * leafProportion * (1 - leafProportion)));
     }
 }

@@ -25,6 +25,7 @@ import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.Version;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
@@ -50,11 +51,13 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
     private static final KnnSearchStrategy.Hnsw DEFAULT_HNSW_SEARCH_STRATEGY = KnnSearchStrategy.Hnsw.DEFAULT;
 
     private final KnnCollectorManager knnCollectorManager;
+    private final int collectorK;
     @Setter
     private ReentrantKnnCollectorManager reentrantKNNCollectorManager;
 
     public MemoryOptimizedKNNWeight(KNNQuery query, float boost, final Weight filterWeight, IndexSearcher searcher, Integer k) {
         super(query, boost, filterWeight);
+        this.collectorK = (k != null && k > 0) ? k : 0;
 
         if (k != null && k > 0) {
             // ANN Search
@@ -73,6 +76,51 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                 visitLimit
             );
         }
+    }
+
+    /**
+     * Mirrors the per-leaf exact-search short-circuit that Lucene's {@code AbstractKnnVectorQuery}
+     * applies on the engine-Lucene path: drop to exact search when the per-leaf filter cost is
+     * below {@code perLeafTopK}. Without this the MOS path stays on ANN with a low-selectivity
+     * filter and loses recall.
+     */
+    @Override
+    protected boolean isFilteredExactSearchPreferred(final LeafReaderContext context, final int filterIdsCount) {
+        if (super.isFilteredExactSearchPreferred(context, filterIdsCount)) {
+            return true;
+        }
+        if (getFilterWeight() == null || collectorK <= 0) {
+            return false;
+        }
+        final int perLeafTopK = computePerLeafTopK(context);
+        return filterIdsCount <= perLeafTopK;
+    }
+
+    /**
+     * Mirrors Lucene's post-ANN fallback: if the approximate search returned fewer hits than
+     * {@code perLeafTopK}, the graph walk under-explored relative to its budget, so fall back to
+     * exact search.
+     */
+    @Override
+    protected boolean isExactSearchRequire(final LeafReaderContext context, final int filterIdsCount, final int annResultCount) {
+        if (super.isExactSearchRequire(context, filterIdsCount, annResultCount)) {
+            return true;
+        }
+        if (getFilterWeight() == null || collectorK <= 0) {
+            return false;
+        }
+        if (KNNSettings.isKnnIndexFaissEfficientFilterExactSearchDisabled(knnQuery.getIndexName())) {
+            return false;
+        }
+        final int perLeafTopK = computePerLeafTopK(context);
+        return filterIdsCount >= perLeafTopK && annResultCount < perLeafTopK;
+    }
+
+    private int computePerLeafTopK(final LeafReaderContext context) {
+        final float leafProportion = (context.parent != null)
+            ? context.reader().maxDoc() / (float) context.parent.reader().maxDoc()
+            : 1f;
+        return OptimisticKnnCollectorManager.perLeafTopKCalculation(collectorK, leafProportion);
     }
 
     @Override
