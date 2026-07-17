@@ -69,6 +69,30 @@ public enum MethodParameter {
             validationException.addValidationError(METHOD_PARAMETER_NPROBES + " should be greater than 0");
             return validationException;
         }
+    },
+
+    DECAY("decay", Version.V_2_16_0, new ParseField("decay")) {
+        @Override
+        public Float parse(Object value) {
+            return Float.parseFloat(String.valueOf(value));
+        }
+
+        @Override
+        public ValidationException validate(Object value) {
+            return null;
+        }
+    },
+
+    ERROR_THRESHOLD("error_threshold", Version.V_2_16_0, new ParseField("error_threshold")) {
+        @Override
+        public Float parse(Object value) {
+            return Float.parseFloat(String.valueOf(value));
+        }
+
+        @Override
+        public ValidationException validate(Object value) {
+            return null;
+        }
     };
 
     private final String name;

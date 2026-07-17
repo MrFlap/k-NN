@@ -126,6 +126,9 @@ public class KNNSettings {
     public static final String MEMORY_OPTIMIZED_KNN_SEARCH_MODE = "index.knn.memory_optimized_search";
     public static final boolean DEFAULT_MEMORY_OPTIMIZED_KNN_SEARCH_MODE = false;
 
+    public static final String KNN_RADIAL_SEARCH_ERROR_THRESHOLD = "index.knn.radial_search.error_threshold";
+    public static final String KNN_RADIAL_SEARCH_DECAY = "index.knn.radial_search.decay";
+
     /**
      * Default setting values
      *
@@ -496,6 +499,22 @@ public class KNNSettings {
         Dynamic
     );
 
+    public static final Setting<Float> KNN_RADIAL_SEARCH_ERROR_THRESHOLD_SETTING = Setting.floatSetting(
+        KNN_RADIAL_SEARCH_ERROR_THRESHOLD,
+        0.0f,
+        0.0f,
+        IndexScope,
+        Dynamic
+    );
+
+    public static final Setting<Float> KNN_RADIAL_SEARCH_DECAY_SETTING = Setting.floatSetting(
+        KNN_RADIAL_SEARCH_DECAY,
+        -1.0f,
+        -1.0f,
+        IndexScope,
+        Dynamic
+    );
+
     /**
      * Keystore settings for build service HTTP authorization
      */
@@ -768,7 +787,9 @@ public class KNNSettings {
             KNN_REMOTE_BUILD_CLIENT_TIMEOUT_SETTING,
             KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING,
             KNN_REMOTE_BUILD_SERVER_PASSWORD_SETTING,
-            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING
+            INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
+            KNN_RADIAL_SEARCH_ERROR_THRESHOLD_SETTING,
+            KNN_RADIAL_SEARCH_DECAY_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());

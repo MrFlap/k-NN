@@ -10,8 +10,10 @@ import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 import static org.opensearch.knn.index.VectorDataType.SUPPORTED_VECTOR_DATA_TYPES;
 
 import java.util.Locale;
+import java.util.Map;
 
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.search.FloatVectorSimilarityQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.opensearch.index.IndexSettings;
@@ -118,12 +120,26 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final String fieldName = request.getFieldName();
         final Float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
+        float errorThreshold = resolveErrorThreshold(request);
+        float adjustedRadius = radius * (1.0f - errorThreshold);
+
+        Float decay = resolveDecay(request);
+        if (decay != null) {
+            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), adjustedRadius, decay, filterQuery);
+        }
+
         final int efSearch = resolveEfSearch(request);
 
-        log.info("[RADIAL-DEBUG] createSeededRadialQuery: index={}, field={}, radius={}, efSearch={}",
-            request.getIndexName(), fieldName, radius, efSearch);
+        log.debug(
+            "Creating seeded radial query for index: {}, field: {}, radius: {}, adjustedRadius: {}, efSearch: {}",
+            request.getIndexName(),
+            fieldName,
+            radius,
+            adjustedRadius,
+            efSearch
+        );
 
-        return new RadialSearchQuery(fieldName, request.getVector(), radius, efSearch, filterQuery);
+        return new RadialSearchQuery(fieldName, request.getVector(), adjustedRadius, efSearch, filterQuery);
     }
 
     /**
@@ -175,15 +191,23 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final String fieldName = request.getFieldName();
         final Float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
+        float errorThreshold = resolveErrorThreshold(request);
+        float adjustedRadius = radius * (1.0f - errorThreshold);
 
-        log.info("[RADIAL-DEBUG] createLuceneRadialQuery: index={}, field={}, radius={}, efSearch={}",
-            request.getIndexName(), fieldName, radius, resolveEfSearch(request));
+        Float decay = resolveDecay(request);
+        if (decay != null) {
+            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), adjustedRadius, decay, filterQuery);
+        }
+
+        log.debug(
+            String.format("Creating Lucene r-NN query for index: %s \"\", field: %s \"\", k: %f", request.getIndexName(), fieldName, adjustedRadius)
+        );
 
         switch (request.getVectorDataType()) {
             case BYTE:
-                return new RadialSearchQuery(fieldName, request.getByteVector(), radius, resolveEfSearch(request), filterQuery);
+                return new RadialSearchQuery(fieldName, request.getByteVector(), adjustedRadius, resolveEfSearch(request), filterQuery);
             case FLOAT:
-                return new RadialSearchQuery(fieldName, request.getVector(), radius, resolveEfSearch(request), filterQuery);
+                return new RadialSearchQuery(fieldName, request.getVector(), adjustedRadius, resolveEfSearch(request), filterQuery);
             default:
                 throw new IllegalArgumentException(
                     String.format(
@@ -203,5 +227,46 @@ public class RNNQueryFactory extends BaseQueryFactory {
         } catch (Exception e) {
             return KNNSettings.INDEX_KNN_DEFAULT_ALGO_PARAM_EF_SEARCH;
         }
+    }
+
+    private static Float resolveDecay(final CreateQueryRequest request) {
+        Map<String, ?> params = request.getMethodParameters();
+        if (params != null && params.containsKey("decay")) {
+            Object val = params.get("decay");
+            if (val instanceof Number) {
+                return ((Number) val).floatValue();
+            }
+        }
+        try {
+            if (request.getContext().isPresent()) {
+                float indexDecay = request.getContext().get().getIndexSettings().getSettings()
+                    .getAsFloat(KNNSettings.KNN_RADIAL_SEARCH_DECAY, -1.0f);
+                if (indexDecay >= 0.0f) {
+                    return indexDecay;
+                }
+            }
+        } catch (Exception e) {
+            // index settings unavailable
+        }
+        return null;
+    }
+
+    private static float resolveErrorThreshold(final CreateQueryRequest request) {
+        Map<String, ?> params = request.getMethodParameters();
+        if (params != null && params.containsKey("error_threshold")) {
+            Object val = params.get("error_threshold");
+            if (val instanceof Number) {
+                return ((Number) val).floatValue();
+            }
+        }
+        try {
+            if (request.getContext().isPresent()) {
+                return request.getContext().get().getIndexSettings().getSettings()
+                    .getAsFloat(KNNSettings.KNN_RADIAL_SEARCH_ERROR_THRESHOLD, 0.0f);
+            }
+        } catch (Exception e) {
+            // index settings unavailable
+        }
+        return 0.0f;
     }
 }
