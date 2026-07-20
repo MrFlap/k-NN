@@ -20,6 +20,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.util.IndexHyperParametersUtil;
 
 /**
  * Class to create radius nearest neighbor queries
@@ -66,32 +67,52 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final Float radius = createQueryRequest.getRadius();
         final float[] vector = createQueryRequest.getVector();
 
-        final Query innerQuery;
-        if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(createQueryRequest.getKnnEngine())) {
-            innerQuery = createNativeEngineRadialQuery(createQueryRequest);
-        } else {
-            innerQuery = createLuceneRadialQuery(createQueryRequest);
-        }
-
         if (createQueryRequest.getVectorFieldType() != null && createQueryRequest.getVectorFieldType().isRescoringRequiredForRadial()) {
-            // Honor the index-level max_result_window setting to cap the number of results retained
-            // after rescoring. Falls back to MAX_RESULTS_RADIAL_RESCORING if context is unavailable.
-            final int maxResultsSize;
-            if (createQueryRequest.getContext().isPresent()) {
-                maxResultsSize = createQueryRequest.getContext().get().getIndexSettings().getMaxResultWindow();
-            } else {
-                maxResultsSize = MAX_RESULTS_RADIAL_RESCORING;
-            }
+            // For quantized indices, use top-k ANN as the candidate generation strategy.
+            // k = efSearch gives a candidate pool sized by the HNSW exploration budget,
+            // then we rescore with full-precision vectors and filter by the radius threshold.
+            final int efSearch = IndexHyperParametersUtil.getHNSWEFSearchValue(
+                createQueryRequest.getMethodParameters(),
+                createQueryRequest.getIndexName()
+            );
+
+            final Query topKQuery = createTopKQuery(createQueryRequest, efSearch);
             return new RescoreRadialSearchQuery(
-                innerQuery,
+                topKQuery,
                 fieldName,
                 vector,
                 radius,
                 createQueryRequest.isMemoryOptimizedSearchEnabled(),
-                maxResultsSize
+                efSearch
             );
         }
-        return innerQuery;
+
+        if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(createQueryRequest.getKnnEngine())) {
+            return createNativeEngineRadialQuery(createQueryRequest);
+        }
+        return createLuceneRadialQuery(createQueryRequest);
+    }
+
+    /**
+     * Creates a top-k ANN query to use as candidate generation for quantized radial search.
+     * The returned candidates will be rescored with full-precision vectors and filtered by radius.
+     */
+    private static Query createTopKQuery(CreateQueryRequest request, int k) {
+        KNNQueryFactory.CreateQueryRequest topKRequest = KNNQueryFactory.CreateQueryRequest.builder()
+            .knnEngine(request.getKnnEngine())
+            .indexName(request.getIndexName())
+            .fieldName(request.getFieldName())
+            .vector(request.getVector())
+            .originalVector(request.getOriginalVector())
+            .byteVector(request.getByteVector())
+            .vectorDataType(request.getVectorDataType())
+            .k(k)
+            .methodParameters(request.getMethodParameters())
+            .filter(request.getFilter().orElse(null))
+            .context(request.getContext().orElse(null))
+            .memoryOptimizedSearchEnabled(request.isMemoryOptimizedSearchEnabled())
+            .build();
+        return KNNQueryFactory.create(topKRequest);
     }
 
     /**
