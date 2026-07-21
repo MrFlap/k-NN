@@ -8,6 +8,7 @@ package org.opensearch.knn.index.query;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnCollector;
@@ -24,6 +25,8 @@ import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.search.knn.TopKnnCollectorManager;
 import org.apache.lucene.util.Bits;
+import org.opensearch.knn.index.codec.KNN1040Codec.QefContext;
+import org.opensearch.knn.index.codec.KNN1040Codec.QuantizationErrorFile;
 import org.opensearch.knn.index.query.common.QueryUtils;
 import org.opensearch.knn.index.query.memoryoptsearch.RadiusVectorSimilarityCollector;
 import org.opensearch.lucene.ReentrantKnnCollectorManager;
@@ -136,6 +139,17 @@ public class RadialSearchQuery extends Query {
             }
         }
 
+        // Set .qef reader for Cauchy-Schwarz scorer correction
+        QuantizationErrorFile.Reader qefReader = null;
+        if (reader instanceof SegmentReader) {
+            try {
+                qefReader = QuantizationErrorFile.openIfExists((SegmentReader) reader, field);
+            } catch (Exception e) {
+                log.warn("Failed to open .qef file for field [{}]", field, e);
+            }
+        }
+        QefContext.CURRENT.set(qefReader);
+
         // Determine accepted docs and visit limit
         final AcceptDocs acceptDocs;
         final int visitLimit;
@@ -155,53 +169,60 @@ public class RadialSearchQuery extends Query {
             visitLimit = Integer.MAX_VALUE;
         }
 
-        // Phase 1: top-k ANN with k = ef_search to find seed entry points.
-        log.info("[RADIAL-DEBUG] RadialSearchQuery.searchLeaf: field={}, similarity={}, efSearch={}, maxDoc={}",
-            field, similarity, efSearch, reader.maxDoc());
-        KnnCollector seedCollector = new TopKnnCollectorManager(efSearch, searcher).newCollector(
-            visitLimit,
-            DEFAULT_HNSW_SEARCH_STRATEGY,
-            ctx
-        );
-        if (isByteVector) {
-            reader.searchNearestVectors(field, byteTarget, seedCollector, acceptDocs);
-        } else {
-            reader.searchNearestVectors(field, target, seedCollector, acceptDocs);
+        try {
+            // Phase 1: top-k ANN with k = ef_search to find seed entry points.
+            log.info("[RADIAL-DEBUG] RadialSearchQuery.searchLeaf: field={}, similarity={}, efSearch={}, maxDoc={}",
+                field, similarity, efSearch, reader.maxDoc());
+            KnnCollector seedCollector = new TopKnnCollectorManager(efSearch, searcher).newCollector(
+                visitLimit,
+                DEFAULT_HNSW_SEARCH_STRATEGY,
+                ctx
+            );
+            if (isByteVector) {
+                reader.searchNearestVectors(field, byteTarget, seedCollector, acceptDocs);
+            } else {
+                reader.searchNearestVectors(field, target, seedCollector, acceptDocs);
+            }
+            TopDocs seedTopDocs = seedCollector.topDocs();
+            log.info("[RADIAL-DEBUG] Phase 1 seeds: count={}, minScore={}, maxScore={}",
+                seedTopDocs.scoreDocs.length,
+                seedTopDocs.scoreDocs.length > 0 ? seedTopDocs.scoreDocs[seedTopDocs.scoreDocs.length - 1].score : "N/A",
+                seedTopDocs.scoreDocs.length > 0 ? seedTopDocs.scoreDocs[0].score : "N/A");
+
+            // Phase 2: radial search, seeded from phase-1 results.
+            final KnnCollectorManager radialCollectorManager;
+            KnnCollectorManager baseRadialManager = (vl, strategy, context) -> new RadiusVectorSimilarityCollector(similarity, vl, strategy);
+
+            if (seedTopDocs != null && seedTopDocs.scoreDocs.length > 0) {
+                Object queryVector = isByteVector ? byteTarget : target;
+                radialCollectorManager = new ReentrantKnnCollectorManager(baseRadialManager, Map.of(ctx.ord, seedTopDocs), queryVector, field);
+            } else {
+                radialCollectorManager = baseRadialManager;
+            }
+
+            KnnCollector radialCollector = radialCollectorManager.newCollector(visitLimit, DEFAULT_HNSW_SEARCH_STRATEGY, ctx);
+            if (isByteVector) {
+                reader.searchNearestVectors(field, byteTarget, radialCollector, acceptDocs);
+            } else {
+                reader.searchNearestVectors(field, target, radialCollector, acceptDocs);
+            }
+            TopDocs results = radialCollector.topDocs();
+
+            log.info("[RADIAL-DEBUG] Phase 2 results: count={}, visited={}",
+                results == null ? 0 : results.scoreDocs.length,
+                radialCollector.visitedCount());
+
+            if (results == null || results.scoreDocs.length == 0) {
+                return new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
+            }
+
+            return results;
+        } finally {
+            QefContext.CURRENT.remove();
+            if (qefReader != null) {
+                qefReader.close();
+            }
         }
-        TopDocs seedTopDocs = seedCollector.topDocs();
-        log.info("[RADIAL-DEBUG] Phase 1 seeds: count={}, minScore={}, maxScore={}",
-            seedTopDocs.scoreDocs.length,
-            seedTopDocs.scoreDocs.length > 0 ? seedTopDocs.scoreDocs[seedTopDocs.scoreDocs.length - 1].score : "N/A",
-            seedTopDocs.scoreDocs.length > 0 ? seedTopDocs.scoreDocs[0].score : "N/A");
-
-        // Phase 2: radial search, seeded from phase-1 results.
-        final KnnCollectorManager radialCollectorManager;
-        KnnCollectorManager baseRadialManager = (vl, strategy, context) -> new RadiusVectorSimilarityCollector(similarity, vl, strategy);
-
-        if (seedTopDocs != null && seedTopDocs.scoreDocs.length > 0) {
-            Object queryVector = isByteVector ? byteTarget : target;
-            radialCollectorManager = new ReentrantKnnCollectorManager(baseRadialManager, Map.of(ctx.ord, seedTopDocs), queryVector, field);
-        } else {
-            radialCollectorManager = baseRadialManager;
-        }
-
-        KnnCollector radialCollector = radialCollectorManager.newCollector(visitLimit, DEFAULT_HNSW_SEARCH_STRATEGY, ctx);
-        if (isByteVector) {
-            reader.searchNearestVectors(field, byteTarget, radialCollector, acceptDocs);
-        } else {
-            reader.searchNearestVectors(field, target, radialCollector, acceptDocs);
-        }
-        TopDocs results = radialCollector.topDocs();
-
-        log.info("[RADIAL-DEBUG] Phase 2 results: count={}, visited={}",
-            results == null ? 0 : results.scoreDocs.length,
-            radialCollector.visitedCount());
-
-        if (results == null || results.scoreDocs.length == 0) {
-            return new TopDocs(new TotalHits(0, TotalHits.Relation.EQUAL_TO), new ScoreDoc[0]);
-        }
-
-        return results;
     }
 
     @Override

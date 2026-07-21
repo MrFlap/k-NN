@@ -68,26 +68,6 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final Float radius = createQueryRequest.getRadius();
         final float[] vector = createQueryRequest.getVector();
 
-        if (createQueryRequest.getVectorFieldType() != null && createQueryRequest.getVectorFieldType().isRescoringRequiredForRadial()) {
-            final Float errorThreshold = resolveErrorThreshold(createQueryRequest);
-            if (errorThreshold == null) {
-                // No error_threshold set: use top-k ANN + partial rescore with Cauchy-Schwarz bounds.
-                // k = efSearch gives a candidate pool sized by the HNSW exploration budget.
-                final int efSearch = resolveEfSearch(createQueryRequest);
-                final Query topKQuery = createTopKQuery(createQueryRequest, efSearch);
-                return new RescoreRadialSearchQuery(
-                    topKQuery,
-                    fieldName,
-                    vector,
-                    radius,
-                    createQueryRequest.isMemoryOptimizedSearchEnabled(),
-                    efSearch
-                );
-            }
-            // error_threshold is explicitly set: use the seeded radial search with adjusted radius,
-            // and wrap with full rescore.
-        }
-
         final Query innerQuery;
         if (createQueryRequest.isMemoryOptimizedSearchEnabled()) {
             innerQuery = createSeededRadialQuery(createQueryRequest);
@@ -117,28 +97,6 @@ public class RNNQueryFactory extends BaseQueryFactory {
     }
 
     /**
-     * Creates a top-k ANN query to use as candidate generation for quantized radial search.
-     * The returned candidates will be rescored with full-precision vectors and filtered by radius.
-     */
-    private static Query createTopKQuery(CreateQueryRequest request, int k) {
-        KNNQueryFactory.CreateQueryRequest topKRequest = KNNQueryFactory.CreateQueryRequest.builder()
-            .knnEngine(request.getKnnEngine())
-            .indexName(request.getIndexName())
-            .fieldName(request.getFieldName())
-            .vector(request.getVector())
-            .originalVector(request.getOriginalVector())
-            .byteVector(request.getByteVector())
-            .vectorDataType(request.getVectorDataType())
-            .k(k)
-            .methodParameters(request.getMethodParameters())
-            .filter(request.getFilter().orElse(null))
-            .context(request.getContext().orElse(null))
-            .memoryOptimizedSearchEnabled(request.isMemoryOptimizedSearchEnabled())
-            .build();
-        return KNNQueryFactory.create(topKRequest);
-    }
-
-    /**
      * Creates a {@link RadialSearchQuery} for memory-optimized search (Faiss HNSW via Lucene's vector reader).
      * <p>
      * This uses the same two-phase seeded radial search as the Lucene engine path, since both
@@ -149,28 +107,25 @@ public class RNNQueryFactory extends BaseQueryFactory {
      */
     private static Query createSeededRadialQuery(CreateQueryRequest request) {
         final String fieldName = request.getFieldName();
-        final Float radius = request.getRadius();
+        final float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
-        Float errorThreshold = resolveErrorThreshold(request);
-        float adjustedRadius = errorThreshold != null ? radius * (1.0f - errorThreshold) : radius;
 
         Float decay = resolveDecay(request);
         if (decay != null) {
-            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), adjustedRadius, decay, filterQuery);
+            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), radius, decay, filterQuery);
         }
 
         final int efSearch = resolveEfSearch(request);
 
         log.debug(
-            "Creating seeded radial query for index: {}, field: {}, radius: {}, adjustedRadius: {}, efSearch: {}",
+            "Creating seeded radial query for index: {}, field: {}, radius: {}, efSearch: {}",
             request.getIndexName(),
             fieldName,
             radius,
-            adjustedRadius,
             efSearch
         );
 
-        return new RadialSearchQuery(fieldName, request.getVector(), adjustedRadius, efSearch, filterQuery);
+        return new RadialSearchQuery(fieldName, request.getVector(), radius, efSearch, filterQuery);
     }
 
     /**
@@ -220,25 +175,23 @@ public class RNNQueryFactory extends BaseQueryFactory {
      */
     private static Query createLuceneRadialQuery(CreateQueryRequest request) {
         final String fieldName = request.getFieldName();
-        final Float radius = request.getRadius();
+        final float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
-        Float errorThreshold = resolveErrorThreshold(request);
-        float adjustedRadius = errorThreshold != null ? radius * (1.0f - errorThreshold) : radius;
 
         Float decay = resolveDecay(request);
         if (decay != null) {
-            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), adjustedRadius, decay, filterQuery);
+            return new FloatVectorSimilarityQuery(fieldName, request.getVector(), radius, decay, filterQuery);
         }
 
         log.debug(
-            String.format("Creating Lucene r-NN query for index: %s \"\", field: %s \"\", k: %f", request.getIndexName(), fieldName, adjustedRadius)
+            String.format("Creating Lucene r-NN query for index: %s \"\", field: %s \"\", k: %f", request.getIndexName(), fieldName, radius)
         );
 
         switch (request.getVectorDataType()) {
             case BYTE:
-                return new RadialSearchQuery(fieldName, request.getByteVector(), adjustedRadius, resolveEfSearch(request), filterQuery);
+                return new RadialSearchQuery(fieldName, request.getByteVector(), radius, resolveEfSearch(request), filterQuery);
             case FLOAT:
-                return new RadialSearchQuery(fieldName, request.getVector(), adjustedRadius, resolveEfSearch(request), filterQuery);
+                return new RadialSearchQuery(fieldName, request.getVector(), radius, resolveEfSearch(request), filterQuery);
             default:
                 throw new IllegalArgumentException(
                     String.format(
@@ -282,29 +235,4 @@ public class RNNQueryFactory extends BaseQueryFactory {
         return null;
     }
 
-    /**
-     * Resolves the error threshold. Returns null if not explicitly set by the user (query params or index setting),
-     * which signals that the Cauchy-Schwarz partial rescoring path should be used for quantized indices.
-     */
-    private static Float resolveErrorThreshold(final CreateQueryRequest request) {
-        Map<String, ?> params = request.getMethodParameters();
-        if (params != null && params.containsKey("error_threshold")) {
-            Object val = params.get("error_threshold");
-            if (val instanceof Number) {
-                return ((Number) val).floatValue();
-            }
-        }
-        try {
-            if (request.getContext().isPresent()) {
-                float setting = request.getContext().get().getIndexSettings().getSettings()
-                    .getAsFloat(KNNSettings.KNN_RADIAL_SEARCH_ERROR_THRESHOLD, -1.0f);
-                if (setting >= 0.0f) {
-                    return setting;
-                }
-            }
-        } catch (Exception e) {
-            // index settings unavailable
-        }
-        return null;
-    }
 }
