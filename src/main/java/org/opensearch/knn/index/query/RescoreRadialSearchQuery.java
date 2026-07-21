@@ -9,22 +9,35 @@ import com.google.common.annotations.VisibleForTesting;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
+import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
+import org.opensearch.common.lucene.Lucene;
+import org.opensearch.knn.index.codec.KNN1040Codec.KNN1040ScalarQuantizedUtils;
+import org.opensearch.knn.index.codec.KNN1040Codec.QuantizationErrorFile;
 import org.opensearch.knn.index.query.exactsearch.ExactSearcher;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -240,40 +253,28 @@ public class RescoreRadialSearchQuery extends Query {
                         return KNNScorer.emptyScorer();
                     }
 
-                    // 3. If more candidates than maxResultsSize, pull only top-maxResultsSize
-                    // from the inner scorer; otherwise use the iterator directly.
-                    final DocIdSetIterator docsToRescore;
-                    final long numDocsToRescore;
+                    // 3. Collect all candidates with their approximate scores.
+                    // If more candidates than maxResultsSize, keep only top-maxResultsSize.
+                    final TopDocs candidates;
                     if (matchedDocs.cost() > maxResultsSize) {
-                        final TopDocs topCandidates = collectTopDocs(innerScorer);
-                        docsToRescore = new TopDocsDISI(topCandidates);
-                        numDocsToRescore = topCandidates.scoreDocs.length;
+                        candidates = collectTopDocs(innerScorer);
                     } else {
-                        docsToRescore = matchedDocs;
-                        numDocsToRescore = matchedDocs.cost();
+                        candidates = collectAllDocs(innerScorer);
+                    }
+
+                    if (candidates.scoreDocs.length == 0) {
+                        return KNNScorer.emptyScorer();
                     }
 
                     log.info("[RADIAL-DEBUG] RescoreRadialSearchQuery: candidatesFromInner={}, radius={}, MOS={}",
-                        numDocsToRescore, radius, memoryOptimizedSearchEnabled);
+                        candidates.scoreDocs.length, radius, memoryOptimizedSearchEnabled);
 
-                    // 4. Build ExactSearcherContext — rescore with full-precision vectors
-                    final ExactSearcher.ExactSearcherContext exactSearcherContext = ExactSearcher.ExactSearcherContext.builder()
-                        .matchedDocsIterator(docsToRescore)
-                        .numberOfMatchedDocs(numDocsToRescore)
-                        .useQuantizedVectorsForSearch(false)
-                        .maxResultWindow((int) Math.min(maxResultsSize, numDocsToRescore))
-                        .radius(radius)
-                        .field(field)
-                        .floatQueryVector(queryVector)
-                        .isMemoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
-                        .build();
-
-                    // 5. Rescore — ExactSearcher handles radius → minScore conversion internally
-                    final TopDocs rescored = EXACT_SEARCHER_SINGLETON.searchLeaf(context, exactSearcherContext);
+                    // 4. Attempt partial rescoring with Cauchy-Schwarz bounds
+                    final TopDocs rescored = partialRescore(context, candidates);
 
                     log.info("[RADIAL-DEBUG] RescoreRadialSearchQuery: afterRescore={}", rescored.scoreDocs.length);
 
-                    // 6. Return scorer over rescored results
+                    // 5. Return scorer over rescored results
                     return new KNNScorer(rescored, boost);
                 }
 
@@ -285,6 +286,140 @@ public class RescoreRadialSearchQuery extends Query {
                     return cost;
                 }
             };
+        }
+
+        /**
+         * Performs partial rescoring using Cauchy-Schwarz bounds when a .qef sidecar file is available.
+         * Falls back to full rescoring when the sidecar file doesn't exist.
+         *
+         * For each candidate with approximate score S_approx, computes:
+         *   lower_bound = S_approx - (‖q-c‖·‖E_x‖ + ‖e_q+E_q‖·‖x-c‖ + ‖e_q+E_q‖·‖E_x‖)
+         *
+         * If lower_bound >= radius: accept without rescore (guaranteed in-radius).
+         * Otherwise: rescore with full-precision vectors.
+         */
+        private TopDocs partialRescore(LeafReaderContext context, TopDocs candidates) throws IOException {
+            final SegmentReader segReader = Lucene.segmentReader(context.reader());
+            final QuantizationErrorFile.Reader qefReader = QuantizationErrorFile.openIfExists(segReader, field);
+
+            if (qefReader == null) {
+                return fullRescore(context, candidates);
+            }
+
+            try {
+                // Get quantized vector values to access centroid and quantizer
+                final FloatVectorValues floatVectorValues = context.reader().getFloatVectorValues(field);
+                if (floatVectorValues == null) {
+                    return fullRescore(context, candidates);
+                }
+
+                final QuantizedByteVectorValues quantizedValues;
+                try {
+                    quantizedValues = KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(floatVectorValues);
+                } catch (IOException e) {
+                    log.debug("Could not extract quantized values for partial rescoring, falling back to full rescore", e);
+                    return fullRescore(context, candidates);
+                }
+
+                if (quantizedValues == null) {
+                    return fullRescore(context, candidates);
+                }
+
+                final float[] centroid = quantizedValues.getCentroid();
+                final OptimizedScalarQuantizer quantizer = quantizedValues.getQuantizer();
+                final int dim = centroid.length;
+
+                // Compute query-side terms (once per segment):
+                // ‖q - c‖
+                float queryResidualNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    float diff = queryVector[i] - centroid[i];
+                    queryResidualNormSq += diff * diff;
+                }
+                final float queryResidualNorm = (float) Math.sqrt(queryResidualNormSq);
+
+                // Quantize the query to compute ‖e_q + E_q‖ (query quantization error norm)
+                float[] queryForQuantize = queryVector.clone();
+                byte[] queryQuantized = new byte[dim];
+                OptimizedScalarQuantizer.QuantizationResult qResult = quantizer.scalarQuantize(
+                    queryForQuantize, queryQuantized, (byte) 1, centroid
+                );
+                float[] queryDequantized = new float[dim];
+                OptimizedScalarQuantizer.deQuantize(
+                    queryQuantized, queryDequantized, (byte) 1, qResult.lowerInterval(), qResult.upperInterval(), centroid
+                );
+                float queryErrorNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    float err = queryDequantized[i] - queryVector[i];
+                    queryErrorNormSq += err * err;
+                }
+                final float queryErrorNorm = (float) Math.sqrt(queryErrorNormSq);
+
+                log.info("[RADIAL-DEBUG] Partial rescore: queryResidualNorm={}, queryErrorNorm={}, numCandidates={}",
+                    queryResidualNorm, queryErrorNorm, candidates.scoreDocs.length);
+
+                // Iterate candidates, apply Cauchy-Schwarz bounds
+                final List<ScoreDoc> accepted = new ArrayList<>();
+                final List<Integer> needsRescore = new ArrayList<>();
+
+                for (ScoreDoc sd : candidates.scoreDocs) {
+                    float errorNorm = qefReader.getErrorNorm(sd.doc);
+                    float residualNorm = qefReader.getResidualNorm(sd.doc);
+
+                    float correction = queryResidualNorm * errorNorm
+                        + queryErrorNorm * residualNorm
+                        + queryErrorNorm * errorNorm;
+                    float lowerBound = sd.score - correction;
+
+                    if (lowerBound >= radius) {
+                        accepted.add(sd);
+                    } else {
+                        needsRescore.add(sd.doc);
+                    }
+                }
+
+                log.info("[RADIAL-DEBUG] Partial rescore results: accepted={}, needsRescore={}",
+                    accepted.size(), needsRescore.size());
+
+                // Rescore the ambiguous candidates
+                if (!needsRescore.isEmpty()) {
+                    DocIdSetIterator rescoreIter = new IntListDISI(needsRescore);
+                    final ExactSearcher.ExactSearcherContext exactSearcherContext = ExactSearcher.ExactSearcherContext.builder()
+                        .matchedDocsIterator(rescoreIter)
+                        .numberOfMatchedDocs(needsRescore.size())
+                        .useQuantizedVectorsForSearch(false)
+                        .maxResultWindow(needsRescore.size())
+                        .radius(radius)
+                        .field(field)
+                        .floatQueryVector(queryVector)
+                        .isMemoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
+                        .build();
+
+                    final TopDocs rescoredDocs = EXACT_SEARCHER_SINGLETON.searchLeaf(context, exactSearcherContext);
+                    accepted.addAll(Arrays.asList(rescoredDocs.scoreDocs));
+                }
+
+                ScoreDoc[] results = accepted.toArray(new ScoreDoc[0]);
+                return new TopDocs(new TotalHits(results.length, TotalHits.Relation.EQUAL_TO), results);
+            } finally {
+                IOUtils.close(qefReader);
+            }
+        }
+
+        private TopDocs fullRescore(LeafReaderContext context, TopDocs candidates) throws IOException {
+            DocIdSetIterator docsToRescore = new TopDocsDISI(candidates);
+            final ExactSearcher.ExactSearcherContext exactSearcherContext = ExactSearcher.ExactSearcherContext.builder()
+                .matchedDocsIterator(docsToRescore)
+                .numberOfMatchedDocs(candidates.scoreDocs.length)
+                .useQuantizedVectorsForSearch(false)
+                .maxResultWindow((int) Math.min(maxResultsSize, candidates.scoreDocs.length))
+                .radius(radius)
+                .field(field)
+                .floatQueryVector(queryVector)
+                .isMemoryOptimizedSearchEnabled(memoryOptimizedSearchEnabled)
+                .build();
+
+            return EXACT_SEARCHER_SINGLETON.searchLeaf(context, exactSearcherContext);
         }
 
         /**
@@ -308,6 +443,59 @@ public class RescoreRadialSearchQuery extends Query {
                 collector.collect(docId, scorer.score());
             }
             return collector.topDocs();
+        }
+
+        /**
+         * Collects all documents from the scorer into a TopDocs.
+         */
+        private TopDocs collectAllDocs(final Scorer scorer) throws IOException {
+            final DocIdSetIterator iterator = scorer.iterator();
+            final List<ScoreDoc> docs = new ArrayList<>();
+            int docId;
+            while ((docId = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                docs.add(new ScoreDoc(docId, scorer.score()));
+            }
+            ScoreDoc[] arr = docs.toArray(new ScoreDoc[0]);
+            return new TopDocs(new TotalHits(arr.length, TotalHits.Relation.EQUAL_TO), arr);
+        }
+    }
+
+    /**
+     * A DocIdSetIterator over a sorted list of doc IDs.
+     */
+    private static class IntListDISI extends DocIdSetIterator {
+        private final int[] docIds;
+        private int idx = -1;
+
+        IntListDISI(List<Integer> docs) {
+            this.docIds = new int[docs.size()];
+            for (int i = 0; i < docs.size(); i++) {
+                docIds[i] = docs.get(i);
+            }
+            java.util.Arrays.sort(docIds);
+        }
+
+        @Override
+        public int docID() {
+            if (idx == -1) return -1;
+            if (idx >= docIds.length) return NO_MORE_DOCS;
+            return docIds[idx];
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            idx++;
+            return docID();
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            return slowAdvance(target);
+        }
+
+        @Override
+        public long cost() {
+            return docIds.length;
         }
     }
 }

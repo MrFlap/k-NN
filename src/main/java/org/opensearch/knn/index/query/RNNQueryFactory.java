@@ -68,33 +68,42 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final Float radius = createQueryRequest.getRadius();
         final float[] vector = createQueryRequest.getVector();
 
-        log.info("[RADIAL-DEBUG] RNNQueryFactory.create: field={}, radius={}, engine={}, MOS={}",
-            fieldName, radius, createQueryRequest.getKnnEngine(), createQueryRequest.isMemoryOptimizedSearchEnabled());
+        if (createQueryRequest.getVectorFieldType() != null && createQueryRequest.getVectorFieldType().isRescoringRequiredForRadial()) {
+            final Float errorThreshold = resolveErrorThreshold(createQueryRequest);
+            if (errorThreshold == null) {
+                // No error_threshold set: use top-k ANN + partial rescore with Cauchy-Schwarz bounds.
+                // k = efSearch gives a candidate pool sized by the HNSW exploration budget.
+                final int efSearch = resolveEfSearch(createQueryRequest);
+                final Query topKQuery = createTopKQuery(createQueryRequest, efSearch);
+                return new RescoreRadialSearchQuery(
+                    topKQuery,
+                    fieldName,
+                    vector,
+                    radius,
+                    createQueryRequest.isMemoryOptimizedSearchEnabled(),
+                    efSearch
+                );
+            }
+            // error_threshold is explicitly set: use the seeded radial search with adjusted radius,
+            // and wrap with full rescore.
+        }
 
         final Query innerQuery;
         if (createQueryRequest.isMemoryOptimizedSearchEnabled()) {
-            // MOS (Faiss HNSW via Lucene's vector reader): use the unified seeded radial search.
-            log.info("[RADIAL-DEBUG] Routing to createSeededRadialQuery (MOS path)");
             innerQuery = createSeededRadialQuery(createQueryRequest);
         } else if (KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(createQueryRequest.getKnnEngine())) {
-            log.info("[RADIAL-DEBUG] Routing to createNativeEngineRadialQuery (native FAISS/NMSLIB path)");
             innerQuery = createNativeEngineRadialQuery(createQueryRequest);
         } else {
-            log.info("[RADIAL-DEBUG] Routing to createLuceneRadialQuery (Lucene engine path)");
             innerQuery = createLuceneRadialQuery(createQueryRequest);
         }
 
         if (createQueryRequest.getVectorFieldType() != null && createQueryRequest.getVectorFieldType().isRescoringRequiredForRadial()) {
-            // Honor the index-level max_result_window setting to cap the number of results retained
-            // after rescoring. Falls back to MAX_RESULTS_RADIAL_RESCORING if context is unavailable.
             final int maxResultsSize;
             if (createQueryRequest.getContext().isPresent()) {
                 maxResultsSize = createQueryRequest.getContext().get().getIndexSettings().getMaxResultWindow();
             } else {
                 maxResultsSize = MAX_RESULTS_RADIAL_RESCORING;
             }
-            log.info("[RADIAL-DEBUG] Wrapping with RescoreRadialSearchQuery: radius={}, MOS={}, maxResultsSize={}",
-                radius, createQueryRequest.isMemoryOptimizedSearchEnabled(), maxResultsSize);
             return new RescoreRadialSearchQuery(
                 innerQuery,
                 fieldName,
@@ -105,6 +114,28 @@ public class RNNQueryFactory extends BaseQueryFactory {
             );
         }
         return innerQuery;
+    }
+
+    /**
+     * Creates a top-k ANN query to use as candidate generation for quantized radial search.
+     * The returned candidates will be rescored with full-precision vectors and filtered by radius.
+     */
+    private static Query createTopKQuery(CreateQueryRequest request, int k) {
+        KNNQueryFactory.CreateQueryRequest topKRequest = KNNQueryFactory.CreateQueryRequest.builder()
+            .knnEngine(request.getKnnEngine())
+            .indexName(request.getIndexName())
+            .fieldName(request.getFieldName())
+            .vector(request.getVector())
+            .originalVector(request.getOriginalVector())
+            .byteVector(request.getByteVector())
+            .vectorDataType(request.getVectorDataType())
+            .k(k)
+            .methodParameters(request.getMethodParameters())
+            .filter(request.getFilter().orElse(null))
+            .context(request.getContext().orElse(null))
+            .memoryOptimizedSearchEnabled(request.isMemoryOptimizedSearchEnabled())
+            .build();
+        return KNNQueryFactory.create(topKRequest);
     }
 
     /**
@@ -120,8 +151,8 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final String fieldName = request.getFieldName();
         final Float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
-        float errorThreshold = resolveErrorThreshold(request);
-        float adjustedRadius = radius * (1.0f - errorThreshold);
+        Float errorThreshold = resolveErrorThreshold(request);
+        float adjustedRadius = errorThreshold != null ? radius * (1.0f - errorThreshold) : radius;
 
         Float decay = resolveDecay(request);
         if (decay != null) {
@@ -191,8 +222,8 @@ public class RNNQueryFactory extends BaseQueryFactory {
         final String fieldName = request.getFieldName();
         final Float radius = request.getRadius();
         final Query filterQuery = getFilterQuery(request);
-        float errorThreshold = resolveErrorThreshold(request);
-        float adjustedRadius = radius * (1.0f - errorThreshold);
+        Float errorThreshold = resolveErrorThreshold(request);
+        float adjustedRadius = errorThreshold != null ? radius * (1.0f - errorThreshold) : radius;
 
         Float decay = resolveDecay(request);
         if (decay != null) {
@@ -251,7 +282,11 @@ public class RNNQueryFactory extends BaseQueryFactory {
         return null;
     }
 
-    private static float resolveErrorThreshold(final CreateQueryRequest request) {
+    /**
+     * Resolves the error threshold. Returns null if not explicitly set by the user (query params or index setting),
+     * which signals that the Cauchy-Schwarz partial rescoring path should be used for quantized indices.
+     */
+    private static Float resolveErrorThreshold(final CreateQueryRequest request) {
         Map<String, ?> params = request.getMethodParameters();
         if (params != null && params.containsKey("error_threshold")) {
             Object val = params.get("error_threshold");
@@ -261,12 +296,15 @@ public class RNNQueryFactory extends BaseQueryFactory {
         }
         try {
             if (request.getContext().isPresent()) {
-                return request.getContext().get().getIndexSettings().getSettings()
-                    .getAsFloat(KNNSettings.KNN_RADIAL_SEARCH_ERROR_THRESHOLD, 0.0f);
+                float setting = request.getContext().get().getIndexSettings().getSettings()
+                    .getAsFloat(KNNSettings.KNN_RADIAL_SEARCH_ERROR_THRESHOLD, -1.0f);
+                if (setting >= 0.0f) {
+                    return setting;
+                }
             }
         } catch (Exception e) {
             // index settings unavailable
         }
-        return 0.0f;
+        return null;
     }
 }

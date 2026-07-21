@@ -28,6 +28,9 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexWriter;
 
 import java.io.IOException;
+import java.util.List;
+
+import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
 
 /**
  * Writer for Faiss SQ vector fields. Unlike {@link org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsWriter}
@@ -125,6 +128,11 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
                 nativeIndexBuildStrategyFactory,
                 quantizedValues
             );
+            try {
+                writeQuantizationErrorFile(fieldWriter.getVectors(), quantizedValues);
+            } catch (Exception | AssertionError e) {
+                log.warn("Failed to write quantization error file for field [{}], partial rescoring will be unavailable", fieldInfo.name, e);
+            }
         } finally {
             IOUtils.close(flatVectorsReader);
         }
@@ -158,6 +166,11 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
                 floatVectorValues
             );
             doMergeOneField(fieldInfo, mergeState, null, null, segmentWriteState, nativeIndexBuildStrategyFactory, quantizedValues);
+            try {
+                writeQuantizationErrorFileFromValues(floatVectorValues, quantizedValues);
+            } catch (Exception | AssertionError e) {
+                log.warn("Failed to write quantization error file for field [{}] during merge, partial rescoring will be unavailable", fieldInfo.name, e);
+            }
         } finally {
             IOUtils.close(flatVectorsReader);
         }
@@ -172,6 +185,90 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
         finished = true;
         // flatVectorsWriter.finish() and close() are already called in flush/mergeOneField
         // before the native build. No additional finalization needed here.
+    }
+
+    /**
+     * Computes and writes per-vector Cauchy-Schwarz correction factors from the in-memory vector list (flush path).
+     */
+    @SuppressWarnings("unchecked")
+    private void writeQuantizationErrorFile(List<?> vectors, QuantizedByteVectorValues quantizedValues) throws IOException {
+        if (vectors.isEmpty()) {
+            return;
+        }
+        final float[] centroid = quantizedValues.getCentroid();
+        final OptimizedScalarQuantizer quantizer = quantizedValues.getQuantizer();
+        final int dim = centroid.length;
+        final byte[] quantizedScratch = new byte[dim];
+
+        try (QuantizationErrorFile.Writer writer = new QuantizationErrorFile.Writer(segmentWriteState, fieldInfo.name)) {
+            for (Object vecObj : vectors) {
+                float[] rawVector = (float[]) vecObj;
+                float[] vectorCopy = rawVector.clone();
+                OptimizedScalarQuantizer.QuantizationResult result = quantizer.scalarQuantize(
+                    vectorCopy, quantizedScratch, (byte) 1, centroid
+                );
+                // vectorCopy is now the residual (x - c), compute its norm
+                float residualNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    residualNormSq += vectorCopy[i] * vectorCopy[i];
+                }
+                float residualNorm = (float) Math.sqrt(residualNormSq);
+
+                // Dequantize to get reconstructed residual, then compute error norm
+                float[] dequantized = new float[dim];
+                OptimizedScalarQuantizer.deQuantize(
+                    quantizedScratch, dequantized, (byte) 1, result.lowerInterval(), result.upperInterval(), centroid
+                );
+                // Error = dequantized - rawVector (equivalently, dequantized_residual - residual)
+                float errorNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    float err = dequantized[i] - rawVector[i];
+                    errorNormSq += err * err;
+                }
+                float errorNorm = (float) Math.sqrt(errorNormSq);
+
+                writer.writeVector(errorNorm, residualNorm);
+            }
+        }
+    }
+
+    /**
+     * Computes and writes per-vector correction factors from FloatVectorValues (merge path).
+     */
+    private void writeQuantizationErrorFileFromValues(FloatVectorValues floatVectorValues, QuantizedByteVectorValues quantizedValues)
+        throws IOException {
+        final float[] centroid = quantizedValues.getCentroid();
+        final OptimizedScalarQuantizer quantizer = quantizedValues.getQuantizer();
+        final int dim = centroid.length;
+        final byte[] quantizedScratch = new byte[dim];
+
+        try (QuantizationErrorFile.Writer writer = new QuantizationErrorFile.Writer(segmentWriteState, fieldInfo.name)) {
+            for (int ord = 0; ord < floatVectorValues.size(); ord++) {
+                float[] rawVector = floatVectorValues.vectorValue(ord);
+                float[] vectorCopy = rawVector.clone();
+                OptimizedScalarQuantizer.QuantizationResult result = quantizer.scalarQuantize(
+                    vectorCopy, quantizedScratch, (byte) 1, centroid
+                );
+                float residualNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    residualNormSq += vectorCopy[i] * vectorCopy[i];
+                }
+                float residualNorm = (float) Math.sqrt(residualNormSq);
+
+                float[] dequantized = new float[dim];
+                OptimizedScalarQuantizer.deQuantize(
+                    quantizedScratch, dequantized, (byte) 1, result.lowerInterval(), result.upperInterval(), centroid
+                );
+                float errorNormSq = 0f;
+                for (int i = 0; i < dim; i++) {
+                    float err = dequantized[i] - rawVector[i];
+                    errorNormSq += err * err;
+                }
+                float errorNorm = (float) Math.sqrt(errorNormSq);
+
+                writer.writeVector(errorNorm, residualNorm);
+            }
+        }
     }
 
     @Override

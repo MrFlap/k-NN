@@ -26,7 +26,7 @@ import java.util.Locale;
  * ({@link KNN1040ScalarQuantizedVectorScorer}) to obtain quantized vectors for SIMD-accelerated scoring.
  */
 @UtilityClass
-class KNN1040ScalarQuantizedUtils {
+public class KNN1040ScalarQuantizedUtils {
     private static final String QUANTIZED_VECTOR_VALUES_FIELD_NAME = "quantizedVectorValues";
 
     /**
