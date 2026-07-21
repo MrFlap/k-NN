@@ -200,6 +200,23 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         }
     }
 
+    /**
+     * Searches the HNSW graph using a caller-provided scorer and accepted ordinals.
+     * This allows full-precision scoring on a restricted subset of vectors.
+     */
+    public void searchWithScorer(
+        final RandomVectorScorer scorer,
+        final KnnCollector knnCollector,
+        final Bits acceptedOrds
+    ) throws IOException {
+        final KnnCollector collector = createKnnCollector(knnCollector, scorer);
+        HnswGraphSearcher.search(scorer, collector, new FaissHnswGraph(hnsw, indexInput.clone()), acceptedOrds);
+    }
+
+    public VectorSimilarityFunction getVectorSimilarityFunction() {
+        return vectorSimilarityFunction;
+    }
+
     @VisibleForTesting
     KnnCollector createKnnCollector(final KnnCollector knnCollector, final RandomVectorScorer scorer) {
         final KnnCollector ordinalTranslatedKnnCollector = new OrdinalTranslatedKnnCollector(knnCollector, scorer::ordToDoc);

@@ -98,7 +98,12 @@ public final class QuantizationErrorFile {
             this.dataOffset = input.getFilePointer();
             // Read count from the end (just before the 16-byte footer)
             long fileLength = input.length();
-            input.seek(fileLength - CodecUtil.footerLength() - 4);
+            long countOffset = fileLength - CodecUtil.footerLength() - 4;
+            if (countOffset < dataOffset) {
+                this.numVectors = 0;
+                return;
+            }
+            input.seek(countOffset);
             this.numVectors = input.readInt();
         }
 
@@ -107,11 +112,13 @@ public final class QuantizationErrorFile {
         }
 
         public float getErrorNorm(int ord) throws IOException {
+            if (ord < 0 || ord >= numVectors) return 0f;
             input.seek(dataOffset + (long) ord * 8);
             return Float.intBitsToFloat(input.readInt());
         }
 
         public float getResidualNorm(int ord) throws IOException {
+            if (ord < 0 || ord >= numVectors) return 0f;
             input.seek(dataOffset + (long) ord * 8 + 4);
             return Float.intBitsToFloat(input.readInt());
         }

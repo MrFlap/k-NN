@@ -25,6 +25,7 @@ import java.io.IOException;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
 import static org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE;
 
+
 /**
  * A specialized {@link Lucene104ScalarQuantizedVectorScorer} that leverages
  * FAISS-style SIMD-accelerated scoring for scalar-quantized vectors with fallback.
@@ -171,12 +172,14 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
 
         // We make a copy as the quantization process mutates the input
         final float[] targetCopy = ArrayUtil.copyOfSubArray(target, 0, target.length);
+        // Keep original for error norm computation
+        final float[] targetOriginal = ArrayUtil.copyOfSubArray(target, 0, target.length);
 
         // For cosine similarity, the query vector is expected to already be normalized.
         // Normalization is performed upfront in KNNQueryBuilder via VectorTransformerFactory
         // for Lucene cosine with SQ 1-bit and flat methods and for Faiss.
 
-        // Perform scalar quantization
+        // Perform scalar quantization — after this, targetCopy becomes the residual (q - c)
         final OptimizedScalarQuantizer.QuantizationResult targetCorrectiveTerms = quantizer.scalarQuantize(
             targetCopy,
             scratch,
@@ -184,8 +187,33 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             quantizedByteVectorValues.getCentroid()
         );
 
+        // Compute query-side norms for Cauchy-Schwarz correction
+        // queryResidualNorm = ‖q - c‖ (targetCopy is now the residual after scalarQuantize)
+        float queryResidualNormSq = 0f;
+        for (int i = 0; i < targetCopy.length; i++) {
+            queryResidualNormSq += targetCopy[i] * targetCopy[i];
+        }
+        final float queryResidualNorm = (float) Math.sqrt(queryResidualNormSq);
+
+        // queryErrorNorm = ‖dequantized(q) - q‖ (quantization error of the query)
+        final float[] dequantizedQuery = new float[targetOriginal.length];
+        OptimizedScalarQuantizer.deQuantize(
+            scratch, dequantizedQuery, scalarEncoding.getQueryBits(),
+            targetCorrectiveTerms.lowerInterval(), targetCorrectiveTerms.upperInterval(),
+            quantizedByteVectorValues.getCentroid()
+        );
+        float queryErrorNormSq = 0f;
+        for (int i = 0; i < targetOriginal.length; i++) {
+            float err = dequantizedQuery[i] - targetOriginal[i];
+            queryErrorNormSq += err * err;
+        }
+        final float queryErrorNorm = (float) Math.sqrt(queryErrorNormSq);
+
         // Transpose half-bytes (nibbles) for SIMD-friendly layout
         OptimizedScalarQuantizer.transposeHalfByte(scratch, targetQuantized);
+
+        // Capture current .qef reader from ThreadLocal
+        final QuantizationErrorFile.Reader qefReader = QefContext.CURRENT.get();
 
         // Return Bulk SIMD scorer
         return new BulkSimdRandomVectorScorer(
@@ -195,7 +223,10 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             quantizedByteVectorValues,
             similarityFunction,
             targetCopy.length,
-            quantizedByteVectorValues.getCentroidDP()
+            quantizedByteVectorValues.getCentroidDP(),
+            qefReader,
+            queryResidualNorm,
+            queryErrorNorm
         );
     }
 
@@ -210,20 +241,10 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
      * and reused across all scoring calls.
      */
     private static class BulkSimdRandomVectorScorer extends RandomVectorScorer.AbstractRandomVectorScorer {
-        /**
-         * Constructs a SIMD-backed scorer and initializes the native search context.
-         *
-         * <p>This constructor pushes all necessary query state into native memory,
-         * including quantized query values and correction terms required for accurate scoring.
-         *
-         * @param targetQuantized       quantized query vector
-         * @param targetCorrectiveTerms correction terms from quantization
-         * @param addressAndSize        raw memory location of vector data
-         * @param knnVectorValues       vector storage abstraction
-         * @param similarityFunction    similarity function (IP or L2)
-         * @param dimension             vector dimensionality
-         * @param centroidDp            centroid dot-product correction
-         */
+        private final QuantizationErrorFile.Reader qefReader;
+        private final float queryResidualNorm;
+        private final float queryErrorNorm;
+
         public BulkSimdRandomVectorScorer(
             final byte[] targetQuantized,
             final OptimizedScalarQuantizer.QuantizationResult targetCorrectiveTerms,
@@ -231,9 +252,15 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             final QuantizedByteVectorValues knnVectorValues,
             final VectorSimilarityFunction similarityFunction,
             final int dimension,
-            final float centroidDp
+            final float centroidDp,
+            final QuantizationErrorFile.Reader qefReader,
+            final float queryResidualNorm,
+            final float queryErrorNorm
         ) {
             super(knnVectorValues);
+            this.qefReader = qefReader;
+            this.queryResidualNorm = queryResidualNorm;
+            this.queryErrorNorm = queryErrorNorm;
 
             // Initialize native SIMD search context
             SimdVectorComputeService.saveSQSearchContext(
@@ -252,32 +279,36 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             );
         }
 
-        /**
-         * Computes similarity scores for multiple vectors in bulk using native SIMD code.
-         *
-         * <p>This method is optimized for throughput and should be preferred when scoring
-         * large batches of vectors.
-         *
-         * @param internalVectorIds vector ordinals to score
-         * @param scores            output buffer for similarity scores
-         * @param numVectors        number of vectors to process
-         * @return implementation-defined value (typically unused aggregate)
-         */
         @Override
         public float bulkScore(final int[] internalVectorIds, final float[] scores, final int numVectors) {
-            return SimdVectorComputeService.scoreSimilarityInBulk(internalVectorIds, scores, numVectors);
+            float result = SimdVectorComputeService.scoreSimilarityInBulk(internalVectorIds, scores, numVectors);
+            if (qefReader != null) {
+                try {
+                    for (int i = 0; i < numVectors; i++) {
+                        float errorNorm = qefReader.getErrorNorm(internalVectorIds[i]);
+                        float residualNorm = qefReader.getResidualNorm(internalVectorIds[i]);
+                        scores[i] += queryResidualNorm * errorNorm + queryErrorNorm * residualNorm + queryErrorNorm * errorNorm;
+                    }
+                } catch (IOException e) {
+                    log.warn("Failed to read .qef correction factors in bulkScore", e);
+                }
+            }
+            return result;
         }
 
-        /**
-         * Computes the similarity score for a single vector using native SIMD code.
-         *
-         * @param internalVectorId the internal vector ID to score
-         * @return the computed similarity score
-         * @throws IOException if the native scoring operation fails
-         */
         @Override
         public float score(final int internalVectorId) {
-            return SimdVectorComputeService.scoreSimilarity(internalVectorId);
+            float rawScore = SimdVectorComputeService.scoreSimilarity(internalVectorId);
+            if (qefReader != null) {
+                try {
+                    float errorNorm = qefReader.getErrorNorm(internalVectorId);
+                    float residualNorm = qefReader.getResidualNorm(internalVectorId);
+                    rawScore += queryResidualNorm * errorNorm + queryErrorNorm * residualNorm + queryErrorNorm * errorNorm;
+                } catch (IOException e) {
+                    log.warn("Failed to read .qef correction factors", e);
+                }
+            }
+            return rawScore;
         }
     }
 }

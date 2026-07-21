@@ -47,6 +47,13 @@ public class Faiss1040ScalarQuantizedKnnVectorsReader extends AbstractNativeEngi
         return flatVectorsReader;
     }
 
+    /**
+     * Returns the memory-optimized searcher for this field, which provides direct HNSW graph access.
+     */
+    public VectorSearcher getMemoryOptimizedSearcher(String field) {
+        return loadMemoryOptimizedSearcherIfRequired(fieldInfos.fieldInfo(field));
+    }
+
     @Override
     public ByteVectorValues getByteVectorValues(String field) throws IOException {
         throw new UnsupportedOperationException("Byte vector search is not supported for Faiss scalar quantized format");

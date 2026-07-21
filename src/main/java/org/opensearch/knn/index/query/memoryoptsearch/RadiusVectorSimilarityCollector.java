@@ -28,16 +28,20 @@ import java.util.List;
  */
 public class RadiusVectorSimilarityCollector extends AbstractKnnCollector {
     private static final KnnSearchStrategy.Hnsw DEFAULT_STRATEGY = new KnnSearchStrategy.Hnsw(0);
+    private static final double DECAY_MAX_QUALITY = 1.0;
+    private static final double DEFAULT_DECAY = 0.95;
 
-    private final float similarity;
+    private final float resultSimilarity;
+    private final double decay;
     private final List<ScoreDoc> scoreDocList;
+    private float minCompetitiveSimilarity;
 
     /**
      * @param similarity minimum similarity for both traversal and collection.
      * @param visitLimit limit on number of nodes to visit.
      */
     public RadiusVectorSimilarityCollector(float similarity, long visitLimit) {
-        this(similarity, visitLimit, DEFAULT_STRATEGY);
+        this(similarity, visitLimit, DEFAULT_STRATEGY, DEFAULT_DECAY);
     }
 
     /**
@@ -46,25 +50,38 @@ public class RadiusVectorSimilarityCollector extends AbstractKnnCollector {
      * @param searchStrategy the HNSW search strategy (e.g. {@link KnnSearchStrategy.Seeded}).
      */
     public RadiusVectorSimilarityCollector(float similarity, long visitLimit, KnnSearchStrategy searchStrategy) {
+        this(similarity, visitLimit, searchStrategy, DEFAULT_DECAY);
+    }
+
+    /**
+     * @param similarity     minimum similarity for both traversal and collection.
+     * @param visitLimit     limit on number of nodes to visit.
+     * @param searchStrategy the HNSW search strategy (e.g. {@link KnnSearchStrategy.Seeded}).
+     * @param decay          decay factor for the traversal bound (0-1). Lower values terminate sooner.
+     */
+    public RadiusVectorSimilarityCollector(float similarity, long visitLimit, KnnSearchStrategy searchStrategy, double decay) {
         super(1, visitLimit, searchStrategy);
-        this.similarity = similarity;
+        this.resultSimilarity = similarity;
+        this.decay = decay;
         this.scoreDocList = new ArrayList<>();
+        this.minCompetitiveSimilarity = Math.nextDown(similarity);
     }
 
     @Override
     public boolean collect(int docId, float similarity) {
-        if (similarity >= this.similarity) {
+        if (similarity >= resultSimilarity) {
             scoreDocList.add(new ScoreDoc(docId, similarity));
+            return true;
+        } else if (decay < DECAY_MAX_QUALITY) {
+            minCompetitiveSimilarity = (float) (similarity + ((double) minCompetitiveSimilarity - similarity) * decay);
+            return true;
         }
-        // Return false: our minCompetitiveSimilarity is constant, no re-read needed.
         return false;
     }
 
     @Override
     public float minCompetitiveSimilarity() {
-        // Lucene 10.5's HnswGraphSearcher uses Math.nextUp(this) as the traversal bound.
-        // Returning nextDown(similarity) makes the effective cutoff exactly equal to similarity.
-        return Math.nextDown(similarity);
+        return minCompetitiveSimilarity;
     }
 
     @Override
