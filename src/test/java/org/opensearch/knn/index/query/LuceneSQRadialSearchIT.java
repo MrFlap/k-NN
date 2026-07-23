@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.query;
 
+import org.junit.Ignore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 
@@ -13,6 +14,8 @@ import static org.opensearch.knn.index.KNNSettings.KNN_INDEX;
 /**
  * Integration tests for radial search on Lucene 32x SQ quantized indices with HNSW method.
  */
+// Radial search on quantized indices is disabled due to poor recall from quantization error.
+@Ignore("Radial search on quantized indices is disabled; see CHANGELOG / PR #3448")
 public class LuceneSQRadialSearchIT extends AbstractRadialSearchOnQuantizedIndexIT {
 
     private static final String INDEX_NAME = "lucene_sq_radial_search_test";

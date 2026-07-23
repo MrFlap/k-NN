@@ -317,7 +317,7 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
         assertTrue(e.getMessage().contains("compression level=x8"));
     }
 
-    public void testValidateRadialSearch_whenFlatMethod32x_thenPasses() {
+    public void testValidateRadialSearch_whenFlatMethod32x_thenThrows() {
         // Given: a flat method field type with 32x compression
         KNNMethodContext methodContext = new KNNMethodContext(
             KNNEngine.LUCENE,
@@ -342,8 +342,13 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
         };
         KNNVectorFieldType fieldType = new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, config);
 
-        // When/Then: no exception — flat method with 32x is recognized as 1-bit SQ
-        fieldType.validateSupportRadialSearch(KNNEngine.LUCENE);
+        // When/Then: 32x is quantized, so it is rejected even when its method is flat.
+        UnsupportedOperationException e = expectThrows(
+            UnsupportedOperationException.class,
+            () -> fieldType.validateSupportRadialSearch(KNNEngine.LUCENE)
+        );
+        assertTrue(e.getMessage().contains("quantized indices"));
+        assertTrue(e.getMessage().contains("x32"));
     }
 
     public void testValidateRadialSearch_whenSQOneBit_thenPasses() {
@@ -396,12 +401,12 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
         };
         KNNVectorFieldType fieldType = new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, config);
 
-        // When/Then: throws — x32 with HNSW and non-SQ encoder is not allowed
+        // When/Then: throws — all compression-based quantized indices are unsupported.
         UnsupportedOperationException e = expectThrows(
             UnsupportedOperationException.class,
             () -> fieldType.validateSupportRadialSearch(KNNEngine.FAISS)
         );
-        assertTrue(e.getMessage().contains("1-bit SQ"));
+        assertTrue(e.getMessage().contains("quantized indices"));
         assertTrue(e.getMessage().contains("x32"));
     }
 
@@ -445,12 +450,12 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
 
     // --- isRescoringRequiredForRadial tests ---
 
-    public void testIsRescoringRequired_whenSQOneBit_thenTrue() {
+    public void testIsRescoringRequired_whenSQOneBit_thenFalse() {
         // Given: a field type with SQ 1-bit encoder
         KNNVectorFieldType fieldType = buildSQOneBitFieldType();
 
-        // When/Then: rescoring is required
-        assertTrue(fieldType.isRescoringRequiredForRadial());
+        // When/Then: radial search is unsupported for quantized indices, so rescoring is never required.
+        assertFalse(fieldType.isRescoringRequiredForRadial());
     }
 
     public void testIsRescoringRequired_whenNonQuantized_thenFalse() {
