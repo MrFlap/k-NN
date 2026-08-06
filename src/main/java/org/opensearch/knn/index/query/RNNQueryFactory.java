@@ -20,6 +20,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.search.approximate.ApproximateScoreQuery;
 
 /**
  * Class to create radius nearest neighbor queries
@@ -82,7 +83,7 @@ public class RNNQueryFactory extends BaseQueryFactory {
             } else {
                 maxResultsSize = MAX_RESULTS_RADIAL_RESCORING;
             }
-            return new RescoreRadialSearchQuery(
+            final Query rescoredQuery = new RescoreRadialSearchQuery(
                 innerQuery,
                 fieldName,
                 vector,
@@ -90,8 +91,17 @@ public class RNNQueryFactory extends BaseQueryFactory {
                 createQueryRequest.isMemoryOptimizedSearchEnabled(),
                 maxResultsSize
             );
+            if (supportsSizeBoundedQuantizedRadialSearch(createQueryRequest)) {
+                return new ApproximateScoreQuery(rescoredQuery, new SizeBoundedRadialSearchQuery(createQueryRequest));
+            }
+            return rescoredQuery;
         }
         return innerQuery;
+    }
+
+    private static boolean supportsSizeBoundedQuantizedRadialSearch(final CreateQueryRequest request) {
+        return request.isMemoryOptimizedSearchEnabled()
+            || KNNEngine.getEnginesThatCreateCustomSegmentFiles().contains(request.getKnnEngine()) == false;
     }
 
     /**

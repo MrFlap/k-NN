@@ -42,7 +42,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
 
 import static org.opensearch.knn.common.FieldInfoExtractor.extractKNNEngine;
 import static org.opensearch.knn.common.FieldInfoExtractor.getSpaceType;
@@ -207,11 +206,9 @@ public class ExactSearcher {
         assert context.isMemoryOptimizedSearchEnabled != null;
 
         final KNNEngine engine = extractKNNEngine(fieldInfo);
-        if (KNNEngine.FAISS != engine) {
-            throw new IllegalArgumentException(String.format(Locale.ROOT, "Engine [%s] does not support radial search", engine));
-        }
-        final SpaceType spaceType = getSpaceType(modelDao, fieldInfo);
-        final float minScore = context.isMemoryOptimizedSearchEnabled ? context.getRadius() : engine.score(context.getRadius(), spaceType);
+        final float minScore = context.getMinScore() != null ? context.getMinScore()
+            : context.isMemoryOptimizedSearchEnabled ? context.getRadius()
+            : engine.score(context.getRadius(), getSpaceType(modelDao, fieldInfo));
 
         return collectTopK(BulkVectorScorer.forRadialSearch(vectorScorer, matchedDocs, minScore), context.getMaxResultWindow(), false);
     }
@@ -421,6 +418,12 @@ public class ExactSearcher {
          * search is enabled, in which case it is already a score.
          */
         Float radius;
+
+        /**
+         * Optional normalized score cutoff used directly by radial exact rescoring. This avoids
+         * converting a threshold that was already normalized by the originating query engine.
+         */
+        Float minScore;
 
         /**
          * An optional iterator over the pre-filtered candidate document set. When {@code null},
