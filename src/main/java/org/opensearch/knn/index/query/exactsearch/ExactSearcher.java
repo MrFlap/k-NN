@@ -371,7 +371,11 @@ public class ExactSearcher {
 
         if (SegmentLevelQuantizationUtil.isAdcEnabled(quantizationInfo)) {
             float[] transformQuery = context.getFloatQueryVector().clone();
-            SegmentLevelQuantizationUtil.transformVectorWithADC(transformQuery, quantizationInfo, spaceType);
+            // TODO: exact ADC returns a per-segment offset that must be added to the raw score before translation for
+            // scores to be comparable across segments. The exact-search scorers translate internally, so plumbing it
+            // here needs the same treatment as MemoryOptimizedKNNWeight. Filtered/rescored ADC search is therefore
+            // still on the legacy (uncalibrated) scale.
+            SegmentLevelQuantizationUtil.transformVectorWithADC(transformQuery, quantizationInfo, spaceType, false);
             return VectorScorers.createScorer(
                 quantizedIteratorValues,
                 transformQuery,

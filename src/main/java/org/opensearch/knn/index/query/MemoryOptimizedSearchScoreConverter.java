@@ -80,6 +80,41 @@ public final class MemoryOptimizedSearchScoreConverter {
     }
 
     /**
+     * Adds a constant offset to each score in raw distance/similarity space.
+     *
+     * <p>Memory-optimized search returns scores already mapped into Lucene's range, but exact ADC needs to restore a
+     * per-segment constant that lives in raw space. This inverts the Lucene mapping, applies the offset, and maps
+     * back. Both mappings are strictly monotone, so this preserves the ordering within the segment while making the
+     * scores comparable against other segments.</p>
+     *
+     * <p>Must be called before {@link #convertToCosineScore}, while cosine scores are still in
+     * MAXIMUM_INNER_PRODUCT format.</p>
+     *
+     * @param scoreDocs results to adjust in place
+     * @param spaceType space type the scores were produced for
+     * @param rawScoreOffset offset to add in raw distance (L2) or inner product (IP/cosine) space
+     */
+    public static void applyRawScoreOffset(final ScoreDoc[] scoreDocs, final SpaceType spaceType, final float rawScoreOffset) {
+        switch (spaceType) {
+            case L2 -> {
+                for (final ScoreDoc scoreDoc : scoreDocs) {
+                    // score = 1 / (1 + distance)
+                    final float distance = 1f / scoreDoc.score - 1f;
+                    scoreDoc.score = SpaceType.L2.scoreTranslation(Math.max(distance + rawScoreOffset, 0f));
+                }
+            }
+            case INNER_PRODUCT, COSINESIMIL -> {
+                for (final ScoreDoc scoreDoc : scoreDocs) {
+                    // Reverse MAXIMUM_INNER_PRODUCT score translation to recover the raw inner product value.
+                    final float innerProductValue = scoreDoc.score >= 1 ? scoreDoc.score - 1 : 1 - 1 / scoreDoc.score;
+                    scoreDoc.score = SpaceType.INNER_PRODUCT.scoreTranslation(-1 * (innerProductValue + rawScoreOffset));
+                }
+            }
+            default -> throw new UnsupportedOperationException("Raw score offset is not supported for space type " + spaceType);
+        }
+    }
+
+    /**
      * This method converts Lucene's max inner product score to Faiss cosine score to ensure user
      * to get the same results with the same query.
      *

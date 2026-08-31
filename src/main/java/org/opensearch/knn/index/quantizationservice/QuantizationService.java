@@ -104,10 +104,12 @@ public final class QuantizationService<T, R> {
      * @param vector array of floats, modified in-place.
      * @param quantizationState The {@link QuantizationState} containing the state of the trained quantizer.
      * @param spaceType spaceType (l2 or innerproduct). Used to identify whether an additional correction term should be applied.
+     * @param exactAdc selects the exact ADC transform over the legacy one.
+     * @return the segment-level additive offset to apply to the raw ADC kernel output before score translation.
      */
-    public void transformWithADC(final QuantizationState quantizationState, T vector, final SpaceType spaceType) {
+    public float transformWithADC(final QuantizationState quantizationState, T vector, final SpaceType spaceType, final boolean exactAdc) {
         Quantizer<T, R> quantizer = QuantizerFactory.getQuantizer(quantizationState.getQuantizationParams());
-        quantizer.transformWithADC(vector, quantizationState, spaceType);
+        return quantizer.transformWithADC(vector, quantizationState, spaceType, exactAdc);
     }
 
     /**

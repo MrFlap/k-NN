@@ -107,6 +107,7 @@ public class KNNSettings {
     public static final String KNN_FAISS_AVX512_DISABLED = "knn.faiss.avx512.disabled";
     public static final String KNN_FAISS_AVX512_SPR_DISABLED = "knn.faiss.avx512_spr.disabled";
     public static final String KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED = "index.knn.disk.vector.shard_level_rescoring_disabled";
+    public static final String KNN_ADC_EXACT = "index.knn.adc.exact";
     public static final String KNN_DERIVED_SOURCE_ENABLED = "index.knn.derived_source.enabled";
     // Remote index build index settings
     public static final String KNN_INDEX_REMOTE_VECTOR_BUILD = "index.knn.remote_index_build.enabled";
@@ -156,6 +157,7 @@ public class KNNSettings {
     // 10% of the JVM heap
     public static final Integer KNN_DEFAULT_QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES = 60;
     public static final boolean KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_VALUE = false;
+    public static final boolean KNN_ADC_EXACT_VALUE = true;
     public static final ByteSizeValue KNN_REMOTE_VECTOR_BUILD_SIZE_LIMIT_DEFAULT_VALUE = new ByteSizeValue(0, ByteSizeUnit.MB);
     // TODO: Tune this default value based on benchmarking
     public static final ByteSizeValue KNN_INDEX_REMOTE_VECTOR_BUILD_THRESHOLD_DEFAULT_VALUE = new ByteSizeValue(50, ByteSizeUnit.MB);
@@ -183,6 +185,22 @@ public class KNNSettings {
     public static final Setting<Boolean> KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING = Setting.boolSetting(
         KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED,
         KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_VALUE,
+        IndexScope,
+        Dynamic
+    );
+
+    /**
+     * index.knn.adc.exact - When true, 1-bit scalar quantization scores a full-precision query against the exact
+     * reconstruction implied by each document's bits, so that scores are comparable across segments with different
+     * quantization thresholds. When false, the legacy transform is used, which drops the per-dimension spread
+     * weighting and therefore carries a segment-dependent scale and offset.
+     * <p>
+     * ADC is applied at query time only, so this can be flipped on an existing index without reindexing. That makes
+     * it usable for A/B recall comparisons on one index.
+     */
+    public static final Setting<Boolean> KNN_ADC_EXACT_SETTING = Setting.boolSetting(
+        KNN_ADC_EXACT,
+        KNN_ADC_EXACT_VALUE,
         IndexScope,
         Dynamic
     );
@@ -684,6 +702,10 @@ public class KNNSettings {
             return QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING;
         }
 
+        if (KNN_ADC_EXACT.equals(key)) {
+            return KNN_ADC_EXACT_SETTING;
+        }
+
         if (KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED.equals(key)) {
             return KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING;
         }
@@ -757,6 +779,7 @@ public class KNNSettings {
             QUANTIZATION_STATE_CACHE_SIZE_LIMIT_SETTING,
             QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING,
             KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING,
+            KNN_ADC_EXACT_SETTING,
             KNN_DERIVED_SOURCE_ENABLED_SETTING,
             MEMORY_OPTIMIZED_KNN_SEARCH_MODE_SETTING,
             // Index level remote vector build settings
@@ -975,6 +998,17 @@ public class KNNSettings {
 
     public static boolean isShardLevelRescoringDisabledForDiskBasedVector(final String indexName) {
         return getIndexSettings(indexName).getAsBoolean(KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED, false);
+    }
+
+    /**
+     * Whether 1-bit scalar quantization should score against the exact reconstruction (making scores comparable
+     * across segments) rather than using the legacy unweighted transform.
+     *
+     * @param indexName index being queried
+     * @return true when exact ADC is enabled for the index
+     */
+    public static boolean isExactAdcEnabled(final String indexName) {
+        return getIndexSettings(indexName).getAsBoolean(KNN_ADC_EXACT, KNN_ADC_EXACT_VALUE);
     }
 
     public void initialize(Client client, ClusterService clusterService) {

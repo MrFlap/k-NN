@@ -86,7 +86,7 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         final KNNEngine knnEngine,
         final VectorDataType vectorDataType,
         final byte[] quantizedTargetVector,
-        final float[] adcTransformedVector,
+        final AdcQuery adcQuery,
         final String modelId,
         final BitSet filterIdsBitSet,
         final int cardinality,
@@ -106,7 +106,8 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                             filterIdsBitSet,
                             reader,
                             knnEngine,
-                            spaceType
+                            spaceType,
+                            0f
                         );
                     }
 
@@ -130,21 +131,23 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                         filterIdsBitSet,
                         reader,
                         knnEngine,
-                        spaceType
+                        spaceType,
+                        0f
                     );
                 }
 
-                if (adcTransformedVector != null) {
+                if (adcQuery.vector() != null) {
                     // ADC case
                     return queryIndex(
-                        adcTransformedVector,
+                        adcQuery.vector(),
                         cardinality,
                         cardinality + 1,
                         context,
                         filterIdsBitSet,
                         reader,
                         knnEngine,
-                        spaceType
+                        spaceType,
+                        adcQuery.distanceOffset()
                     );
                 }
 
@@ -157,11 +160,22 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
                     filterIdsBitSet,
                     reader,
                     knnEngine,
-                    spaceType
+                    spaceType,
+                    0f
                 );
             } else {
                 // Radius search
-                return queryIndex(knnQuery.getVector(), cardinality, cardinality, context, filterIdsBitSet, reader, knnEngine, spaceType);
+                return queryIndex(
+                    knnQuery.getVector(),
+                    cardinality,
+                    cardinality,
+                    context,
+                    filterIdsBitSet,
+                    reader,
+                    knnEngine,
+                    spaceType,
+                    0f
+                );
             }
         } catch (Exception e) {
             GRAPH_QUERY_ERRORS.increment();
@@ -177,7 +191,8 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         final BitSet filterIdsBitSet,
         final SegmentReader reader,
         final KNNEngine knnEngine,
-        final SpaceType spaceType
+        final SpaceType spaceType,
+        final float adcRawScoreOffset
     ) throws IOException {
         assert (targetVector instanceof float[] || targetVector instanceof byte[]);
 
@@ -213,6 +228,12 @@ public class MemoryOptimizedKNNWeight extends KNNWeight {
         if (topDocs.scoreDocs.length == 0) {
             log.debug("[KNN] Query yielded 0 results");
             return EMPTY_TOPDOCS;
+        }
+        // Exact ADC needs a per-segment constant added in raw distance space. The collector has already selected this
+        // segment's top-k, and the offset is identical for every document in the segment, so applying it here yields
+        // the same result as applying it during scoring — it only affects the cross-segment merge that follows.
+        if (adcRawScoreOffset != 0f) {
+            MemoryOptimizedSearchScoreConverter.applyRawScoreOffset(topDocs.scoreDocs, spaceType, adcRawScoreOffset);
         }
         if (spaceType == SpaceType.COSINESIMIL) {
             MemoryOptimizedSearchScoreConverter.convertToCosineScore(topDocs.scoreDocs);

@@ -18,11 +18,23 @@ public class TopApproxKnnCollector extends TopKnnCollector {
 
     private final KNNEngine engine;
     private final SpaceType spaceType;
+    private final float rawScoreOffset;
 
     public TopApproxKnnCollector(int k, KNNEngine engine, SpaceType spaceType) {
+        this(k, engine, spaceType, 0f);
+    }
+
+    /**
+     * @param rawScoreOffset added to the raw similarity before score translation. Used by exact ADC to restore the
+     *                       per-segment constant term the ADC kernel cannot compute for itself, so that scores from
+     *                       segments with different quantization thresholds are comparable. It is constant within a
+     *                       segment and therefore does not change this collector's own ordering.
+     */
+    public TopApproxKnnCollector(int k, KNNEngine engine, SpaceType spaceType, float rawScoreOffset) {
         super(k, Integer.MAX_VALUE);
         this.spaceType = spaceType;
         this.engine = engine;
+        this.rawScoreOffset = rawScoreOffset;
     }
 
     /**
@@ -34,6 +46,6 @@ public class TopApproxKnnCollector extends TopKnnCollector {
      */
     @Override
     public boolean collect(int docId, float similarity) {
-        return super.collect(docId, engine.score(similarity, spaceType));
+        return super.collect(docId, engine.score(similarity + rawScoreOffset, spaceType));
     }
 }

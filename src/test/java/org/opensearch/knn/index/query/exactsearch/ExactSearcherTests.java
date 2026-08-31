@@ -47,6 +47,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.opensearch.knn.KNNRestTestCase.FIELD_NAME;
@@ -381,7 +382,8 @@ public class ExactSearcherTests extends KNNTestCase {
                 () -> org.opensearch.knn.index.query.SegmentLevelQuantizationUtil.transformVectorWithADC(
                     queryVector,
                     quantizationInfo,
-                    spaceType
+                    spaceType,
+                    false
                 )
             ).thenAnswer(invocation -> null);
 
@@ -399,7 +401,8 @@ public class ExactSearcherTests extends KNNTestCase {
                 () -> org.opensearch.knn.index.query.SegmentLevelQuantizationUtil.transformVectorWithADC(
                     queryVector,
                     quantizationInfo,
-                    spaceType
+                    spaceType,
+                    false
                 )
             );
 
@@ -457,13 +460,18 @@ public class ExactSearcherTests extends KNNTestCase {
                 () -> org.opensearch.knn.index.query.SegmentLevelQuantizationUtil.isAdcEnabled(quantizationInfo)
             ).thenReturn(true);
             quantizationUtilMockedStatic.when(
-                () -> org.opensearch.knn.index.query.SegmentLevelQuantizationUtil.transformVectorWithADC(any(float[].class), any(), any())
+                () -> org.opensearch.knn.index.query.SegmentLevelQuantizationUtil.transformVectorWithADC(
+                    any(float[].class),
+                    any(),
+                    any(),
+                    anyBoolean()
+                )
             ).thenAnswer(invocation -> {
                 float[] vec = invocation.getArgument(0);
                 for (int i = 0; i < vec.length; i++) {
                     vec[i] = 999.0f;
                 }
-                return null;
+                return 0f;
             });
 
             final KNNVectorValues knnFloatVectorValues = TestVectorValues.createKNNFloatVectorValues(

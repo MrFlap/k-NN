@@ -514,7 +514,7 @@ public abstract class KNNWeight extends Weight {
 
         // TODO: Change type of vector once more quantization methods are supported
         byte[] quantizedVector = maybeQuantizeVector(segmentLevelQuantizationInfo);
-        float[] transformedVector = maybeTransformVector(segmentLevelQuantizationInfo, spaceType);
+        AdcQuery adcQuery = maybeTransformVector(segmentLevelQuantizationInfo, spaceType);
         /*
          * If filters match all docs in this segment, then null should be passed as filterBitSet
          * so that it will not do a bitset look up in bottom search layer.
@@ -530,7 +530,7 @@ public abstract class KNNWeight extends Weight {
             knnEngine,
             vectorDataType,
             quantizedVector,
-            transformedVector,
+            adcQuery,
             modelId,
             annFilter,
             filterCardinality,
@@ -555,6 +555,7 @@ public abstract class KNNWeight extends Weight {
      * @param knnEngine Engine type configured for the target field.
      * @param vectorDataType Vector data type configured for the target field.
      * @param quantizedVector Quantized query vector if quantization is enabled for the target field. It can be null. Quantized query vector if quantization is enabled for the target field. It can be null. Quantized query vector if quantization is enabled for the target field. It can be null. Quantized query vector if quantization is enabled for the target field. It can be null. Quantized query vector if quantization is enabled for the target field. It can be null. Quantized query vector if quantization is enabled for the target field. It can be null.
+     * @param adcQuery ADC-transformed query and its segment offset. {@link AdcQuery#NONE} when ADC is not enabled.
      * @param modelId Model id. It can be null if the index for searching was not derived from a trained index.
      * @param filterIdsBitSet Bit set for filtering a valid document for collecting.
      * @param cardinality Cardinality of filtering bit set. It will be the total number of documents if no filtering presents.
@@ -570,7 +571,7 @@ public abstract class KNNWeight extends Weight {
         final KNNEngine knnEngine,
         final VectorDataType vectorDataType,
         final byte[] quantizedVector,
-        final float[] transformedVector,
+        final AdcQuery adcQuery,
         final String modelId,
         final BitSet filterIdsBitSet,
         final int cardinality,
@@ -779,19 +780,37 @@ public abstract class KNNWeight extends Weight {
     }
 
     /**
+     * An ADC-transformed query together with the segment-level offset that must be added to the raw distance or
+     * similarity the ADC kernel returns, before score translation. The offset is constant across all documents in
+     * the segment, so it does not affect that segment's own ordering — it only makes the segment's scores
+     * comparable with other segments, which have different quantization thresholds.
+     *
+     * @param vector the transformed query, or null when ADC is not enabled for the segment
+     * @param distanceOffset the additive offset in raw distance/similarity space
+     */
+    protected record AdcQuery(float[] vector, float distanceOffset) {
+        static final AdcQuery NONE = new AdcQuery(null, 0f);
+    }
+
+    /**
      * If ADC is enabled from the segment level, then we need to transform the query vector for ADC.
      * @param segmentLevelQuantizationInfo {@link SegmentLevelQuantizationInfo}
      * @param spaceType {@link SpaceType}
-     * @return transformed query vector if ADC is enabled, otherwise null
+     * @return the transformed query and its segment offset if ADC is enabled, otherwise {@link AdcQuery#NONE}
      */
-    private float[] maybeTransformVector(SegmentLevelQuantizationInfo segmentLevelQuantizationInfo, SpaceType spaceType) {
+    private AdcQuery maybeTransformVector(SegmentLevelQuantizationInfo segmentLevelQuantizationInfo, SpaceType spaceType) {
         if (SegmentLevelQuantizationUtil.isAdcEnabled(segmentLevelQuantizationInfo)) {
             float[] transformedVector = knnQuery.getQueryVector().clone();
-            SegmentLevelQuantizationUtil.transformVectorWithADC(transformedVector, segmentLevelQuantizationInfo, spaceType);
-            return transformedVector;
+            float offset = SegmentLevelQuantizationUtil.transformVectorWithADC(
+                transformedVector,
+                segmentLevelQuantizationInfo,
+                spaceType,
+                KNNSettings.isExactAdcEnabled(knnQuery.getIndexName())
+            );
+            return new AdcQuery(transformedVector, offset);
         }
 
-        return null;
+        return AdcQuery.NONE;
     }
 
     private static int[] bitSetToIntArray(final BitSet bitSet) {

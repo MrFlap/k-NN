@@ -517,7 +517,7 @@ public class FaissMemoryOptimizedSearcherTests extends KNNTestCase {
                 spaceType == SpaceType.COSINESIMIL
             );
 
-            (QuantizationService.getInstance()).transformWithADC(testingSpec.quantizationState, rawFloat, spaceType);
+            (QuantizationService.getInstance()).transformWithADC(testingSpec.quantizationState, rawFloat, spaceType, false);
 
             query = queryForVectorReader = rawFloat;
 

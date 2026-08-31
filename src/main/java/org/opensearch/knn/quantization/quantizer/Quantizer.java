@@ -48,6 +48,12 @@ public interface Quantizer<T, R> {
      *
      * @param vector the vector to transform.
      * @param state  the quantization state containing parameters for quantization.
+     * @param exactAdc when true, encode the exact distance to the reconstruction implied by the document bits;
+     *                 when false, use the legacy unweighted transform.
+     * @return a segment-level additive offset that must be applied to the raw distance/similarity produced by the
+     *         ADC kernel before score translation. Zero when no offset is required.
      */
-    default void transformWithADC(T vector, QuantizationState state, SpaceType spaceType) {}
+    default float transformWithADC(T vector, QuantizationState state, SpaceType spaceType, boolean exactAdc) {
+        return 0f;
+    }
 }

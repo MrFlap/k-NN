@@ -54,7 +54,7 @@ public class DefaultKNNWeight extends KNNWeight {
         final KNNEngine knnEngine,
         final VectorDataType vectorDataType,
         final byte[] quantizedVector,
-        final float[] transformedVector,
+        final AdcQuery adcQuery,
         final String modelId,
         final BitSet filterIdsBitSet,
         final int cardinality,
@@ -131,7 +131,7 @@ public class DefaultKNNWeight extends KNNWeight {
                 } else {
                     results = JNIService.queryIndex(
                         indexAllocation.getMemoryAddress(),
-                        transformedVector == null ? knnQuery.getQueryVector() : transformedVector,
+                        adcQuery.vector() == null ? knnQuery.getQueryVector() : adcQuery.vector(),
                         k,
                         knnQuery.getMethodParameters(),
                         knnEngine,
@@ -164,7 +164,8 @@ public class DefaultKNNWeight extends KNNWeight {
         TopApproxKnnCollector collector = new TopApproxKnnCollector(
             k > 0 ? k : knnQuery.getContext().getMaxResultWindow(),
             knnEngine,
-            quantizedVector != null ? SpaceType.HAMMING : spaceType
+            quantizedVector != null ? SpaceType.HAMMING : spaceType,
+            adcQuery.distanceOffset()
         );
         for (KNNQueryResult knnQueryResult : results) {
             collector.incVisitedCount(1);

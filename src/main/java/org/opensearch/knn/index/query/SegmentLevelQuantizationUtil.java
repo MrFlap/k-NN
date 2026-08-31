@@ -62,17 +62,20 @@ public class SegmentLevelQuantizationUtil {
      * @param vector array of floats, modified in-place.
      * @param segmentLevelQuantizationInfo quantization state including below and above threshold means to perform the transformation.
      * @param spaceType spaceType (l2 or innerproduct). Used to identify whether an additional correction term should be applied.
+     * @param exactAdc selects the exact ADC transform over the legacy one.
+     * @return the segment-level additive offset to apply to the raw ADC kernel output before score translation.
      */
-    public static void transformVectorWithADC(
+    public static float transformVectorWithADC(
         float[] vector,
         final SegmentLevelQuantizationInfo segmentLevelQuantizationInfo,
-        SpaceType spaceType
+        SpaceType spaceType,
+        final boolean exactAdc
     ) {
         if (segmentLevelQuantizationInfo == null) {
-            return;
+            return 0f;
         }
         final QuantizationService quantizationService = QuantizationService.getInstance();
-        quantizationService.transformWithADC(segmentLevelQuantizationInfo.getQuantizationState(), vector, spaceType);
+        return quantizationService.transformWithADC(segmentLevelQuantizationInfo.getQuantizationState(), vector, spaceType, exactAdc);
     }
 
     /**
