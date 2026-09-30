@@ -5,6 +5,12 @@
 
 package org.opensearch.knn.index.codec.derivedsource;
 
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
+import java.util.Arrays;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.Term;
@@ -74,5 +80,46 @@ public class DerivedSourceIndexOperationListenerTests extends KNNTestCase {
             operation.parsedDoc().getMediaType()
         );
         assertEquals(KNN10010DerivedSourceStoredFieldsWriter.MASK.intValue(), maskedSourceBinaryValueMap.v2().get(fieldName));
+    }
+
+    public void testPreIndex_whenFieldIsRandomOrthogonallyTransformed_thenSourceHasOriginalVector() throws Exception {
+        String fieldName = "test-vector";
+        float[] userVector = { 1.0f, -2.0f, 3.0f, 0.5f, 7.0f };
+        float[] backendVector = RandomOrthogonalVectorTransformer.forDimension(userVector.length).transform(userVector, false);
+        float[] indexedVector = Arrays.copyOf(backendVector, backendVector.length);
+
+        FieldType fieldType = new FieldType(KnnFloatVectorField.createFieldType(userVector.length, VectorSimilarityFunction.EUCLIDEAN));
+        fieldType.putAttribute(KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM, KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1);
+        fieldType.freeze();
+
+        BytesStreamOutput bStream = new BytesStreamOutput();
+        XContentBuilder builder = MediaTypeRegistry.contentBuilder(XContentType.JSON, bStream).map(Map.of(fieldName, userVector));
+        builder.close();
+        BytesReference originalSource = bStream.bytes();
+
+        ParseContext.Document document = new ParseContext.Document();
+        document.add(new DerivedKnnFloatVectorField(fieldName, indexedVector, fieldType, true));
+        document.add(new StoredField(SourceFieldMapper.NAME, originalSource.toBytesRef()));
+        Engine.Index operation = new Engine.Index(
+            new Term("test-iud"),
+            1,
+            new ParsedDocument(null, null, null, null, List.of(document), originalSource, XContentType.JSON, null)
+        );
+
+        operation = new DerivedSourceIndexOperationListener().preIndex(null, operation);
+        Map<String, Object> modifiedSource = XContentHelper.convertToMap(
+            operation.parsedDoc().source(),
+            true,
+            operation.parsedDoc().getMediaType()
+        ).v2();
+
+        @SuppressWarnings("unchecked")
+        List<Number> sourceVector = (List<Number>) modifiedSource.get(fieldName);
+        assertEquals(userVector.length, sourceVector.size());
+        for (int i = 0; i < userVector.length; i++) {
+            assertEquals(userVector[i], sourceVector.get(i).floatValue(), 1e-5f);
+        }
+        // The indexed vector itself stays transformed.
+        assertArrayEquals(backendVector, indexedVector, 0f);
     }
 }

@@ -20,6 +20,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+import static org.opensearch.knn.common.KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM;
+import static org.opensearch.knn.common.KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.buildDocValuesFieldType;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createStoredFieldForByteVector;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.createStoredFieldForFloatVector;
@@ -56,7 +58,14 @@ public final class LuceneFieldStrategy implements EngineFieldStrategy {
             vectorFieldType = null;
         }
 
-        return new FieldTypeConfig(fieldType, vectorFieldType, knnLibraryIndexingContext.getVectorTransformer(), false);
+        VectorTransformer vectorTransformer = knnLibraryIndexingContext.getVectorTransformer();
+        if (knnMappingConfig.isRandomOrthogonalTransformEnabled()) {
+            fieldType = withRandomOrthogonalTransformAttribute(fieldType);
+            vectorFieldType = vectorFieldType == null ? null : withRandomOrthogonalTransformAttribute(vectorFieldType);
+            vectorTransformer = VectorTransformerFactory.withRandomOrthogonalTransform(vectorTransformer, knnMappingConfig.getDimension());
+        }
+
+        return new FieldTypeConfig(fieldType, vectorFieldType, vectorTransformer, false);
     }
 
     @Override
@@ -104,5 +113,13 @@ public final class LuceneFieldStrategy implements EngineFieldStrategy {
             fields.add(createStoredFieldForByteVector(name, array));
         }
         return Optional.of(fields);
+    }
+
+    // Marks the field's stored vectors as transformed so readers of stored vectors can undo it.
+    private static FieldType withRandomOrthogonalTransformAttribute(final FieldType frozen) {
+        final FieldType fieldType = new FieldType(frozen);
+        fieldType.putAttribute(RANDOM_ORTHOGONAL_TRANSFORM, RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1);
+        fieldType.freeze();
+        return fieldType;
     }
 }

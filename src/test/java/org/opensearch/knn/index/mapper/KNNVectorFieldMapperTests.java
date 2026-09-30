@@ -7,6 +7,7 @@ package org.opensearch.knn.index.mapper;
 
 import lombok.SneakyThrows;
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KnnByteVectorField;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.index.DocValuesType;
@@ -31,6 +32,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexSettings;
@@ -139,7 +141,7 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             )
         );
 
-        assertEquals(11, builder.getParameters().size());
+        assertEquals(12, builder.getParameters().size());
         List<String> actualParams = builder.getParameters().stream().map(a -> a.name).collect(Collectors.toList());
         List<String> expectedParams = Arrays.asList(
             "store",
@@ -152,7 +154,8 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             MODE_PARAMETER,
             COMPRESSION_LEVEL_PARAMETER,
             KNNConstants.TOP_LEVEL_PARAMETER_SPACE_TYPE,
-            TOP_LEVEL_PARAMETER_ENGINE
+            TOP_LEVEL_PARAMETER_ENGINE,
+            KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM
         );
         assertEquals(expectedParams, actualParams);
     }
@@ -3692,6 +3695,106 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             .aliasesVersion(0)
             .creationDate(0)
             .build();
+    }
+
+    public void testRandomOrthogonalTransform_whenSQOnNewIndex_thenEnabledByDefault() throws IOException {
+        for (KNNEngine engine : List.of(KNNEngine.FAISS, KNNEngine.LUCENE)) {
+            KNNVectorFieldMapper mapper = buildRandomOrthogonalTransformMapper(engine, true, null, CURRENT);
+            assertRandomOrthogonalTransform(mapper, true);
+            assertFalse(mapperXContent(mapper).contains(KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM));
+        }
+    }
+
+    public void testRandomOrthogonalTransform_whenExplicitlyDisabled_thenNotApplied() throws IOException {
+        for (KNNEngine engine : List.of(KNNEngine.FAISS, KNNEngine.LUCENE)) {
+            KNNVectorFieldMapper mapper = buildRandomOrthogonalTransformMapper(engine, true, false, CURRENT);
+            assertRandomOrthogonalTransform(mapper, false);
+            assertTrue(mapperXContent(mapper).contains("\"" + KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM + "\":false"));
+        }
+    }
+
+    public void testRandomOrthogonalTransform_whenNotSQ_thenNotApplied() throws IOException {
+        for (KNNEngine engine : List.of(KNNEngine.FAISS, KNNEngine.LUCENE)) {
+            assertRandomOrthogonalTransform(buildRandomOrthogonalTransformMapper(engine, false, null, CURRENT), false);
+            expectThrows(MapperParsingException.class, () -> buildRandomOrthogonalTransformMapper(engine, false, true, CURRENT));
+        }
+    }
+
+    public void testRandomOrthogonalTransform_whenIndexCreatedBeforeMinVersion_thenNotAppliedAndNotConfigurable() throws IOException {
+        for (KNNEngine engine : List.of(KNNEngine.FAISS, KNNEngine.LUCENE)) {
+            assertRandomOrthogonalTransform(buildRandomOrthogonalTransformMapper(engine, true, null, Version.V_3_8_0), false);
+            expectThrows(MapperParsingException.class, () -> buildRandomOrthogonalTransformMapper(engine, true, true, Version.V_3_8_0));
+            expectThrows(MapperParsingException.class, () -> buildRandomOrthogonalTransformMapper(engine, true, false, Version.V_3_8_0));
+        }
+    }
+
+    private KNNVectorFieldMapper buildRandomOrthogonalTransformMapper(KNNEngine engine, boolean sq, Boolean configured, Version version)
+        throws IOException {
+        XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
+            .startObject()
+            .field(TYPE_FIELD_NAME, KNN_VECTOR_TYPE)
+            .field(DIMENSION_FIELD_NAME, 100);
+        if (configured != null) {
+            xContentBuilder.field(KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM, configured);
+        }
+        xContentBuilder.startObject(KNN_METHOD)
+            .field(NAME, METHOD_HNSW)
+            .field(KNN_ENGINE, engine.getName())
+            .field(METHOD_PARAMETER_SPACE_TYPE, SpaceType.L2.getValue());
+        if (sq) {
+            xContentBuilder.startObject(PARAMETERS)
+                .startObject(METHOD_ENCODER_PARAMETER)
+                .field(NAME, ENCODER_SQ)
+                .startObject(PARAMETERS)
+                .field(KNNConstants.LUCENE_SQ_BITS, engine == KNNEngine.FAISS ? 16 : KNNConstants.LUCENE_SQ_DEFAULT_BITS)
+                .endObject()
+                .endObject()
+                .endObject();
+        }
+        xContentBuilder.endObject().endObject();
+
+        Settings settings = Settings.builder().put(settings(version).build()).put(KNN_INDEX, true).build();
+        KNNVectorFieldMapper.TypeParser typeParser = new KNNVectorFieldMapper.TypeParser(() -> mock(ModelDao.class));
+        KNNVectorFieldMapper.Builder builder = (KNNVectorFieldMapper.Builder) typeParser.parse(
+            "test-field-name",
+            xContentBuilderToMap(xContentBuilder),
+            dobuildParserContext("test", settings, version)
+        );
+        return builder.build(new Mapper.BuilderContext(settings, new ContentPath()));
+    }
+
+    private void assertRandomOrthogonalTransform(KNNVectorFieldMapper mapper, boolean expected) {
+        final int dimension = 100;
+        assertEquals(expected, mapper.fieldType().getKnnMappingConfig().isRandomOrthogonalTransformEnabled());
+
+        final float[] vector = new float[dimension];
+        for (int i = 0; i < dimension; i++) {
+            vector[i] = randomFloat() * 2 - 1;
+        }
+        final float[] original = Arrays.copyOf(vector, dimension);
+        final float[] expectedVector = expected
+            ? RandomOrthogonalVectorTransformer.forDimension(dimension).transform(vector, false)
+            : original;
+
+        // Query vectors are transformed without modifying the input.
+        assertArrayEquals(expectedVector, mapper.fieldType().transformQueryVector(vector), 0f);
+        assertArrayEquals(original, vector, 0f);
+
+        // Indexed vectors are transformed, and every Lucene field for the vector is marked for readers to undo it.
+        final float[] indexed = mapper.getVectorTransformer().transform(Arrays.copyOf(vector, dimension), true);
+        assertArrayEquals(expectedVector, indexed, 0f);
+        for (Field field : mapper.getFieldsForFloatVector(indexed, false)) {
+            if (field.fieldType().stored()) {
+                continue;
+            }
+            assertEquals(field.toString(), expected, RandomOrthogonalVectorTransformer.isAppliedTo(field.fieldType().getAttributes()));
+        }
+    }
+
+    private static String mapperXContent(KNNVectorFieldMapper mapper) throws IOException {
+        XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
+        mapper.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        return builder.endObject().toString();
     }
 
     public Mapper.TypeParser.ParserContext buildParserContext(String indexName, Settings settings) {

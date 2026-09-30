@@ -30,6 +30,8 @@ import java.io.IOException;
 
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
+import static org.opensearch.knn.common.KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM;
+import static org.opensearch.knn.common.KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
 import static org.opensearch.knn.common.KNNConstants.QFRAMEWORK_CONFIG;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
@@ -79,6 +81,9 @@ public final class FaissFieldStrategy implements EngineFieldStrategy {
 
         fieldType.putAttribute(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue());
         fieldType.putAttribute(KNN_ENGINE, knnEngine.getName());
+        if (knnMappingConfig.isRandomOrthogonalTransformEnabled()) {
+            fieldType.putAttribute(RANDOM_ORTHOGONAL_TRANSFORM, RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1);
+        }
         try {
             fieldType.putAttribute(
                 PARAMETERS,
@@ -107,6 +112,9 @@ public final class FaissFieldStrategy implements EngineFieldStrategy {
         fieldType.freeze();
 
         VectorTransformer vectorTransformer = knnLibraryIndexingContext.getVectorTransformer();
+        if (knnMappingConfig.isRandomOrthogonalTransformEnabled()) {
+            vectorTransformer = VectorTransformerFactory.withRandomOrthogonalTransform(vectorTransformer, knnMappingConfig.getDimension());
+        }
         return new FieldTypeConfig(fieldType, null, vectorTransformer, useLuceneBasedVectorField);
     }
 

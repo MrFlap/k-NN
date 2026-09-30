@@ -263,7 +263,7 @@ public class KNNVectorFieldType extends MappedFieldType {
      *
      * The transformation process follows this order:
      * 1. If vector is not FLOAT or HALF_FLOAT type, no transformation is performed
-     * 2. Attempts to use KNN method context if present
+     * 2. Attempts to use KNN method context if present, followed by the random orthogonal transform when the field uses it
      * 3. Falls back to model ID if KNN method context is not available
      * 4. Throws exception if neither configuration is present
      */
@@ -274,12 +274,19 @@ public class KNNVectorFieldType extends MappedFieldType {
         final Optional<KNNMethodContext> knnMethodContext = knnMappingConfig.getKnnMethodContext();
         if (knnMethodContext.isPresent()) {
             KNNMethodContext context = knnMethodContext.get();
-            return VectorTransformerFactory.getVectorTransformer(
+            VectorTransformer vectorTransformer = VectorTransformerFactory.getVectorTransformer(
                 context.getKnnEngine(),
                 context.getSpaceType(),
                 context.getMethodComponentContext(),
                 vectorDataType
-            ).transform(vector, false);
+            );
+            if (knnMappingConfig.isRandomOrthogonalTransformEnabled()) {
+                vectorTransformer = VectorTransformerFactory.withRandomOrthogonalTransform(
+                    vectorTransformer,
+                    knnMappingConfig.getDimension()
+                );
+            }
+            return vectorTransformer.transform(vector, false);
         }
         final Optional<String> modelId = knnMappingConfig.getModelId();
         if (modelId.isPresent()) {

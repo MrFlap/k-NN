@@ -17,6 +17,7 @@ import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.index.fielddata.ScriptDocValues;
 
@@ -84,9 +85,34 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
      * @throws IllegalArgumentException If the type of values is unsupported.
      */
     public static KNNVectorScriptDocValues<?> create(KnnVectorValues knnVectorValues, String fieldName, VectorDataType vectorDataType) {
+        return create(knnVectorValues, fieldName, vectorDataType, false);
+    }
+
+    /**
+     * Creates a KNNVectorScriptDocValues object based on the provided parameters.
+     *
+     * @param knnVectorValues          The DocIdSetIterator representing the vector values.
+     * @param fieldName       The name of the field.
+     * @param vectorDataType  The data type of the vector.
+     * @param undoRandomOrthogonalTransform Whether float vectors are stored transformed and must be returned with the random
+     *                                      orthogonal transform undone.
+     * @return A KNNVectorScriptDocValues object based on the type of the values.
+     * @throws IllegalArgumentException If the type of values is unsupported.
+     */
+    public static KNNVectorScriptDocValues<?> create(
+        KnnVectorValues knnVectorValues,
+        String fieldName,
+        VectorDataType vectorDataType,
+        boolean undoRandomOrthogonalTransform
+    ) {
         Objects.requireNonNull(knnVectorValues, "values must not be null");
         if (knnVectorValues instanceof FloatVectorValues) {
-            return new KNNFloatVectorScriptDocValues((FloatVectorValues) knnVectorValues, fieldName, vectorDataType);
+            return new KNNFloatVectorScriptDocValues(
+                (FloatVectorValues) knnVectorValues,
+                fieldName,
+                vectorDataType,
+                undoRandomOrthogonalTransform
+            );
         } else if (knnVectorValues instanceof ByteVectorValues) {
             return new KNNByteVectorScriptDocValues((ByteVectorValues) knnVectorValues, fieldName, vectorDataType);
         } else {
@@ -95,9 +121,23 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
     }
 
     public static KNNVectorScriptDocValues<?> create(DocIdSetIterator docIdSetIterator, String fieldName, VectorDataType vectorDataType) {
+        return create(docIdSetIterator, fieldName, vectorDataType, false);
+    }
+
+    public static KNNVectorScriptDocValues<?> create(
+        DocIdSetIterator docIdSetIterator,
+        String fieldName,
+        VectorDataType vectorDataType,
+        boolean undoRandomOrthogonalTransform
+    ) {
         Objects.requireNonNull(docIdSetIterator, "values must not be null");
         if (docIdSetIterator instanceof BinaryDocValues) {
-            return new KNNNativeVectorScriptDocValues<>((BinaryDocValues) docIdSetIterator, fieldName, vectorDataType);
+            return new KNNNativeVectorScriptDocValues<>(
+                (BinaryDocValues) docIdSetIterator,
+                fieldName,
+                vectorDataType,
+                undoRandomOrthogonalTransform
+            );
         } else {
             throw new IllegalArgumentException("Unsupported values type: " + docIdSetIterator.getClass());
         }
@@ -135,10 +175,12 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
     private static final class KNNFloatVectorScriptDocValues extends KNNVectorScriptDocValues<float[]> {
         private final FloatVectorValues values;
         private final KnnVectorValues.DocIndexIterator iterator;
+        private final boolean undoRandomOrthogonalTransform;
 
-        KNNFloatVectorScriptDocValues(FloatVectorValues values, String field, VectorDataType type) {
+        KNNFloatVectorScriptDocValues(FloatVectorValues values, String field, VectorDataType type, boolean undoRandomOrthogonalTransform) {
             super(values.iterator(), field, type);
             this.values = values;
+            this.undoRandomOrthogonalTransform = undoRandomOrthogonalTransform;
             this.iterator = super.vectorValues instanceof KnnVectorValues.DocIndexIterator
                 ? (KnnVectorValues.DocIndexIterator) super.vectorValues
                 : values.iterator();
@@ -150,21 +192,32 @@ public abstract class KNNVectorScriptDocValues<T> extends ScriptDocValues<T> {
             if (ord == KnnVectorValues.DocIndexIterator.NO_MORE_DOCS) {
                 throw new IllegalStateException("No more ordinals to retrieve vector values.");
             }
-            return values.vectorValue(ord);
+            final float[] vector = values.vectorValue(ord);
+            // vectorValue may return a buffer owned by the reader, so undo the transform on a copy.
+            return undoRandomOrthogonalTransform
+                ? RandomOrthogonalVectorTransformer.forDimension(vector.length).inverseTransform(vector, false)
+                : vector;
         }
     }
 
     private static final class KNNNativeVectorScriptDocValues<T> extends KNNVectorScriptDocValues<T> {
         private final BinaryDocValues values;
+        private final boolean undoRandomOrthogonalTransform;
 
-        KNNNativeVectorScriptDocValues(BinaryDocValues values, String field, VectorDataType type) {
+        KNNNativeVectorScriptDocValues(BinaryDocValues values, String field, VectorDataType type, boolean undoRandomOrthogonalTransform) {
             super(values, field, type);
             this.values = values;
+            this.undoRandomOrthogonalTransform = undoRandomOrthogonalTransform;
         }
 
         @Override
         protected T doGetValue() throws IOException {
-            return getVectorDataType().getVectorFromBytesRef(values.binaryValue());
+            final T vector = getVectorDataType().getVectorFromBytesRef(values.binaryValue());
+            // Deserialization returns a new array, so the transform can be undone in place.
+            if (undoRandomOrthogonalTransform && vector instanceof float[] floats) {
+                RandomOrthogonalVectorTransformer.forDimension(floats.length).inverseTransform(floats, true);
+            }
+            return vector;
         }
     }
 

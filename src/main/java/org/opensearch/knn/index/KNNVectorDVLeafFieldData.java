@@ -16,6 +16,7 @@ import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.index.fielddata.SortedBinaryDocValues;
 import org.opensearch.index.mapper.DocValueFetcher;
 import org.opensearch.knn.common.FieldInfoExtractor;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory;
 import org.opensearch.search.DocValueFormat;
@@ -63,6 +64,8 @@ public class KNNVectorDVLeafFieldData implements LeafFieldData {
             if (fieldInfo == null) {
                 return KNNVectorScriptDocValues.emptyValues(fieldName, vectorDataType);
             }
+            // Scripts see vectors as provided, so undo the random orthogonal transform applied at index time.
+            final boolean undoRandomOrthogonalTransform = RandomOrthogonalVectorTransformer.isAppliedTo(fieldInfo.attributes());
             KnnVectorValues knnVectorValues;
             if (fieldInfo.hasVectorValues()) {
                 switch (fieldInfo.getVectorEncoding()) {
@@ -75,10 +78,10 @@ public class KNNVectorDVLeafFieldData implements LeafFieldData {
                     default:
                         throw new IllegalStateException("Unsupported Lucene vector encoding: " + fieldInfo.getVectorEncoding());
                 }
-                return KNNVectorScriptDocValues.create(knnVectorValues, fieldName, vectorDataType);
+                return KNNVectorScriptDocValues.create(knnVectorValues, fieldName, vectorDataType, undoRandomOrthogonalTransform);
             }
             DocIdSetIterator values = DocValues.getBinary(reader, fieldName);
-            return KNNVectorScriptDocValues.create(values, fieldName, vectorDataType);
+            return KNNVectorScriptDocValues.create(values, fieldName, vectorDataType, undoRandomOrthogonalTransform);
         } catch (IOException e) {
             throw new IllegalStateException("Cannot load values for knn vector field: " + fieldName, e);
         }
@@ -133,6 +136,7 @@ public class KNNVectorDVLeafFieldData implements LeafFieldData {
             return EMPTY_DOCVALUE_FETCHER_LEAF;
         }
 
+        final boolean undoRandomOrthogonalTransform = RandomOrthogonalVectorTransformer.isAppliedTo(fieldInfo.attributes());
         final KNNVectorValues<?> vectorValues;
         try {
             vectorValues = KNNVectorValuesFactory.getVectorValues(fieldInfo, Lucene.segmentReader(reader));
@@ -161,6 +165,13 @@ public class KNNVectorDVLeafFieldData implements LeafFieldData {
             @Override
             public Object nextValue() throws IOException {
                 if (vectorDataType == VectorDataType.FLOAT || vectorDataType == VectorDataType.HALF_FLOAT) {
+                    if (undoRandomOrthogonalTransform) {
+                        final float[] vector = RandomOrthogonalVectorTransformer.inverseIfApplied(
+                            fieldInfo.attributes(),
+                            (float[]) vectorValues.getVector()
+                        );
+                        return isBinary ? KNNVectorDocValueFormat.floatToLittleEndianBytes(vector) : vector;
+                    }
                     if (isBinary) {
                         // Convert float[] to little-endian byte[]; XContentBuilder will base64-encode it
                         return KNNVectorDocValueFormat.floatToLittleEndianBytes((float[]) vectorValues.getVector());

@@ -27,6 +27,7 @@ import org.opensearch.knn.index.DerivedKnnFloatVectorField;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN10010Codec.KNN10010DerivedSourceStoredFieldsWriter;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -107,7 +108,12 @@ public class DerivedSourceIndexOperationListener implements IndexingOperationLis
                 IndexableField indexableField = it.next();
                 if (indexableField instanceof DerivedKnnFloatVectorField knnVectorFieldType && knnVectorFieldType.isDerivedEnabled()) {
                     injectedVectors.computeIfAbsent(indexableField.name(), k -> new ArrayList<>())
-                        .add(formatVector(VectorDataType.FLOAT, knnVectorFieldType.vectorValue()));
+                        .add(
+                            RandomOrthogonalVectorTransformer.inverseIfApplied(
+                                knnVectorFieldType.fieldType().getAttributes(),
+                                (float[]) formatVector(VectorDataType.FLOAT, knnVectorFieldType.vectorValue())
+                            )
+                        );
                 }
 
                 if (indexableField instanceof DerivedKnnByteVectorField knnByteVectorField && knnByteVectorField.isDerivedEnabled()) {

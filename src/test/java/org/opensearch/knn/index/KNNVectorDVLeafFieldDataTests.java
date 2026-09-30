@@ -6,6 +6,7 @@
 package org.opensearch.knn.index;
 
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.KnnByteVectorField;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.NumericDocValuesField;
@@ -19,6 +20,8 @@ import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.index.mapper.DocValueFetcher;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -81,6 +84,61 @@ public class KNNVectorDVLeafFieldDataTests extends KNNTestCase {
         ScriptDocValues<float[]> scriptValues = (ScriptDocValues<float[]>) leafFieldData.getScriptValues();
         assertNotNull(scriptValues);
         assertTrue(scriptValues instanceof KNNVectorScriptDocValues);
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testRandomOrthogonalTransform_whenFieldIsTransformed_thenScriptsAndFetcherSeeOriginalVectors() throws IOException {
+        final int dimension = 37;
+        final float[][] originals = new float[3][];
+        for (int i = 0; i < originals.length; i++) {
+            originals[i] = new float[dimension];
+            for (int j = 0; j < dimension; j++) {
+                originals[i][j] = randomFloat() * 2 - 1;
+            }
+        }
+        final RandomOrthogonalVectorTransformer transformer = RandomOrthogonalVectorTransformer.forDimension(dimension);
+        final FieldType fieldType = new FieldType(KnnFloatVectorField.createFieldType(dimension, VectorSimilarityFunction.EUCLIDEAN));
+        fieldType.putAttribute(KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM, KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1);
+        fieldType.freeze();
+
+        try (Directory transformedDir = newDirectory()) {
+            try (IndexWriter writer = new IndexWriter(transformedDir, newIndexWriterConfig(new MockAnalyzer(random())))) {
+                for (float[] original : originals) {
+                    Document doc = new Document();
+                    doc.add(new KnnFloatVectorField(MOCK_INDEX_FIELD_NAME, transformer.transform(original, false), fieldType));
+                    writer.addDocument(doc);
+                }
+                writer.forceMerge(1);
+                writer.commit();
+            }
+
+            try (DirectoryReader transformedReader = DirectoryReader.open(transformedDir)) {
+                KNNVectorDVLeafFieldData leafFieldData = new KNNVectorDVLeafFieldData(
+                    transformedReader.getContext().leaves().get(0).reader(),
+                    MOCK_INDEX_FIELD_NAME,
+                    VectorDataType.FLOAT
+                );
+
+                ScriptDocValues<float[]> scriptValues = (ScriptDocValues<float[]>) leafFieldData.getScriptValues();
+                DocValueFetcher.Leaf arrayLeaf = leafFieldData.getLeafValueFetcher(KNNVectorDocValueFormat.ARRAY_FORMAT);
+                DocValueFetcher.Leaf binaryLeaf = leafFieldData.getLeafValueFetcher(KNNVectorDocValueFormat.BINARY_FORMAT);
+                for (int docId = 0; docId < originals.length; docId++) {
+                    scriptValues.setNextDocId(docId);
+                    assertArrayEquals(originals[docId], ((KNNVectorScriptDocValues<float[]>) scriptValues).getValue(), 1e-5f);
+                    // Undoing the transform must not modify the reader's buffer.
+                    assertArrayEquals(originals[docId], ((KNNVectorScriptDocValues<float[]>) scriptValues).getValue(), 1e-5f);
+
+                    assertTrue(arrayLeaf.advanceExact(docId));
+                    assertArrayEquals(originals[docId], (float[]) arrayLeaf.nextValue(), 1e-5f);
+
+                    assertTrue(binaryLeaf.advanceExact(docId));
+                    ByteBuffer buffer = ByteBuffer.wrap((byte[]) binaryLeaf.nextValue()).order(ByteOrder.LITTLE_ENDIAN);
+                    float[] decoded = new float[dimension];
+                    buffer.asFloatBuffer().get(decoded);
+                    assertArrayEquals(originals[docId], decoded, 1e-5f);
+                }
+            }
+        }
     }
 
     public void testRamBytesUsed() {
