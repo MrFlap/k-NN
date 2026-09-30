@@ -9,6 +9,7 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.CheckedSupplier;
 import org.opensearch.knn.common.FieldInfoExtractor;
+import org.opensearch.knn.index.mapper.RandomOrthogonalVectorTransformer;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil;
 
@@ -30,12 +31,19 @@ public abstract class AbstractPerFieldDerivedVectorTransformer implements PerFie
         CheckedSupplier<Object, IOException> vectorCloneSupplier
     ) throws IOException {
         Object vectorValue = vectorSupplier.get();
+        Object formatted;
         // If the vector value is a byte[], we must deserialize
         if (vectorValue instanceof byte[]) {
             BytesRef vectorBytesRef = new BytesRef((byte[]) vectorValue);
             VectorDataType vectorDataType = FieldInfoExtractor.extractVectorDataType(fieldInfo);
-            return KNNVectorFieldMapperUtil.deserializeStoredVector(vectorBytesRef, vectorDataType);
+            formatted = KNNVectorFieldMapperUtil.deserializeStoredVector(vectorBytesRef, vectorDataType);
+        } else {
+            formatted = vectorCloneSupplier.get();
         }
-        return vectorCloneSupplier.get();
+        // Source holds the vector as provided, so undo the random orthogonal transform applied at index time.
+        if (formatted instanceof float[] floats) {
+            return RandomOrthogonalVectorTransformer.inverseIfApplied(fieldInfo.attributes(), floats);
+        }
+        return formatted;
     }
 }

@@ -62,6 +62,33 @@ public final class VectorTransformerFactory {
             : NOOP_VECTOR_TRANSFORMER;
     }
 
+    /**
+     * Returns a transformer that applies {@code base} followed by the random orthogonal transform for the given dimension.
+     *
+     * @param base transformer to apply first, typically normalization or {@link #NOOP_VECTOR_TRANSFORMER}
+     * @param dimension vector dimension
+     * @return composed transformer
+     */
+    public static VectorTransformer withRandomOrthogonalTransform(final VectorTransformer base, final int dimension) {
+        final RandomOrthogonalVectorTransformer orthogonal = RandomOrthogonalVectorTransformer.forDimension(dimension);
+        if (base == null || base == NOOP_VECTOR_TRANSFORMER) {
+            return orthogonal;
+        }
+        return new VectorTransformer() {
+            @Override
+            public float[] transform(final float[] vector, final boolean inplaceUpdate) {
+                final float[] transformed = base.transform(vector, inplaceUpdate);
+                // base may hand back the caller's array even when inplaceUpdate is false, so only reuse it if it is a copy.
+                return orthogonal.transform(transformed, inplaceUpdate || transformed != vector);
+            }
+
+            @Override
+            public void transform(final byte[] vector) {
+                orthogonal.transform(vector);
+            }
+        };
+    }
+
     private static boolean shouldNormalizeVector(
         final KNNEngine knnEngine,
         final SpaceType spaceType,

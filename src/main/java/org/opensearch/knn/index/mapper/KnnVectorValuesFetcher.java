@@ -45,7 +45,13 @@ public class KnnVectorValuesFetcher extends FieldValueFetcher {
                 return values;
             }
             if (vectorValues.advance(docId) == docId) {
-                values.add(vectorValues.getVector());
+                final Object vector = vectorValues.getVector();
+                // Source holds the vector as provided, so undo the random orthogonal transform applied at index time.
+                values.add(
+                    vector instanceof float[] floats
+                        ? RandomOrthogonalVectorTransformer.inverseIfApplied(fieldInfo.attributes(), floats)
+                        : vector
+                );
             }
         } catch (Exception e) {
             throw new IOException("Failed to read vector values for document " + docId + " in field " + mappedFieldType.name(), e);

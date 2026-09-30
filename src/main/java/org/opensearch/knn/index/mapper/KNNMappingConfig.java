@@ -76,4 +76,13 @@ public interface KNNMappingConfig {
     default KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
         return null;
     }
+
+    /**
+     * Whether vectors of this field are stored and searched after a random orthogonal transform
+     *
+     * @return true if the field uses the random orthogonal transform
+     */
+    default boolean isRandomOrthogonalTransformEnabled() {
+        return false;
+    }
 }

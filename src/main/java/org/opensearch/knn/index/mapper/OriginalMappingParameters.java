@@ -46,6 +46,9 @@ public final class OriginalMappingParameters {
     private final String modelId;
     private final String topLevelSpaceType;
     private final String topLevelEngine;
+    // Value of the random_orthogonal_transform parameter, or null when not configured. Not final so that it stays out of the
+    // required args constructor.
+    private Boolean randomOrthogonalTransform;
 
     /**
      * Initialize the parameters from the builder
@@ -62,6 +65,7 @@ public final class OriginalMappingParameters {
         this.modelId = builder.modelId.get();
         this.topLevelSpaceType = builder.topLevelSpaceType.get();
         this.topLevelEngine = builder.topLevelEngine.get();
+        this.randomOrthogonalTransform = builder.randomOrthogonalTransform.get();
     }
 
     /**
