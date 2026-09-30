@@ -208,6 +208,19 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             KNNEngine.UNDEFINED.getName()
         ).setValidator(KNNEngine::getEngine);
 
+        /**
+         * random_orthogonal_transform controls whether float vectors encoded with the sq encoder are transformed by a random
+         * orthogonal matrix before indexing and search. When not configured, it is on for supported fields of indices created on or
+         * after {@link KNNConstants#RANDOM_ORTHOGONAL_TRANSFORM_MIN_VERSION}.
+         */
+        protected final Parameter<Boolean> randomOrthogonalTransform = new Parameter<>(
+            KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM,
+            false,
+            () -> null,
+            (n, c, o) -> XContentMapValues.nodeBooleanValue(o, n),
+            m -> toType(m).originalMappingParameters.getRandomOrthogonalTransform()
+        ).acceptsNull();
+
         protected final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         protected ModelDao modelDao;
@@ -262,7 +275,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 mode,
                 compressionLevel,
                 topLevelSpaceType,
-                topLevelEngine
+                topLevelEngine,
+                randomOrthogonalTransform
             );
         }
 
@@ -421,8 +435,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             // Check for flat configuration and validate only if index is created after 2.17
             if (isKNNDisabled && parserContext.indexVersionCreated().onOrAfter(Version.V_2_17_0)) {
                 validateFromFlat(builder);
+                validateRandomOrthogonalTransform(builder, parserContext.indexVersionCreated());
             } else if (builder.modelId.get() != null) {
                 validateFromModel(builder);
+                validateRandomOrthogonalTransform(builder, parserContext.indexVersionCreated());
             } else {
                 // Validate that the mode and compression are not set if data type is not float, as they are not supported.
                 // Also, validate that the index created version is on or after 2.17 as mode and compression are not supported for
@@ -448,9 +464,49 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 // Validate if the KNN engine is allowed for index creation
                 validateBlockedKNNEngine(builder.knnMethodContext.get(), parserContext.indexVersionCreated());
                 validateFromKNNMethod(builder);
+                validateRandomOrthogonalTransform(builder, parserContext.indexVersionCreated());
             }
 
             return builder;
+        }
+
+        /**
+         * Validates the random_orthogonal_transform parameter. It can only be configured on indices created on or after
+         * {@link KNNConstants#RANDOM_ORTHOGONAL_TRANSFORM_MIN_VERSION}, and can only be enabled for supported fields. Must run after
+         * the method context is resolved.
+         */
+        private void validateRandomOrthogonalTransform(KNNVectorFieldMapper.Builder builder, Version indexCreatedVersion) {
+            final Boolean configured = builder.randomOrthogonalTransform.get();
+            if (configured == null) {
+                return;
+            }
+            if (indexCreatedVersion.before(KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_MIN_VERSION)) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] can only be used on indices created on or after version %s for field %s",
+                        KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM,
+                        KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM_MIN_VERSION,
+                        builder.name
+                    )
+                );
+            }
+            if (configured
+                && RandomOrthogonalVectorTransformer.isSupported(
+                    builder.originalParameters.getResolvedKnnMethodContext(),
+                    builder.vectorDataType.getValue()
+                ) == false) {
+                throw new MapperParsingException(
+                    String.format(
+                        Locale.ROOT,
+                        "[%s] requires a float vector with the [%s] encoder on the faiss or lucene engine and a space type of l2, "
+                            + "innerproduct or cosinesimil for field %s",
+                        KNNConstants.RANDOM_ORTHOGONAL_TRANSFORM,
+                        KNNConstants.ENCODER_SQ,
+                        builder.name
+                    )
+                );
+            }
         }
 
         private void validateSpaceType(KNNVectorFieldMapper.Builder builder) {

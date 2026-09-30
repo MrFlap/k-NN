@@ -242,4 +242,11 @@ public class KNNConstants {
     // created before this version only support SQ 1-bit (x32) and 7-bit (x4) on Lucene HNSW.
     // 1-bit was introduced in 3.6.0 and stays gated there; 2/4-bit require the newer version.
     public static final Version LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION = Version.V_3_9_0;
+
+    // Mapping parameter and field attribute for the random orthogonal transform applied to SQ-encoded float vectors.
+    public static final String RANDOM_ORTHOGONAL_TRANSFORM = "random_orthogonal_transform";
+    // Field attribute value identifying the transform algorithm, seed and rounds. Changing any of these requires a new value.
+    public static final String RANDOM_ORTHOGONAL_TRANSFORM_FWHH_V1 = "fwhh_v1";
+    // Version gate for the random orthogonal transform. Indices created before this version are never transformed.
+    public static final Version RANDOM_ORTHOGONAL_TRANSFORM_MIN_VERSION = Version.V_3_9_0;
 }

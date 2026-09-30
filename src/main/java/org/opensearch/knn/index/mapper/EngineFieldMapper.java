@@ -50,6 +50,12 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
         KNNLibraryIndexingContext libraryContext = methodContext.getKnnEngine()
             .getKNNLibraryIndexingContext(methodContext, knnMethodConfigContext);
         ResolvedIndexSpec resolvedSpec = libraryContext.getResolvedSpec();
+        boolean randomOrthogonalTransformEnabled = RandomOrthogonalVectorTransformer.isEnabled(
+            originalMappingParameters.getRandomOrthogonalTransform(),
+            methodContext,
+            knnMethodConfigContext.getVectorDataType(),
+            indexCreatedVersion
+        );
 
         KNNVectorFieldType mappedFieldType = new KNNVectorFieldType(
             fullname,
@@ -91,6 +97,11 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
                 @Override
                 public KNNLibraryIndexingContext getKnnLibraryIndexingContext() {
                     return libraryContext;
+                }
+
+                @Override
+                public boolean isRandomOrthogonalTransformEnabled() {
+                    return randomOrthogonalTransformEnabled;
                 }
             },
             indexCreatedVersion,
