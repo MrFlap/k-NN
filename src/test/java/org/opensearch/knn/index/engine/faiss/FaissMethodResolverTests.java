@@ -19,10 +19,13 @@ import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.mapper.Mode;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_TYPE;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
@@ -223,6 +226,58 @@ public class FaissMethodResolverTests extends KNNTestCase {
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
     }
 
+    public void testResolveMethod_whenFloatX4_thenSQEightBit() {
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .compressionLevel(CompressionLevel.x4)
+                .versionCreated(Version.CURRENT)
+                .build(),
+            false,
+            SpaceType.L2
+        );
+
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x4, SpaceType.L2, ENCODER_SQ, false);
+        Map<String, Object> params = encoderParams(resolvedMethodContext);
+        assertEquals(8, params.get(SQ_BITS));
+        // type and clip only apply to fp16 and must not leak into the coded-bits path
+        assertFalse(params.containsKey(FAISS_SQ_TYPE));
+        assertFalse(params.containsKey(FAISS_SQ_CLIP));
+    }
+
+    public void testResolveMethod_whenFloatX4OnPreGate_thenThrows() {
+        ValidationException e = expectThrows(
+            ValidationException.class,
+            () -> TEST_RESOLVER.resolveMethod(
+                null,
+                KNNMethodConfigContext.builder()
+                    .vectorDataType(VectorDataType.FLOAT)
+                    .compressionLevel(CompressionLevel.x4)
+                    .versionCreated(Version.V_3_8_0)
+                    .build(),
+                false,
+                SpaceType.L2
+            )
+        );
+        assertTrue(e.getMessage().contains("4x"));
+    }
+
+    public void testResolveMethod_whenUserSpecifiesBits8_thenResolvesToX4() {
+        MethodComponentContext encoder = new MethodComponentContext(ENCODER_SQ, new HashMap<>(Map.of(SQ_BITS, 8)));
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            new KNNMethodContext(
+                KNNEngine.FAISS,
+                SpaceType.L2,
+                new MethodComponentContext(METHOD_HNSW, new HashMap<>(Map.of(METHOD_ENCODER_PARAMETER, encoder)))
+            ),
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).versionCreated(Version.CURRENT).build(),
+            false,
+            SpaceType.L2
+        );
+        assertEquals(CompressionLevel.x4, resolvedMethodContext.getCompressionLevel());
+    }
+
     public void testResolveMethod_whenHalfFloatX16_thenSQOneBit() {
         ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -412,7 +467,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
     }
 
     public void testResolveMethod_whenInvalid_thenThrow() {
-        // Invalid compression
+        // Invalid compression: x4 needs an index created on or after the int8 gate
         expectThrows(
             ValidationException.class,
             () -> TEST_RESOLVER.resolveMethod(
@@ -420,7 +475,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
                 KNNMethodConfigContext.builder()
                     .vectorDataType(VectorDataType.FLOAT)
                     .compressionLevel(CompressionLevel.x4)
-                    .versionCreated(Version.CURRENT)
+                    .versionCreated(Version.V_3_8_0)
                     .build(),
                 false,
                 SpaceType.L2

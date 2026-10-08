@@ -27,6 +27,7 @@ import java.util.Set;
 
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
+import static org.opensearch.knn.common.KNNConstants.FAISS_HNSW_SQ_8BIT_MIN_VERSION;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_FP16;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
@@ -43,6 +44,7 @@ public class FaissMethodResolver extends AbstractMethodResolver {
     private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS = Set.of(
         CompressionLevel.x1,
         CompressionLevel.x2,
+        CompressionLevel.x4,
         CompressionLevel.x8,
         CompressionLevel.x16,
         CompressionLevel.x32
@@ -151,6 +153,27 @@ public class FaissMethodResolver extends AbstractMethodResolver {
             }
         }
 
+        if (CompressionLevel.x4 == resolvedCompressionLevel) {
+            // x4 is only available as SQ 8-bit (int8); there is no BQ or legacy equivalent to fall back to.
+            if (shouldUseSQ8BitForX4(knnMethodConfigContext, encoderMap) == false) {
+                final ValidationException validationException = new ValidationException();
+                validationException.addValidationError(
+                    String.format(
+                        Locale.ROOT,
+                        "\"%s\" compression on the [%s] method for engine [%s] requires an index created with version %s or later",
+                        CompressionLevel.x4.getName(),
+                        METHOD_HNSW,
+                        KNNEngine.FAISS.getName(),
+                        FAISS_HNSW_SQ_8BIT_MIN_VERSION
+                    )
+                );
+                throw validationException;
+            }
+            encoderComponentContext = new MethodComponentContext(ENCODER_SQ, new HashMap<>());
+            encoder = encoderMap.get(ENCODER_SQ);
+            encoderComponentContext.getParameters().put(SQ_BITS, Encoder.QuantizationBits.EIGHT.getValue());
+        }
+
         if (CompressionLevel.x8 == resolvedCompressionLevel) {
             if (shouldUseSQForX8X16(knnMethodConfigContext, encoderMap)) {
                 encoderComponentContext = new MethodComponentContext(ENCODER_SQ, new HashMap<>());
@@ -203,7 +226,7 @@ public class FaissMethodResolver extends AbstractMethodResolver {
         );
         encoderComponentContext.getParameters().putAll(resolvedParams);
 
-        // When auto-resolved to a coded SQ bit width (bits ∈ {1, 2, 4}), remove the type and clip
+        // When auto-resolved to a coded SQ bit width (bits ∈ {1, 2, 4, 8}), remove the type and clip
         // defaults that were injected — those parameters are only applicable to fp16 (bits=16),
         // and validateEncoderConfig would reject them for the coded-bit paths.
         if (encoderComponentContext.getParameters().get(SQ_BITS) instanceof Integer bitsVal && FaissSQEncoder.isSQCodedBits(bitsVal)) {
@@ -292,6 +315,16 @@ public class FaissMethodResolver extends AbstractMethodResolver {
     private static boolean shouldUseSQOneBitForX32(KNNMethodConfigContext knnMethodConfigContext, Map<String, Encoder> encoderMap) {
         return knnMethodConfigContext.getVersionCreated() != null
             && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)
+            && encoderMap.containsKey(ENCODER_SQ);
+    }
+
+    /**
+     * x4 resolves to SQ 8-bit (int8) on indices created on/after {@link org.opensearch.knn.common.KNNConstants#FAISS_HNSW_SQ_8BIT_MIN_VERSION}. The
+     * encoderMap guard is needed because IVF doesn't register the sq encoder — only HNSW does.
+     */
+    private static boolean shouldUseSQ8BitForX4(KNNMethodConfigContext knnMethodConfigContext, Map<String, Encoder> encoderMap) {
+        return knnMethodConfigContext.getVersionCreated() != null
+            && knnMethodConfigContext.getVersionCreated().onOrAfter(FAISS_HNSW_SQ_8BIT_MIN_VERSION)
             && encoderMap.containsKey(ENCODER_SQ);
     }
 

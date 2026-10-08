@@ -2823,11 +2823,12 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             )
         );
 
-        // Invalid if engine doesnt support the compression
+        // Invalid if engine doesnt support the compression (faiss supports 4x for float since SQ 8-bit, but not for half_float)
         XContentBuilder invalidXContentBuilder3 = XContentFactory.jsonBuilder()
             .startObject()
             .field(TYPE_FIELD_NAME, KNN_VECTOR_TYPE)
             .field(DIMENSION_FIELD_NAME, dimension)
+            .field(VECTOR_DATA_TYPE_FIELD, VectorDataType.HALF_FLOAT.getValue())
             .field(COMPRESSION_LEVEL_PARAMETER, CompressionLevel.x4.getName())
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)

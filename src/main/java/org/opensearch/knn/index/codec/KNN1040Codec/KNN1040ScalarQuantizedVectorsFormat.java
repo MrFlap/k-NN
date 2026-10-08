@@ -62,6 +62,15 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
 
     @Override
     public FlatVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
+        if (encoding == ScalarEncoding.UNSIGNED_BYTE) {
+            // int8 uses the simple symmetric quantizer rather than Lucene's mean/stddev-aware one. The files it writes are read back
+            // by the stock Lucene104 reader, so fieldsReader below needs no counterpart.
+            return new KNN1040Int8ScalarQuantizedVectorsWriter(
+                state,
+                rawVectorFormat.fieldsWriter(state),
+                KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER
+            );
+        }
         return new Lucene104ScalarQuantizedVectorsWriter(
             state,
             encoding,

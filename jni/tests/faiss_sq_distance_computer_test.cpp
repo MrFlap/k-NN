@@ -597,15 +597,15 @@ INSTANTIATE_TEST_SUITE_P(
 );
 
 // ---------------------------------------------------------------------------
-// Multi-bit tests (docBits in {1, 2, 4})
+// Multi-bit tests (docBits in {1, 2, 4, 8})
 // ---------------------------------------------------------------------------
 //
-// The tests above all pass docBits=1. These new tests cover B=2 and B=4 by
+// The tests above all pass docBits=1. These new tests cover B=2, B=4 and B=8 by
 // comparing FaissSQDistanceComputer output against a scalar reference that
 // mirrors the production formula:
 //   dp = Σ_{i,j<docBits} popcount(planeA_i AND planeB_j) << (i + j)
 // and validates that the intervalLength scaling by 1/(2^docBits - 1) applies
-// correctly (no-op for B=1, 1/3 for B=2, 1/15 for B=4).
+// correctly (no-op for B=1, 1/3 for B=2, 1/15 for B=4, 1/255 for B=8).
 
 struct MultiBitParams {
     bool isMaxIP;
@@ -677,6 +677,7 @@ protected:
     // Reference multiBitDp. The formula depends on the docBits Lucene layout:
     //   B=1, B=2 (bit-plane popcount): Σ_{i,j} popcount(planeA_i AND planeB_j) << (i + j)
     //   B=4 (PACKED_NIBBLE):           Σ_i (aHi_i * bHi_i + aLo_i * bLo_i)
+    //   B=8 (UNSIGNED_BYTE):           Σ_i a_i * b_i
     // We dispatch on docBits so this reference matches production for every supported width.
     static uint64_t referenceMultiBitDp(const uint8_t* a, const uint8_t* b, int32_t quantizedVectorBytes, int32_t docBits) {
         if (docBits == 4) {
@@ -688,6 +689,14 @@ protected:
                 const uint32_t bLo = b[k] & 0x0Fu;
                 const uint32_t bHi = (b[k] >> 4) & 0x0Fu;
                 total += aLo * bLo + aHi * bHi;
+            }
+            return total;
+        }
+        if (docBits == 8) {
+            // UNSIGNED_BYTE: one unsigned code per byte.
+            uint64_t total = 0;
+            for (int32_t k = 0; k < quantizedVectorBytes; ++k) {
+                total += static_cast<uint64_t>(a[k]) * static_cast<uint64_t>(b[k]);
             }
             return total;
         }
@@ -743,7 +752,7 @@ protected:
     }
 };
 
-// Operator() bit-identical to scalar reference across docBits ∈ {1, 2, 4}.
+// Operator() bit-identical to scalar reference across docBits ∈ {1, 2, 4, 8}.
 TEST_P(FaissSQDistanceComputerMultiBitTest, OperatorMatchesReference) {
     auto [isMaxIP, docBits] = GetParam();
     // planeBytes must divide quantizedVectorBytes cleanly. Pick qvb = docBits * 16 (multiple of 8 → aligned path).
@@ -896,8 +905,8 @@ INSTANTIATE_TEST_SUITE_P(
     MultiBit,
     FaissSQDistanceComputerMultiBitTest,
     ::testing::Values(
-        MultiBitParams{false, 1}, MultiBitParams{false, 2}, MultiBitParams{false, 4},
-        MultiBitParams{true,  1}, MultiBitParams{true,  2}, MultiBitParams{true,  4}
+        MultiBitParams{false, 1}, MultiBitParams{false, 2}, MultiBitParams{false, 4}, MultiBitParams{false, 8},
+        MultiBitParams{true,  1}, MultiBitParams{true,  2}, MultiBitParams{true,  4}, MultiBitParams{true,  8}
     ),
     [](const ::testing::TestParamInfo<MultiBitParams>& info) { return info.param.name(); }
 );
@@ -922,9 +931,13 @@ TEST(FaissSQDistanceComputerValidation, RejectsUnsupportedDocBits) {
     EXPECT_THROW(
         (FaissSQDistanceComputer<false, true>(oneElementByteSize, dummy.data(), 0.0f, 8, 1, /*docBits=*/3)),
         std::runtime_error);
-    // docBits=8 exceeds Lucene's MOS bit widths.
+    // docBits=16 exceeds the MOS bit widths (the widest is 8, UNSIGNED_BYTE).
     EXPECT_THROW(
-        (FaissSQDistanceComputer<false, true>(oneElementByteSize, dummy.data(), 0.0f, 8, 1, /*docBits=*/8)),
+        (FaissSQDistanceComputer<false, true>(oneElementByteSize, dummy.data(), 0.0f, 8, 1, /*docBits=*/16)),
+        std::runtime_error);
+    // docBits=7 is Lucene's legacy SEVEN_BIT, which is not a MOS width either.
+    EXPECT_THROW(
+        (FaissSQDistanceComputer<false, true>(oneElementByteSize, dummy.data(), 0.0f, 8, 1, /*docBits=*/7)),
         std::runtime_error);
     // Negative docBits — the (1 << bits) computation would be UB.
     EXPECT_THROW(
@@ -934,7 +947,7 @@ TEST(FaissSQDistanceComputerValidation, RejectsUnsupportedDocBits) {
 
 TEST(FaissSQDistanceComputerValidation, RejectsOddQuantizedVectorBytesAtB2) {
     // qvb=9 is not divisible by docBits=2. B=2 requires two bit planes of equal length,
-    // so quantizedVectorBytes must be even. B=1 and B=4 have no such requirement.
+    // so quantizedVectorBytes must be even. B=1, B=4 and B=8 have no such requirement.
     constexpr int32_t qvb = 9;
     constexpr int32_t oneElementByteSize = qvb + 3 * sizeof(float) + sizeof(int32_t);
     std::vector<uint8_t, NBytesAlignedAllocator<uint8_t, 8>> dummy(oneElementByteSize, 0);
@@ -956,7 +969,7 @@ TEST(FaissSQDistanceComputerValidation, RejectsOddQuantizedVectorBytesAtB2) {
 
 TEST(FaissSQDistanceComputerValidation, AcceptsAllSupportedDocBits) {
     // Verify the happy path for each supported docBits width. qvb must be a multiple of docBits.
-    for (int32_t docBits : {1, 2, 4}) {
+    for (int32_t docBits : {1, 2, 4, 8}) {
         const int32_t qvb = docBits * 16; // multiple of docBits AND multiple of 8
         const int32_t oneElementByteSize = qvb + 3 * sizeof(float) + sizeof(int32_t);
         std::vector<uint8_t, NBytesAlignedAllocator<uint8_t, 8>> dummy(oneElementByteSize, 0);

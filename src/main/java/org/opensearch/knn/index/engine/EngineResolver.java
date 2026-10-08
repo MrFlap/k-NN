@@ -129,7 +129,7 @@ public final class EngineResolver {
         }
 
         if (compressionLevel == CompressionLevel.x4) {
-            // Lucene is only engine that supports 4x - so we have to default to it here.
+            // 4x defaults to Lucene. Faiss also supports it (SQ 8-bit on the memory-optimized path) but only when requested explicitly.
             return KNNEngine.LUCENE;
         }
         if (CompressionLevel.isConfigured(compressionLevel) == false || compressionLevel == CompressionLevel.x1) {
@@ -233,8 +233,10 @@ public final class EngineResolver {
         if (requiresTraining && topLevelEngine != KNNEngine.FAISS) {
             throw new MapperParsingException(String.format(Locale.ROOT, "Cannot specify engine other than FAISS for training"));
         }
-        if (knnMethodConfigContext.getCompressionLevel() == CompressionLevel.x4 && topLevelEngine != KNNEngine.LUCENE) {
-            throw new MapperParsingException(String.format(Locale.ROOT, "Lucene is the only engine that supports 4x compression"));
+        if (knnMethodConfigContext.getCompressionLevel() == CompressionLevel.x4
+            && topLevelEngine != KNNEngine.LUCENE
+            && topLevelEngine != KNNEngine.FAISS) {
+            throw new MapperParsingException(String.format(Locale.ROOT, "Only the Lucene and Faiss engines support 4x compression"));
         }
         return topLevelEngine;
     }

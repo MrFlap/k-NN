@@ -143,6 +143,57 @@ public class ResolvedIndexSpecTests extends KNNTestCase {
         assertEquals(RescoreContext.OVERSAMPLE_FACTOR_BELOW_DIMENSION_THRESHOLD, spec.getRescoreContext().getOversampleFactor(), 0.0f);
     }
 
+    // --- SQ 8-bit (int8) ---
+
+    private ResolvedIndexSpec.ResolvedIndexSpecBuilder faissInt8() {
+        return baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.EIGHT)
+            .compressionLevel(CompressionLevel.x4);
+    }
+
+    public void testSQEightBit_onFaiss_isMultiBitAndAlwaysUsesMemoryOptimizedSearch() {
+        final ResolvedIndexSpec spec = faissInt8().build();
+        assertTrue(spec.isSQMultiBit());
+        assertTrue(spec.isFaissSQMultiBit());
+        assertTrue(spec.alwaysUseMemoryOptimizedSearch());
+        assertFalse(spec.isSQOneBit());
+    }
+
+    public void testSQEightBit_onFaiss_supportsRadialSearchThroughFullPrecisionRescore() {
+        final ResolvedIndexSpec spec = faissInt8().build();
+        assertTrue(spec.requiresFullPrecisionRadialRescore());
+        assertTrue(spec.supportsRadialSearch());
+    }
+
+    public void testSQEightBit_onFaiss_doesNotSupportRemoteIndexBuild() {
+        assertFalse(faissInt8().build().supportsRemoteIndexBuild());
+        // The sub-byte widths still do.
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ)
+                .quantizationBits(Encoder.QuantizationBits.FOUR)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+    }
+
+    public void testSQEightBit_onFaiss_rescoreIsFixedAtTheMultiBitDefault() {
+        final RescoreContext expected = RescoreContext.builder()
+            .oversampleFactor(RescoreContext.SQ_MULTI_BIT_DEFAULT_OVERSAMPLE_FACTOR)
+            .allowOverrideOversampleFactor(false)
+            .userProvided(false)
+            .build();
+        assertEquals(expected, faissInt8().build().getRescoreContext());
+    }
+
+    // On Lucene int8 is an ordinary SQ level, like the legacy 7-bit one: not the memory-optimized multi-bit path.
+    public void testSQEightBit_onLucene_isNotMultiBit() {
+        final ResolvedIndexSpec spec = faissInt8().engine(KNNEngine.LUCENE).build();
+        assertFalse(spec.isSQMultiBit());
+        assertFalse(spec.alwaysUseMemoryOptimizedSearch());
+        assertFalse(spec.requiresFullPrecisionRadialRescore());
+        assertFalse(spec.supportsRadialSearch());
+    }
+
     public void testRadialSearch_SQSevenBitNotSupported() {
         // 7-bit SQ (x4) is quantized but is not enabled for radial search.
         ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)

@@ -27,6 +27,7 @@ import static org.opensearch.knn.common.KNNConstants.FAISS_FLAT_DESCRIPTION;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_BF16;
+import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_FP16;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_TYPE;
 import static org.opensearch.knn.common.KNNConstants.INDEX_DESCRIPTION_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
@@ -556,15 +557,67 @@ public class FaissSQEncoderTests extends KNNTestCase {
         assertEquals(CompressionLevel.x8, encoder.calculateCompressionLevel(mcc, null));
     }
 
+    // --- bits=8 (int8) ---
+
+    public void testValidateDirectly_whenBits8WithX4Compression_thenOk() {
+        new FaissSQEncoder().validate(buildMethodContext(Map.of(SQ_BITS, 8)), buildConfigContext(Version.CURRENT, CompressionLevel.x4));
+    }
+
+    public void testValidateDirectly_whenBits8WithoutCompression_thenOk() {
+        new FaissSQEncoder().validate(
+            buildMethodContext(Map.of(SQ_BITS, 8)),
+            buildConfigContext(Version.CURRENT, CompressionLevel.NOT_CONFIGURED)
+        );
+    }
+
+    public void testValidateDirectly_whenBits8WithConflictingCompression_thenThrows() {
+        expectThrows(
+            ValidationException.class,
+            () -> new FaissSQEncoder().validate(
+                buildMethodContext(Map.of(SQ_BITS, 8)),
+                buildConfigContext(Version.CURRENT, CompressionLevel.x8)
+            )
+        );
+    }
+
+    // 3.8.0 is past the 3.6.0 bits gate but before the int8 gate.
+    public void testValidateDirectly_whenBits8OnPreGate_thenThrows() {
+        ValidationException e = expectThrows(
+            ValidationException.class,
+            () -> new FaissSQEncoder().validate(
+                buildMethodContext(Map.of(SQ_BITS, 8)),
+                buildConfigContext(Version.V_3_8_0, CompressionLevel.x4)
+            )
+        );
+        assertTrue(e.getMessage().contains(SQ_BITS));
+    }
+
+    public void testValidateDirectly_whenBits8WithTypeParameter_thenThrows() {
+        expectThrows(
+            ValidationException.class,
+            () -> new FaissSQEncoder().validate(
+                buildMethodContext(Map.of(SQ_BITS, 8, FAISS_SQ_TYPE, FAISS_SQ_ENCODER_FP16)),
+                buildConfigContext(Version.CURRENT, CompressionLevel.x4)
+            )
+        );
+    }
+
+    public void testCalculateCompressionLevel_whenBits8_thenX4() {
+        FaissSQEncoder encoder = new FaissSQEncoder();
+        MethodComponentContext mcc = new MethodComponentContext(ENCODER_SQ, Map.of(SQ_BITS, 8));
+        assertEquals(CompressionLevel.x4, encoder.calculateCompressionLevel(mcc, null));
+    }
+
     // --- isSQCodedBits utility ---
 
     public void testIsSQCodedBits() {
         assertTrue(FaissSQEncoder.isSQCodedBits(1));
         assertTrue(FaissSQEncoder.isSQCodedBits(2));
         assertTrue(FaissSQEncoder.isSQCodedBits(4));
+        assertTrue(FaissSQEncoder.isSQCodedBits(8));
         // fp16 is SQ but stores compressed floats, not integer-coded bits
         assertFalse(FaissSQEncoder.isSQCodedBits(16));
-        for (int bits : new int[] { 0, 3, 5, 7, 8, -1 }) {
+        for (int bits : new int[] { 0, 3, 5, 7, 9, -1 }) {
             assertFalse("Expected " + bits + " to not be SQ-coded bits", FaissSQEncoder.isSQCodedBits(bits));
         }
     }

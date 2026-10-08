@@ -30,10 +30,16 @@ public class EncoderInterfaceTests extends KNNTestCase {
     }
 
     public void testQuantizationBits_fromCompressionLevel_isInverseOfGetCompressionLevel() {
-        // For every enum value, fromCompressionLevel(getCompressionLevel(bits)) must return bits.
+        // For every enum value, fromCompressionLevel(getCompressionLevel(bits)) must return bits. EIGHT (int8) shares x4 with
+        // the legacy SEVEN, and fromCompressionLevel resolves x4 to SEVEN by design: int8 is always picked explicitly.
         for (Encoder.QuantizationBits bits : Encoder.QuantizationBits.values()) {
+            if (bits == Encoder.QuantizationBits.EIGHT) {
+                continue;
+            }
             assertEquals("round-trip failed for " + bits, bits, Encoder.QuantizationBits.fromCompressionLevel(bits.getCompressionLevel()));
         }
+        assertEquals(CompressionLevel.x4, Encoder.QuantizationBits.EIGHT.getCompressionLevel());
+        assertEquals(Encoder.QuantizationBits.SEVEN, Encoder.QuantizationBits.fromCompressionLevel(CompressionLevel.x4));
     }
 
     public void testFaissFlatEncoderType() {
@@ -46,12 +52,13 @@ public class EncoderInterfaceTests extends KNNTestCase {
     public void testFaissSQEncoderType() {
         FaissSQEncoder encoder = new FaissSQEncoder();
         assertEquals(Encoder.EncoderType.SQ, encoder.getEncoderType());
-        // Multi-bit MOS (bits ∈ {1, 2, 4}) and legacy fp16 (bits=16) are supported.
+        // Multi-bit MOS (bits ∈ {1, 2, 4, 8}) and legacy fp16 (bits=16) are supported.
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.ONE));
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.TWO));
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.FOUR));
+        assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.EIGHT));
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.SIXTEEN));
-        assertEquals(4, encoder.getSupportedBits().size());
+        assertEquals(5, encoder.getSupportedBits().size());
     }
 
     public void testLuceneSQEncoderType() {
@@ -61,7 +68,8 @@ public class EncoderInterfaceTests extends KNNTestCase {
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.TWO));
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.FOUR));
         assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.SEVEN));
-        assertEquals(4, encoder.getSupportedBits().size());
+        assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.EIGHT));
+        assertEquals(5, encoder.getSupportedBits().size());
     }
 
     public void testQFrameBitEncoderType() {

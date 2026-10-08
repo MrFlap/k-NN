@@ -470,13 +470,25 @@ public class EngineResolverTests extends KNNTestCase {
     }
 
     public void testValidateTopLevelEngine() throws IOException {
-        // only top-level defined; set to faiss with compression 4x
+        // only top-level defined; faiss with compression 4x is accepted (SQ 8-bit), as is lucene
+        assertEquals(
+            KNNEngine.FAISS,
+            ENGINE_RESOLVER.resolveEngine(
+                KNNMethodConfigContext.builder().compressionLevel(CompressionLevel.x4).build(),
+                null,
+                "faiss",
+                false,
+                Version.CURRENT
+            )
+        );
+
+        // only top-level defined; set to nmslib with compression 4x
         expectThrows(
             MapperParsingException.class,
             () -> ENGINE_RESOLVER.resolveEngine(
                 KNNMethodConfigContext.builder().compressionLevel(CompressionLevel.x4).build(),
                 null,
-                "faiss",
+                "nmslib",
                 false,
                 Version.CURRENT
             )

@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -127,6 +128,25 @@ public class KNN1040CodecTest extends KNNCodecTestCase {
     public void testLuceneSQOneBitFormatResolver_returnsKNN1040HnswSQFormat() {
         KNNMethodContext sqMethodContext = buildHnswMethodContext(Map.of(LUCENE_SQ_BITS, 1));
         assertThat(resolveFormat(sqMethodContext), instanceOf(KNN1040HnswScalarQuantizedVectorsFormat.class));
+    }
+
+    public void testLuceneSQEightBitFormatResolver_returnsKNN1040HnswSQFormatWithUnsignedByteEncoding() {
+        KNNMethodContext sqMethodContext = buildHnswMethodContext(Map.of(LUCENE_SQ_BITS, 8));
+        assertThat(resolveFormat(sqMethodContext), instanceOf(KNN1040HnswScalarQuantizedVectorsFormat.class));
+        assertThat(resolveFormat(sqMethodContext).toString(), containsString("UNSIGNED_BYTE"));
+    }
+
+    public void testLuceneSQEightBitFormatResolver_whenHalfFloat_returnsKNN1040HnswHalfFloatSQFormat() {
+        KNNMethodContext sqMethodContext = buildHnswMethodContext(Map.of(LUCENE_SQ_BITS, 8));
+        assertThat(
+            resolveFormat(sqMethodContext, VectorDataType.HALF_FLOAT),
+            instanceOf(KNN1040HnswHalfFloatScalarQuantizedVectorsFormat.class)
+        );
+    }
+
+    public void testLuceneSQSevenBitFormatResolver_stillReturnsLuceneRWHnswSQFormat() {
+        KNNMethodContext sqMethodContext = buildHnswMethodContext(Map.of(LUCENE_SQ_BITS, 7));
+        assertThat(resolveFormat(sqMethodContext), instanceOf(Lucene99RWHnswScalarQuantizedVectorsFormat.class));
     }
 
     private KNNMethodContext buildHnswMethodContext(Map<String, Object> encoderParams) {

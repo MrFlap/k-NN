@@ -242,6 +242,11 @@ public class KNNConstants {
     // created before this version only support SQ 1-bit (x32) and 7-bit (x4) on Lucene HNSW.
     // 1-bit was introduced in 3.6.0 and stays gated there; 2/4-bit require the newer version.
     public static final Version LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION = Version.V_3_9_0;
+    // Lucene HNSW SQ 8-bit (int8, Lucene104 UNSIGNED_BYTE encoding): x4 for float, x2 for half_float. Indices created before this
+    // version only support the legacy 7-bit path for x4 and have no x2.
+    public static final Version LUCENE_HNSW_SQ_8BIT_MIN_VERSION = Version.V_3_9_0;
+    // Faiss HNSW SQ 8-bit (int8) on the memory-optimized path: x4 for float. There is no earlier x4 on Faiss.
+    public static final Version FAISS_HNSW_SQ_8BIT_MIN_VERSION = Version.V_3_9_0;
 
     // Mapping parameter and field attribute for the random orthogonal transform applied to SQ-encoded float vectors.
     public static final String RANDOM_ORTHOGONAL_TRANSFORM = "random_orthogonal_transform";

@@ -171,8 +171,8 @@ public final class ResolvedIndexSpec {
      *
      * <p>Resolution order:</p>
      * <ol>
-     *   <li>SQ multi-bit (bits ∈ {1, 2, 4}): fixed oversample, overrides disallowed.
-     *       bits=1 (x32) uses the Faiss scalar-quantized factor; bits=2 (x16) and bits=4 (x8) use
+     *   <li>SQ multi-bit (bits ∈ {1, 2, 4}, or 8 on Faiss): fixed oversample, overrides disallowed.
+     *       bits=1 (x32) uses the Faiss scalar-quantized factor; bits=2 (x16), bits=4 (x8) and bits=8 (x4) use
      *       {@link RescoreContext#SQ_MULTI_BIT_DEFAULT_OVERSAMPLE_FACTOR} — the higher-bit codes
      *       recover most recall on their own.</li>
      *   <li>x32 compression with the flat method: 2x oversample</li>
@@ -305,7 +305,11 @@ public final class ResolvedIndexSpec {
             return false;
         }
 
-        if (isSQMultiBit() || isFP16QuantizedIndex()) {
+        // The remote builder has not been validated against the int8 (bits=8) codes, so those build locally.
+        if (isSQMultiBit() && quantizationBits != Encoder.QuantizationBits.EIGHT) {
+            return true;
+        }
+        if (isFP16QuantizedIndex()) {
             return true;
         }
 
@@ -325,14 +329,18 @@ public final class ResolvedIndexSpec {
 
     /**
      * True when the encoder is SQ configured for the memory-optimized multi-bit path
-     * (bits ∈ {1, 2, 4}). Document vectors are stored as integer-coded scalar-quantization
+     * (bits ∈ {1, 2, 4}, or 8 on Faiss). Document vectors are stored as integer-coded scalar-quantization
      * codes in Lucene's flat SQ files; Faiss only builds the HNSW graph.
+     *
+     * <p>8-bit (int8) counts only for Faiss: on the Lucene engine it is an ordinary SQ level like the legacy 7-bit one, with no
+     * memory-optimized-search requirement, no radial rescore path and its own x4 rescore default.
      */
     public boolean isSQMultiBit() {
         return encoderType == Encoder.EncoderType.SQ
             && (quantizationBits == Encoder.QuantizationBits.ONE
                 || quantizationBits == Encoder.QuantizationBits.TWO
-                || quantizationBits == Encoder.QuantizationBits.FOUR);
+                || quantizationBits == Encoder.QuantizationBits.FOUR
+                || (quantizationBits == Encoder.QuantizationBits.EIGHT && engine == KNNEngine.FAISS));
     }
 
     /**

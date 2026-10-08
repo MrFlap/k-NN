@@ -27,6 +27,7 @@ import java.io.IOException;
 
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
 import static org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE;
+import static org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding.UNSIGNED_BYTE;
 
 /**
  * A specialized {@link Lucene104ScalarQuantizedVectorScorer} that leverages
@@ -51,6 +52,9 @@ import static org.apache.lucene.util.quantization.QuantizedByteVectorValues.Scal
  */
 @Log4j2
 public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantizedVectorScorer {
+    // 1 / (2^8 - 1): turns (upper - lower) into the per-code step of an 8-bit interval.
+    private static final float INT8_SCALE = 1f / 255;
+
     /**
      * Creates a new scorer that wraps a non-quantized delegate scorer.
      *
@@ -113,11 +117,17 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         final float[] target
     ) throws IOException {
         // Native bulk-SIMD scoring is implemented for 1-bit documents only. Multi-bit docs
-        // (B=2, B=4) share the same .veq layout but need width-specific kernels that are not
+        // (B=2, B=4, B=8 int8) share the same .veq layout but need width-specific kernels that are not
         // yet in the native SIMD path — route them to Lucene's pure-Java reference scorer,
-        // which scores the same codes correctly.
+        // which scores the same codes correctly. Compared by encoding rather than ScalarEncodingResolver.docBits,
+        // which only knows the 4-bit-query encodings and rejects UNSIGNED_BYTE.
         final ScalarEncoding scalarEncoding = quantizedByteVectorValues.getScalarEncoding();
-        if (ScalarEncodingResolver.docBits(scalarEncoding) != 1) {
+        // int8 fields are written by Int8ScalarQuantizer with a zero centroid, so the query is quantized the same simple way.
+        // A non-zero centroid means the codes were written by Lucene's OptimizedScalarQuantizer, which the stock scorer handles.
+        if (scalarEncoding == UNSIGNED_BYTE && quantizedByteVectorValues.getCentroidDP() == 0f) {
+            return int8RandomVectorScorer(similarityFunction, quantizedByteVectorValues, target);
+        }
+        if (scalarEncoding != SINGLE_BIT_QUERY_NIBBLE) {
             return (RandomVectorScorer.AbstractRandomVectorScorer) super.getRandomVectorScorer(
                 similarityFunction,
                 quantizedByteVectorValues,
@@ -139,6 +149,66 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             quantizedByteVectorValues,
             target
         );
+    }
+
+    /**
+     * Builds a scorer for int8 ({@code UNSIGNED_BYTE}) documents whose query is quantized with {@link Int8ScalarQuantizer}.
+     * The score arithmetic is Lucene's: documents and query are both affine-decoded as {@code lower + code * step}, so
+     * {@code x . y = ax*ay*D + ay*lx*x1 + ax*ly*y1 + lx*ly*dot(codes)}. Only the way the query's interval is chosen differs.
+     */
+    private RandomVectorScorer.AbstractRandomVectorScorer int8RandomVectorScorer(
+        final VectorSimilarityFunction similarityFunction,
+        final QuantizedByteVectorValues quantizedByteVectorValues,
+        final float[] target
+    ) {
+        FlatVectorsScorer.checkDimensions(target.length, quantizedByteVectorValues.dimension());
+        // The quantizer reads the vector only, but a copy is needed to normalize for cosine without touching the caller's array.
+        final float[] queryCopy = ArrayUtil.copyOfSubArray(target, 0, target.length);
+        if (similarityFunction == VectorSimilarityFunction.COSINE) {
+            VectorUtil.l2normalize(queryCopy);
+        }
+        final byte[] queryCodes = new byte[UNSIGNED_BYTE.getDiscreteDimensions(quantizedByteVectorValues.dimension())];
+        final OptimizedScalarQuantizer.QuantizationResult queryCorrections = new Int8ScalarQuantizer(similarityFunction).scalarQuantize(
+            queryCopy,
+            queryCodes,
+            Int8ScalarQuantizer.BITS,
+            null
+        );
+        return new RandomVectorScorer.AbstractRandomVectorScorer(quantizedByteVectorValues) {
+            @Override
+            public float score(final int node) throws IOException {
+                return int8Score(queryCodes, queryCorrections, quantizedByteVectorValues, node, similarityFunction);
+            }
+        };
+    }
+
+    // Mirrors Lucene104ScalarQuantizedVectorScorer#quantizedScore for UNSIGNED_BYTE, which is private there.
+    private static float int8Score(
+        final byte[] queryCodes,
+        final OptimizedScalarQuantizer.QuantizationResult queryCorrections,
+        final QuantizedByteVectorValues docs,
+        final int docOrd,
+        final VectorSimilarityFunction similarityFunction
+    ) throws IOException {
+        final float dot = VectorUtil.uint8DotProduct(queryCodes, docs.vectorValue(docOrd));
+        final OptimizedScalarQuantizer.QuantizationResult docCorrections = docs.getCorrectiveTerms(docOrd);
+        final float ax = docCorrections.lowerInterval();
+        final float lx = (docCorrections.upperInterval() - ax) * INT8_SCALE;
+        final float x1 = docCorrections.quantizedComponentSum();
+        final float ay = queryCorrections.lowerInterval();
+        final float ly = (queryCorrections.upperInterval() - ay) * INT8_SCALE;
+        final float y1 = queryCorrections.quantizedComponentSum();
+        float score = ax * ay * docs.dimension() + ay * lx * x1 + ax * ly * y1 + lx * ly * dot;
+        if (similarityFunction == VectorSimilarityFunction.EUCLIDEAN) {
+            // additionalCorrection is the squared l2 norm of the (uncentered) vector.
+            score = queryCorrections.additionalCorrection() + docCorrections.additionalCorrection() - 2 * score;
+            return 1 / (1f + Math.max(score, 0f));
+        }
+        score += queryCorrections.additionalCorrection() + docCorrections.additionalCorrection() - docs.getCentroidDP();
+        if (similarityFunction == VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT) {
+            return VectorUtil.scaleMaxInnerProductScore(score);
+        }
+        return (1f + Math.clamp(score, -1, 1)) / 2f;
     }
 
     /**

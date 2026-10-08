@@ -99,7 +99,7 @@ public class LuceneSQEncoderTests extends KNNTestCase {
             .dimension(128)
             .build();
 
-        // bits=3 is not a supported width; supported are {1, 2, 4, 7}.
+        // bits=3 is not a supported width; supported are {1, 2, 4, 7, 8}.
         MethodComponentContext mcc = new MethodComponentContext(ENCODER_SQ, Map.of(LUCENE_SQ_BITS, 3));
         assertNotNull(methodComponent.validate(mcc, context));
     }
@@ -306,6 +306,72 @@ public class LuceneSQEncoderTests extends KNNTestCase {
             () -> callValidateEncoderParams(Version.CURRENT, VectorDataType.HALF_FLOAT, CompressionLevel.x16, Map.of(LUCENE_SQ_BITS, 2))
         );
         assertTrue(e.getMessage().contains("half_float"));
+    }
+
+    public void testValidate_whenBits8WithX4Compression_thenOk() {
+        callValidateEncoderParams(Version.CURRENT, CompressionLevel.x4, Map.of(LUCENE_SQ_BITS, 8));
+    }
+
+    public void testValidate_whenBits8NoCompressionConfigured_thenOk() {
+        callValidateEncoderParams(Version.CURRENT, CompressionLevel.NOT_CONFIGURED, Map.of(LUCENE_SQ_BITS, 8));
+    }
+
+    public void testValidate_whenBits8WithX8Compression_thenError() {
+        expectThrows(
+            ValidationException.class,
+            () -> callValidateEncoderParams(Version.CURRENT, CompressionLevel.x8, Map.of(LUCENE_SQ_BITS, 8))
+        );
+    }
+
+    public void testValidate_whenBits8WithConfidenceInterval_thenError() {
+        ValidationException e = expectThrows(
+            ValidationException.class,
+            () -> callValidateEncoderParams(
+                Version.CURRENT,
+                CompressionLevel.x4,
+                Map.of(LUCENE_SQ_BITS, 8, LUCENE_SQ_CONFIDENCE_INTERVAL, 0.9)
+            )
+        );
+        assertTrue(e.getMessage().contains(LUCENE_SQ_CONFIDENCE_INTERVAL));
+    }
+
+    // 8-bit is gated on LUCENE_HNSW_SQ_8BIT_MIN_VERSION; 3.8.0 is past the 1-bit gate but before it.
+    public void testValidate_whenBits8OnPreGate_thenError() {
+        ValidationException e = expectThrows(
+            ValidationException.class,
+            () -> callValidateEncoderParams(Version.V_3_8_0, CompressionLevel.x4, Map.of(LUCENE_SQ_BITS, 8))
+        );
+        assertTrue(e.getMessage().contains(LUCENE_SQ_BITS));
+    }
+
+    public void testValidate_whenHalfFloatWithBits8_thenOk() {
+        callValidateEncoderParams(Version.CURRENT, VectorDataType.HALF_FLOAT, CompressionLevel.x2, Map.of(LUCENE_SQ_BITS, 8));
+    }
+
+    // bits=8 is x4 for float but x2 for half_float, so x4 conflicts on half_float.
+    public void testValidate_whenHalfFloatWithBits8AndX4Compression_thenError() {
+        expectThrows(
+            ValidationException.class,
+            () -> callValidateEncoderParams(Version.CURRENT, VectorDataType.HALF_FLOAT, CompressionLevel.x4, Map.of(LUCENE_SQ_BITS, 8))
+        );
+    }
+
+    public void testCalculateCompressionLevel_whenBits8InMethodComponentContext_thenX4() {
+        MethodComponentContext encoderContext = new MethodComponentContext(ENCODER_SQ, Map.of(LUCENE_SQ_BITS, 8));
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.FLOAT)
+            .versionCreated(Version.CURRENT)
+            .build();
+        assertEquals(CompressionLevel.x4, new LuceneSQEncoder().calculateCompressionLevel(encoderContext, configContext));
+    }
+
+    public void testCalculateCompressionLevel_whenHalfFloatBits8InMethodComponentContext_thenX2() {
+        MethodComponentContext encoderContext = new MethodComponentContext(ENCODER_SQ, Map.of(LUCENE_SQ_BITS, 8));
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.HALF_FLOAT)
+            .versionCreated(Version.CURRENT)
+            .build();
+        assertEquals(CompressionLevel.x2, new LuceneSQEncoder().calculateCompressionLevel(encoderContext, configContext));
     }
 
     public void testValidate_whenBits2WithX16Compression_explicitOnDisk_thenOk() {

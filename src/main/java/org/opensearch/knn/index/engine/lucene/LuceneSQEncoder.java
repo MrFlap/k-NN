@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
 
 import static org.opensearch.knn.common.KNNConstants.DYNAMIC_CONFIDENCE_INTERVAL;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
+import static org.opensearch.knn.common.KNNConstants.LUCENE_HNSW_SQ_8BIT_MIN_VERSION;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_CONFIDENCE_INTERVAL;
 import static org.opensearch.knn.common.KNNConstants.MAXIMUM_CONFIDENCE_INTERVAL;
@@ -36,28 +37,30 @@ import static org.opensearch.knn.common.KNNConstants.MINIMUM_CONFIDENCE_INTERVAL
  * Lucene scalar quantization encoder
  */
 public class LuceneSQEncoder implements Encoder {
-    // HALF_FLOAT reaches this encoder through compression_level x16, which resolves to bits=1; it has
+    // HALF_FLOAT reaches this encoder through compression_level x16 (bits=1) or x2 (bits=8); it has
     // no other supported width (see validate()).
     private static final Set<VectorDataType> SUPPORTED_DATA_TYPES = ImmutableSet.of(VectorDataType.FLOAT, VectorDataType.HALF_FLOAT);
 
     /**
-     * Bit widths supported by the Lucene SQ encoder. 1/2/4-bit codes are integer-quantized and
-     * stored via the Lucene 10.4 SIMD scalar quantization path; 7-bit is the legacy scalar
-     * quantization path (retained for backward compatibility with pre-3.6.0 indices).
+     * Bit widths supported by the Lucene SQ encoder. 1/2/4/8-bit codes are integer-quantized and
+     * stored via the Lucene 10.4 scalar quantization path (8-bit is its {@code UNSIGNED_BYTE} int8 encoding);
+     * 7-bit is the legacy scalar quantization path (retained for backward compatibility with pre-3.6.0 indices).
      */
     private static final Set<QuantizationBits> LUCENE_SQ_SUPPORTED_BITS = EnumSet.of(
         QuantizationBits.ONE,
         QuantizationBits.TWO,
         QuantizationBits.FOUR,
-        QuantizationBits.SEVEN
+        QuantizationBits.SEVEN,
+        QuantizationBits.EIGHT
     );
     static final Set<Integer> LUCENE_SQ_BITS_SUPPORTED = LUCENE_SQ_SUPPORTED_BITS.stream()
         .map(QuantizationBits::getValue)
         .collect(Collectors.toUnmodifiableSet());
     static final QuantizationBits LUCENE_PRE_360_SUPPORTED_SQ_BITS = QuantizationBits.SEVEN;
 
-    // Lucene SQ supports compression to 1/2/4 bits only in indices with version gates:
-    // bits=1 requires version >= 3.6.0; bits ∈ {2, 4} require LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION.
+    // Lucene SQ supports compression to 1/2/4/8 bits only in indices with version gates:
+    // bits=1 requires version >= 3.6.0; bits ∈ {2, 4} require LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION;
+    // bits=8 requires LUCENE_HNSW_SQ_8BIT_MIN_VERSION.
     private final static MethodComponent METHOD_COMPONENT = MethodComponent.Builder.builder(ENCODER_SQ)
         .addSupportedDataTypes(SUPPORTED_DATA_TYPES)
         .addParameter(
@@ -82,8 +85,10 @@ public class LuceneSQEncoder implements Encoder {
      *     supported value (see {@link #LUCENE_SQ_BITS_SUPPORTED}); {@code bits=1} is rejected on earlier versions.</li>
      *     <li>The {@code bits} value must be compatible with any explicitly configured compression level
      *     (e.g. {@code bits=1} requires x32 compression, {@code bits=7} requires x4).</li>
-     *     <li>Non-bit parameters (e.g. {@code confidence_interval}) are rejected when {@code bits ∈ {1, 2, 4}},
+     *     <li>Non-bit parameters (e.g. {@code confidence_interval}) are rejected when {@code bits ∈ {1, 2, 4, 8}},
      *     since the OSQ integer-quantization path does not use them.</li>
+     *     <li>{@code bits=8} (int8) is rejected on indices created before {@link
+     *     org.opensearch.knn.common.KNNConstants#LUCENE_HNSW_SQ_8BIT_MIN_VERSION}.</li>
      * </ul>
      * Returns silently without validation if either the method context or the config context is null.
      *
@@ -125,15 +130,19 @@ public class LuceneSQEncoder implements Encoder {
         }
 
         if (bitsObj instanceof Integer bits) {
-            // half_float only supports the 1-bit path; 2, 4 and 7 stay float-only.
-            if (configContext.getVectorDataType() == VectorDataType.HALF_FLOAT && bits != QuantizationBits.ONE.getValue()) {
+            // half_float only supports the 1-bit and 8-bit paths; 2, 4 and 7 stay float-only.
+            if (configContext.getVectorDataType() == VectorDataType.HALF_FLOAT
+                && bits != QuantizationBits.ONE.getValue()
+                && bits != QuantizationBits.EIGHT.getValue()) {
                 validationException.addValidationError(
                     String.format(
                         Locale.ROOT,
-                        "[%s] data type only supports [%s=%d] for encoder [%s].",
+                        "[%s] data type only supports [%s=%d] or [%s=%d] for encoder [%s].",
                         VectorDataType.HALF_FLOAT.getValue(),
                         LUCENE_SQ_BITS,
                         QuantizationBits.ONE.getValue(),
+                        LUCENE_SQ_BITS,
+                        QuantizationBits.EIGHT.getValue(),
                         ENCODER_SQ
                     )
                 );
@@ -142,7 +151,8 @@ public class LuceneSQEncoder implements Encoder {
 
             if (bits == QuantizationBits.ONE.getValue()
                 || bits == QuantizationBits.TWO.getValue()
-                || bits == QuantizationBits.FOUR.getValue()) {
+                || bits == QuantizationBits.FOUR.getValue()
+                || bits == QuantizationBits.EIGHT.getValue()) {
                 Set<String> nonBitParameters = encoderParams.keySet()
                     .stream()
                     .filter(k -> !k.equals(LUCENE_SQ_BITS))
@@ -177,6 +187,19 @@ public class LuceneSQEncoder implements Encoder {
                     );
                     throw validationException;
                 }
+            }
+            if (bits == QuantizationBits.EIGHT.getValue() && (version == null || version.before(LUCENE_HNSW_SQ_8BIT_MIN_VERSION))) {
+                validationException.addValidationError(
+                    String.format(
+                        Locale.ROOT,
+                        "Parameter [%s=%d] for encoder [%s] requires an index created with version %s or later.",
+                        LUCENE_SQ_BITS,
+                        bits,
+                        ENCODER_SQ,
+                        LUCENE_HNSW_SQ_8BIT_MIN_VERSION
+                    )
+                );
+                throw validationException;
             }
             CompressionLevel configuredCompression = configContext.getCompressionLevel();
             if (CompressionLevel.isConfigured(configuredCompression)) {

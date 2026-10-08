@@ -30,6 +30,7 @@ import java.util.Set;
 import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.FAISS_FLAT_DESCRIPTION;
+import static org.opensearch.knn.common.KNNConstants.FAISS_HNSW_SQ_8BIT_MIN_VERSION;
 import static org.opensearch.knn.common.KNNConstants.SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_CLIP;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_DESCRIPTION;
@@ -54,6 +55,10 @@ import static org.opensearch.knn.common.KNNConstants.NAME;
  *       The {@code type} and {@code clip} parameters are not allowed.</li>
  *   <li>{@code bits=4} — 4-bit quantization, x8 compression. Same coded-flat path as bits=1.
  *       The {@code type} and {@code clip} parameters are not allowed.</li>
+ *   <li>{@code bits=8} — 8-bit (int8) quantization, x4 compression. Same coded-flat path as bits=1, with symmetric
+ *       per-vector-scale codes. Requires indices created on or after
+ *       {@link org.opensearch.knn.common.KNNConstants#FAISS_HNSW_SQ_8BIT_MIN_VERSION}. The {@code type} and {@code clip}
+ *       parameters are not allowed.</li>
  *   <li>{@code bits=16} — equivalent to the existing {@code type=fp16} behavior, x2 compression.
  *       Uses the standard Faiss SQ description.</li>
  * </ul>
@@ -71,6 +76,7 @@ public class FaissSQEncoder implements Encoder {
         QuantizationBits.ONE.getValue(),
         QuantizationBits.TWO.getValue(),
         QuantizationBits.FOUR.getValue(),
+        QuantizationBits.EIGHT.getValue(),
         QuantizationBits.SIXTEEN.getValue()
     );
     private final static MethodComponent METHOD_COMPONENT = MethodComponent.Builder.builder(ENCODER_SQ)
@@ -91,7 +97,7 @@ public class FaissSQEncoder implements Encoder {
             Map<String, Object> params = methodComponentContext.getParameters();
             Object bitsObj = params.get(SQ_BITS);
 
-            // Multi-bit MOS path (bits in {1,2,4}): document vectors are scalar-quantized to B bits and
+            // Multi-bit MOS path (bits in {1,2,4,8}): document vectors are scalar-quantized to B bits and
             // stored in Lucene's flat SQ files; Faiss only builds the HNSW graph. Use the flat description
             // and carry SQ_BITS = B so the codec/build path can resolve the document bit width.
             if (bitsObj instanceof Integer && isSQCodedBits((Integer) bitsObj)) {
@@ -266,6 +272,20 @@ public class FaissSQEncoder implements Encoder {
                 }
             }
 
+            if (bits == QuantizationBits.EIGHT.getValue() && (version == null || version.before(FAISS_HNSW_SQ_8BIT_MIN_VERSION))) {
+                validationException.addValidationError(
+                    String.format(
+                        Locale.ROOT,
+                        "Parameter [%s=%d] for encoder [%s] requires an index created with version %s or later.",
+                        SQ_BITS,
+                        bits,
+                        ENCODER_SQ,
+                        FAISS_HNSW_SQ_8BIT_MIN_VERSION
+                    )
+                );
+                throw validationException;
+            }
+
             CompressionLevel configuredCompression = configContext.getCompressionLevel();
             if (CompressionLevel.isConfigured(configuredCompression)) {
                 CompressionLevel expectedCompression = QuantizationBits.fromValue(bits)
@@ -305,21 +325,28 @@ public class FaissSQEncoder implements Encoder {
 
     @Override
     public Set<QuantizationBits> getSupportedBits() {
-        return EnumSet.of(QuantizationBits.ONE, QuantizationBits.TWO, QuantizationBits.FOUR, QuantizationBits.SIXTEEN);
+        return EnumSet.of(
+            QuantizationBits.ONE,
+            QuantizationBits.TWO,
+            QuantizationBits.FOUR,
+            QuantizationBits.EIGHT,
+            QuantizationBits.SIXTEEN
+        );
     }
 
     /**
      * Returns true if {@code bits} is a document bit width stored as integer-coded scalar quantization
-     * codes in Lucene's flat SQ format. These are the widths {1, 2, 4} — HNSW construction is
+     * codes in Lucene's flat SQ format. These are the widths {1, 2, 4, 8} — HNSW construction is
      * delegated to native Faiss over the coded bytes. fp16 (16) is excluded — it is a compressed
      * float representation (not integer-quantized codes) and takes the standard Faiss SQ description.
      *
      * @param bits the configured sq encoder bit width
-     * @return true for bits in {1, 2, 4}
+     * @return true for bits in {1, 2, 4, 8}
      */
     public static boolean isSQCodedBits(final int bits) {
         return bits == QuantizationBits.ONE.getValue()
             || bits == QuantizationBits.TWO.getValue()
-            || bits == QuantizationBits.FOUR.getValue();
+            || bits == QuantizationBits.FOUR.getValue()
+            || bits == QuantizationBits.EIGHT.getValue();
     }
 }

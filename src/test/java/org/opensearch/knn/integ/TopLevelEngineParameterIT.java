@@ -86,9 +86,15 @@ public class TopLevelEngineParameterIT extends KNNCompressionRestTestCase {
         validateKNNSearch(INDEX_NAME, FIELD_NAME, DIMENSION, 1, K);
         deleteIndex(INDEX_NAME);
 
-        // faiss, 4x compression -> exception
-        Exception e = expectThrows(Exception.class, () -> createTestIndexWithCompression(KNNEngine.FAISS, "4x"));
-        assertTrue(e.getMessage(), e.getMessage().contains("Lucene is the only engine that supports 4x compression"));
+        // nmslib, 4x compression -> exception
+        Exception e = expectThrows(Exception.class, () -> createTestIndexWithCompression(KNNEngine.NMSLIB, "4x"));
+        assertTrue(e.getMessage(), e.getMessage().contains("Only the Lucene and Faiss engines support 4x compression"));
+        deleteIndex(INDEX_NAME);
+
+        // faiss, 4x compression -> valid (SQ 8-bit)
+        createTestIndexWithCompression(KNNEngine.FAISS, "4x");
+        addKnnDoc(INDEX_NAME, "0", FIELD_NAME, TEST_VECTOR);
+        validateKNNSearch(INDEX_NAME, FIELD_NAME, DIMENSION, 1, K);
         deleteIndex(INDEX_NAME);
 
         // lucene, 4x compression -> valid

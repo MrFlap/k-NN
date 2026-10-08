@@ -18,12 +18,16 @@ import java.util.Objects;
  * dimension of a stored vector) to the Lucene {@link ScalarEncoding} used by the FAISS SQ
  * memory-optimized-search path, and back.
  *
- * <p>The FAISS SQ path always uses a 4-bit (nibble) query, so the relevant encodings are exactly
+ * <p>The sub-byte FAISS SQ widths always use a 4-bit (nibble) query, so the relevant encodings are exactly
  * those whose query bit width is {@link #QUERY_BITS}. In Lucene 10.4 these are:
  * <ul>
  *   <li>1-bit document → {@code SINGLE_BIT_QUERY_NIBBLE} (x32)</li>
  *   <li>2-bit document → {@code DIBIT_QUERY_NIBBLE} (x16)</li>
  *   <li>4-bit document → {@code PACKED_NIBBLE} (x8)</li>
+ * </ul>
+ * The 8-bit (int8) width is symmetric, its query is quantized to 8 bits as well:
+ * <ul>
+ *   <li>8-bit document → {@code UNSIGNED_BYTE} (x4)</li>
  * </ul>
  *
  * <p>The mapping is resolved dynamically from {@link ScalarEncoding#getBits()} and
@@ -38,11 +42,14 @@ public final class ScalarEncodingResolver {
         // Utility class; not instantiable.
     }
 
-    /** The FAISS SQ path always quantizes the query to a 4-bit nibble. */
+    /** The sub-byte FAISS SQ widths always quantize the query to a 4-bit nibble. */
     public static final int QUERY_BITS = 4;
 
+    /** The int8 document width, whose query is quantized to the same width instead of a nibble. */
+    public static final int INT8_DOC_BITS = 8;
+
     /** Document bit widths supported by the FAISS SQ memory-optimized-search path. */
-    private static final int[] SUPPORTED_DOC_BITS = { 1, 2, 4 };
+    private static final int[] SUPPORTED_DOC_BITS = { 1, 2, 4, INT8_DOC_BITS };
 
     /** docBits -> ScalarEncoding, resolved once from the enum metadata. */
     private static final Map<Integer, ScalarEncoding> DOC_BITS_TO_ENCODING = buildDocBitsToEncoding();
@@ -62,6 +69,7 @@ public final class ScalarEncodingResolver {
      *   <tr><td>1</td><td>{@code SINGLE_BIT_QUERY_NIBBLE}</td><td>x32</td></tr>
      *   <tr><td>2</td><td>{@code DIBIT_QUERY_NIBBLE}</td><td>x16</td></tr>
      *   <tr><td>4</td><td>{@code PACKED_NIBBLE}</td><td>x8</td></tr>
+     *   <tr><td>8</td><td>{@code UNSIGNED_BYTE}</td><td>x4</td></tr>
      * </table>
      *
      * <p>Throws at class-load time (via the static initializer of {@link #DOC_BITS_TO_ENCODING})
@@ -71,8 +79,10 @@ public final class ScalarEncodingResolver {
     private static Map<Integer, ScalarEncoding> buildDocBitsToEncoding() {
         final Map<Integer, ScalarEncoding> map = new HashMap<>();
         for (int docBits : SUPPORTED_DOC_BITS) {
+            // int8 is symmetric: the query has the same width as the document.
+            final int queryBits = docBits == INT8_DOC_BITS ? INT8_DOC_BITS : QUERY_BITS;
             for (ScalarEncoding encoding : ScalarEncoding.values()) {
-                if (encoding.getBits() == docBits && encoding.getQueryBits() == QUERY_BITS) {
+                if (encoding.getBits() == docBits && encoding.getQueryBits() == queryBits) {
                     map.put(docBits, encoding);
                     break;
                 }
@@ -96,7 +106,7 @@ public final class ScalarEncodingResolver {
      * Returns the {@link ScalarEncoding} used to store documents quantized to {@code docBits} bits
      * per dimension with a 4-bit nibble query.
      *
-     * @param docBits the document bit width (1, 2, or 4)
+     * @param docBits the document bit width (1, 2, 4, or 8)
      * @return the corresponding Lucene scalar encoding
      * @throws IllegalArgumentException if {@code docBits} is not a supported document bit width
      */
@@ -112,9 +122,9 @@ public final class ScalarEncodingResolver {
 
     /**
      * Inverse of {@link #forDocBits(int)} — returns the document bit width for {@code encoding},
-     * rejecting encodings outside the {@link #SUPPORTED_DOC_BITS} set (1, 2, 4). {@link ScalarEncoding}
-     * exposes bit widths for encodings the FAISS SQ path doesn't support (e.g. {@code SEVEN_BIT},
-     * {@code UNSIGNED_BYTE}); validating here keeps the round-trip guarantee symmetric with
+     * rejecting encodings outside the {@link #SUPPORTED_DOC_BITS} set (1, 2, 4, 8). {@link ScalarEncoding}
+     * exposes bit widths for encodings the FAISS SQ path doesn't support (e.g. {@code SEVEN_BIT}); validating
+     * here keeps the round-trip guarantee symmetric with
      * {@link #forDocBits(int)} and fails loud if a caller ever passes an unexpected encoding.
      *
      * @param encoding a Lucene scalar encoding
@@ -140,7 +150,7 @@ public final class ScalarEncodingResolver {
     }
 
     /**
-     * Returns the supported document bit widths as a printable string (e.g. {@code "[1, 2, 4]"}).
+     * Returns the supported document bit widths as a printable string (e.g. {@code "[1, 2, 4, 8]"}).
      */
     public static String supportedDocBitsString() {
         return Arrays.toString(SUPPORTED_DOC_BITS);

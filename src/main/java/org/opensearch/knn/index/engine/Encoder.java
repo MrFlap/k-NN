@@ -68,6 +68,8 @@ public interface Encoder {
         TWO(2, CompressionLevel.x16),
         FOUR(4, CompressionLevel.x8),
         SEVEN(7, CompressionLevel.x4),
+        /** int8 (Lucene104 {@code UNSIGNED_BYTE}). Same x4 as {@link #SEVEN}, which must stay first so x4 still resolves to it. */
+        EIGHT(8, CompressionLevel.x4),
         SIXTEEN(16, CompressionLevel.x2),
         /** Identity value for FLAT encoders: full precision float32 with no quantization applied. */
         FULL_PRECISION(32, CompressionLevel.x1);
@@ -99,7 +101,8 @@ public interface Encoder {
 
         /**
          * Reverse of {@link #getCompressionLevel()}: maps a {@link CompressionLevel} back to the bit
-         * width used to achieve it (x32→1, x16→2, x8→4, x4→7, x2→16, x1→32). Falls back to
+         * width used to achieve it (x32→1, x16→2, x8→4, x4→7, x2→16, x1→32); x4 never yields {@link #EIGHT}, callers
+         * that want int8 pick it explicitly. Falls back to
          * {@link #FULL_PRECISION} for {@link CompressionLevel#NOT_CONFIGURED} and any unmapped value.
          */
         public static QuantizationBits fromCompressionLevel(CompressionLevel compressionLevel) {
@@ -116,17 +119,20 @@ public interface Encoder {
          * measured against FLOAT's 32 bits, so {@link #ONE} is x32 there; taking HALF_FLOAT's 16 bits
          * down to 1 saves 16x instead.
          *
-         * <p>HALF_FLOAT supports only bits=1. Any other width is rejected rather than falling through
-         * to {@link #getCompressionLevel()}, which is computed against FLOAT's 32-bit baseline and
-         * would report a level that is wrong for HALF_FLOAT.
+         * <p>HALF_FLOAT supports only bits=1 (x16) and bits=8 (x2). Any other width is rejected rather than
+         * falling through to {@link #getCompressionLevel()}, which is computed against FLOAT's 32-bit baseline
+         * and would report a level that is wrong for HALF_FLOAT.
          */
         public CompressionLevel getCompressionLevel(VectorDataType vectorDataType) {
             if (vectorDataType == VectorDataType.HALF_FLOAT) {
                 if (this == ONE) {
                     return CompressionLevel.x16;
                 }
+                if (this == EIGHT) {
+                    return CompressionLevel.x2;
+                }
                 throw new IllegalArgumentException(
-                    String.format(Locale.ROOT, "half_float only supports bits=1 for SQ quantization, got bits=%d", value)
+                    String.format(Locale.ROOT, "half_float only supports bits=1 or bits=8 for SQ quantization, got bits=%d", value)
                 );
             }
             return compressionLevel;
@@ -134,11 +140,17 @@ public interface Encoder {
 
         /**
          * Data-type-aware inverse of {@link #getCompressionLevel(VectorDataType)}.
-         * For HALF_FLOAT, x16 is its SQ 1-bit level rather than the 2-bit level x16 denotes for FLOAT.
+         * For HALF_FLOAT, x16 is its SQ 1-bit level rather than the 2-bit level x16 denotes for FLOAT, and x2 is its
+         * SQ 8-bit level rather than the fp16 level x2 denotes for FLOAT.
          */
         public static QuantizationBits fromCompressionLevel(CompressionLevel compressionLevel, VectorDataType vectorDataType) {
-            if (vectorDataType == VectorDataType.HALF_FLOAT && compressionLevel == CompressionLevel.x16) {
-                return ONE;
+            if (vectorDataType == VectorDataType.HALF_FLOAT) {
+                if (compressionLevel == CompressionLevel.x16) {
+                    return ONE;
+                }
+                if (compressionLevel == CompressionLevel.x2) {
+                    return EIGHT;
+                }
             }
             return fromCompressionLevel(compressionLevel);
         }

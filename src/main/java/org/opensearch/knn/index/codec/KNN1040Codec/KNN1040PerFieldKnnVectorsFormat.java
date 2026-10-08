@@ -111,13 +111,14 @@ public class KNN1040PerFieldKnnVectorsFormat extends KNN1040BasePerFieldKnnVecto
             final Tuple<Integer, ExecutorService> merge = getMergeThreadCountAndExecutorService();
             final int threshold = toTinySegmentsThreshold(ctx.getApproximateThreshold());
 
-            // bits ∈ {1, 2, 4} — Lucene 10.4 integer-coded SQ path (x32 / x16 / x8) with SIMD
-            // flat scorer. bits == 7 falls through to the legacy Lucene99 RW format so the
+            // bits ∈ {1, 2, 4, 8} — Lucene 10.4 integer-coded SQ path (x32 / x16 / x8 / x4 int8) with SIMD
+            // flat scorer for 1-bit. bits == 7 falls through to the legacy Lucene99 RW format so the
             // {@code confidenceInterval} parameter is preserved for pre-3.6.0 mappings.
             if (p.getBits() == QuantizationBits.ONE.getValue()
                 || p.getBits() == QuantizationBits.TWO.getValue()
-                || p.getBits() == QuantizationBits.FOUR.getValue()) {
-                // half_float only ever reaches bits=1 — LuceneHNSWMethodResolver caps it at {x1, x16}.
+                || p.getBits() == QuantizationBits.FOUR.getValue()
+                || p.getBits() == QuantizationBits.EIGHT.getValue()) {
+                // half_float only ever reaches bits ∈ {1, 8} — LuceneHNSWMethodResolver caps it at {x1, x2, x16}.
                 if (ctx.getVectorDataType() == VectorDataType.HALF_FLOAT) {
                     return new KNN1040HnswHalfFloatScalarQuantizedVectorsFormat(
                         p.getBitEncoding(),

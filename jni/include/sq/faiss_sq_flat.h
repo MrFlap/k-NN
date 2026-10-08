@@ -47,10 +47,10 @@ namespace knn_jni {
     }
 
     // Only bit widths supported by the memory-optimized-search (MOS) path.
-    // Kept in sync with FaissSQEncoder.isMosBits on the Java side and with
+    // Kept in sync with FaissSQEncoder.isSQCodedBits on the Java side and with
     // ScalarEncodingResolver.SUPPORTED_DOC_BITS.
     static inline bool isMosDocBits(int32_t bits) {
-        return bits == 1 || bits == 2 || bits == 4;
+        return bits == 1 || bits == 2 || bits == 4 || bits == 8;
     }
 
     // Validates a docBits value and returns it unchanged when supported. Called from
@@ -60,7 +60,7 @@ namespace knn_jni {
         if (!isMosDocBits(bits)) {
             throw std::runtime_error(
                 "FaissSQDistanceComputer: unsupported docBits=" + std::to_string(bits)
-                + ". Supported: 1, 2, 4."
+                + ". Supported: 1, 2, 4, 8."
             );
         }
         return bits;
@@ -68,8 +68,9 @@ namespace knn_jni {
 
     // Validates that quantizedVectorBytes is compatible with the given docBits and returns it
     // unchanged. For docBits == 2 the bit-plane kernel requires equal-length planes (qvb must
-    // be even). For docBits ∈ {1, 4} any positive qvb is valid — B=1 is a single plane, and
-    // B=4 uses PACKED_NIBBLE where each byte independently carries two elements.
+    // be even). For docBits ∈ {1, 4, 8} any positive qvb is valid — B=1 is a single plane,
+    // B=4 uses PACKED_NIBBLE where each byte independently carries two elements, and B=8 uses
+    // UNSIGNED_BYTE where each byte is one element.
     static inline uint64_t validateQvbForDocBits(uint64_t qvb, int32_t bits) {
         if (bits == 2 && qvb % 2 != 0) {
             throw std::runtime_error(
@@ -84,12 +85,13 @@ namespace knn_jni {
     struct FaissSQDistanceComputer final : faiss::DistanceComputer {
         const int64_t oneElementByteSize;
         const uint64_t quantizedVectorBytes;
-        // Number of bits used to quantize each document dimension (1, 2, or 4).
+        // Number of bits used to quantize each document dimension (1, 2, 4, or 8).
         const int32_t docBits;
         // Byte length of a single bit plane. Only meaningful for the bit-plane popcount path
         // (B=1, B=2): the quantized code is docBits contiguous planes, each planeBytes long,
-        // so quantizedVectorBytes == docBits * planeBytes. Unused for B=4 (PACKED_NIBBLE),
-        // where `bothPackedNibbleDp` iterates over quantizedVectorBytes directly.
+        // so quantizedVectorBytes == docBits * planeBytes. Unused for B=4 (PACKED_NIBBLE) and
+        // B=8 (UNSIGNED_BYTE), where `bothPackedNibbleDp` / `bothUint8Dp` iterate over
+        // quantizedVectorBytes directly.
         const uint64_t planeBytes;
         // Reconstruction scale for the quantization interval: 1 / (2^docBits - 1). For docBits == 1
         // this is 1, preserving the legacy single-bit behavior.
@@ -112,10 +114,10 @@ namespace knn_jni {
                 validateQvbForDocBits(
                     _oneElementByteSize - (sizeof(float) * 3 + sizeof(int32_t)),
                     validateDocBits(_docBits))),
-            // validateDocBits above already rejected _docBits ∉ {1,2,4}, so:
+            // validateDocBits above already rejected _docBits ∉ {1,2,4,8}, so:
             //   - docBits / 0 division in `planeBytes` is unreachable
             //   - `1 << _docBits` signed-shift UB (would need _docBits > 30) is unreachable
-            //   - silent wrong reconstruction for _docBits ∈ {3,5,6,7,...} is unreachable
+            //   - silent wrong reconstruction for _docBits ∈ {3,5,6,7,9,...} is unreachable
             // Fields below are computed only when validation has passed.
             docBits(_docBits),
             planeBytes(quantizedVectorBytes / _docBits),
@@ -171,10 +173,23 @@ namespace knn_jni {
             return total;
         }
 
+        // Byte-wise dot product over Lucene's UNSIGNED_BYTE doc layout: one unsigned 8-bit code per element.
+        // The accumulator is 32-bit, which cannot overflow for any supported dimension: 255 * 255 * 16000 < 2^32.
+        // Written as a plain widening multiply-accumulate so the auto-vectorizer can use UMLAL/UADALP on ARM and
+        // PMADDUBSW/PMADDWD on x86.
+        static inline uint64_t bothUint8Dp(const uint8_t* a, const uint8_t* b, const uint64_t n) {
+            uint32_t total = 0;
+            for (uint64_t i = 0; i < n; ++i) {
+                total += static_cast<uint32_t>(a[i]) * static_cast<uint32_t>(b[i]);
+            }
+            return total;
+        }
+
         // Multi-bit dot product between two quantized codes. The kernel shape depends on docBits:
         //   B=1: single popcount(a AND b)                          — bit-plane (1 plane)
         //   B=2: 2x2 popcount-AND-shift double sum across planes   — bit-plane (2 planes)
         //   B=4: byte-wise nibble multiply-accumulate              — Lucene's PACKED_NIBBLE layout
+        //   B=8: byte-wise multiply-accumulate                     — Lucene's UNSIGNED_BYTE layout
         //
         // Performance trade-off: for B=4 the bit-plane formulation would need 16 popcount calls
         // per distance (and a Java-side repack, since Lucene stores PACKED_NIBBLE not bit planes),
@@ -186,6 +201,9 @@ namespace knn_jni {
             }
             if (docBits == 4) {
                 return bothPackedNibbleDp(a, b, quantizedVectorBytes);
+            }
+            if (docBits == 8) {
+                return bothUint8Dp(a, b, quantizedVectorBytes);
             }
             // docBits == 2: bit-plane popcount path.
             uint64_t dp = 0;
@@ -316,7 +334,7 @@ namespace knn_jni {
         // For safely casting uint8_t* to float*, we should enforce 8-byte alignment for the vector.
         std::vector<uint8_t, knn_jni::NBytesAlignedAllocator<uint8_t, 8>> quantizedVectorsAndCorrectionFactors;
         int32_t dimension;
-        // Document bit width (1, 2, or 4). quantizedVectorBytes == docBits * binaryCodeBytes.
+        // Document bit width (1, 2, 4, or 8). For 1 and 2, quantizedVectorBytes == docBits * binaryCodeBytes.
         int32_t docBits;
 
         FaissSQFlat(int64_t _numVectors, int32_t _quantizedVectorBytes, float _centroidDp, int32_t _dimension, faiss::MetricType _metric, int32_t _docBits)
