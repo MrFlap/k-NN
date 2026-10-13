@@ -117,7 +117,7 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         // yet in the native SIMD path — route them to Lucene's pure-Java reference scorer,
         // which scores the same codes correctly.
         final ScalarEncoding scalarEncoding = quantizedByteVectorValues.getScalarEncoding();
-        if (ScalarEncodingResolver.docBits(scalarEncoding) != 1) {
+        if (scalarEncoding.getBits() != 1) {
             return (RandomVectorScorer.AbstractRandomVectorScorer) super.getRandomVectorScorer(
                 similarityFunction,
                 quantizedByteVectorValues,

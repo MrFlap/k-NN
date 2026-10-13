@@ -18,6 +18,7 @@ import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsFormat.Mode;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
@@ -45,6 +46,9 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
 
     private final ScalarEncoding encoding;
     private final FlatVectorsFormat rawVectorFormat;
+    // POC: when non-null, reads and writes go through the vendored data-blind Lucene104 SQ codec
+    // (apache/lucene#16030 + fixes) with this mode. Null keeps the stock Lucene codec.
+    private final Mode dataBlindCodecMode;
 
     public KNN1040ScalarQuantizedVectorsFormat() {
         this(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
@@ -55,13 +59,31 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
     }
 
     KNN1040ScalarQuantizedVectorsFormat(final ScalarEncoding encoding, final VectorDataType rawVectorDataType) {
+        this(encoding, rawVectorDataType, null);
+    }
+
+    KNN1040ScalarQuantizedVectorsFormat(
+        final ScalarEncoding encoding,
+        final VectorDataType rawVectorDataType,
+        final Mode dataBlindCodecMode
+    ) {
         super(encoding);
         this.encoding = encoding;
         this.rawVectorFormat = VectorDataType.HALF_FLOAT == rawVectorDataType ? RAW_VECTOR_FORMAT_HALF_FLOAT : RAW_VECTOR_FORMAT_FLOAT;
+        this.dataBlindCodecMode = dataBlindCodecMode;
     }
 
     @Override
     public FlatVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
+        if (dataBlindCodecMode != null) {
+            return new org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsWriter(
+                state,
+                encoding,
+                dataBlindCodecMode,
+                rawVectorFormat.fieldsWriter(state),
+                KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER
+            );
+        }
         return new Lucene104ScalarQuantizedVectorsWriter(
             state,
             encoding,
@@ -74,9 +96,10 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
     public String toString() {
         return String.format(
             Locale.ROOT,
-            "%s(encoding=%s, scorer=%s, rawVectorFormat=%s)",
+            "%s(encoding=%s, dataBlindCodecMode=%s, scorer=%s, rawVectorFormat=%s)",
             getClass().getSimpleName(),
             encoding,
+            dataBlindCodecMode,
             KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER,
             rawVectorFormat
         );
@@ -84,6 +107,13 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
 
     @Override
     public FlatVectorsReader fieldsReader(SegmentReadState state) throws IOException {
+        if (dataBlindCodecMode != null) {
+            return new org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsReader(
+                state,
+                rawVectorFormat.fieldsReader(state),
+                KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER
+            );
+        }
         return new Lucene104ScalarQuantizedVectorsReader(
             state,
             rawVectorFormat.fieldsReader(state),

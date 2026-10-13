@@ -17,6 +17,7 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.search.TaskExecutor;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsFormat.Mode;
 import org.opensearch.knn.index.engine.KNNEngine;
 
 import java.io.IOException;
@@ -77,6 +78,19 @@ public class KNN1040HnswScalarQuantizedVectorsFormat extends Lucene104HnswScalar
         int tinySegmentsThreshold,
         VectorDataType rawVectorDataType
     ) {
+        this(encoding, maxConn, beamWidth, numMergeWorkers, mergeExec, tinySegmentsThreshold, rawVectorDataType, Mode.CENTERED);
+    }
+
+    KNN1040HnswScalarQuantizedVectorsFormat(
+        ScalarEncoding encoding,
+        int maxConn,
+        int beamWidth,
+        int numMergeWorkers,
+        ExecutorService mergeExec,
+        int tinySegmentsThreshold,
+        VectorDataType rawVectorDataType,
+        Mode dataBlindCodecMode
+    ) {
         super(encoding, maxConn, beamWidth, numMergeWorkers, mergeExec, tinySegmentsThreshold);
         this.maxConn = maxConn;
         this.beamWidth = beamWidth;
@@ -85,7 +99,9 @@ public class KNN1040HnswScalarQuantizedVectorsFormat extends Lucene104HnswScalar
         this.mergeExec = mergeExec != null ? new TaskExecutor(mergeExec) : null;
         this.flatVectorsFormat = VectorDataType.HALF_FLOAT == rawVectorDataType
             ? new KNN1040HalfFloatScalarQuantizedVectorsFormat(encoding)
-            : new KNN1040ScalarQuantizedVectorsFormat(encoding);
+            // POC: float always goes through the vendored codec so data-blind segments stay readable via the no-arg SPI
+            // constructor; the mode only changes what gets written.
+            : new KNN1040ScalarQuantizedVectorsFormat(encoding, VectorDataType.FLOAT, dataBlindCodecMode);
     }
 
     @Override

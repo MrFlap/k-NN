@@ -18,6 +18,7 @@ import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN1040BasePerFieldKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KnnVectorsFormatContext;
+import org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsFormat.Mode;
 import org.opensearch.knn.index.codec.LuceneVectorsFormatType;
 import org.opensearch.knn.index.codec.KNN9120Codec.KNN9120HnswBinaryVectorsFormat;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
@@ -109,6 +110,12 @@ public class KNN1040PerFieldKnnVectorsFormat extends KNN1040BasePerFieldKnnVecto
             );
             final Tuple<Integer, ExecutorService> merge = getMergeThreadCountAndExecutorService();
             final int threshold = toTinySegmentsThreshold(ctx.getApproximateThreshold());
+            // POC: float x8 (4-bit) and x4 (8-bit) are written data-blind (zero centroid, floats kept).
+            // shortcut: COSINE stays centered since Lucene 10.5.1 asserts a unit centroid for COSINE; lucene#16030 relaxes it,
+            // drop this check once k-NN is on that Lucene.
+            final Mode dataBlindMode = ctx.getMethodContext().getSpaceType() == SpaceType.COSINESIMIL
+                ? Mode.CENTERED
+                : Mode.DATA_BLIND_WITH_FLOATS;
 
             // bits ∈ {1, 2, 4} — Lucene 10.4 integer-coded SQ path (x32 / x16 / x8) with SIMD
             // flat scorer. bits == 7 falls through to the legacy Lucene99 RW format so the
@@ -135,7 +142,24 @@ public class KNN1040PerFieldKnnVectorsFormat extends KNN1040BasePerFieldKnnVecto
                     p.getBeamWidth(),
                     merge.v1(),
                     merge.v2(),
-                    threshold
+                    threshold,
+                    VectorDataType.FLOAT,
+                    p.getBits() == QuantizationBits.FOUR.getValue() ? dataBlindMode : Mode.CENTERED
+                );
+            }
+            // POC: float x4 moves off the legacy Lucene99 7-bit format onto Lucene104 8-bit data-blind.
+            // shortcut: also catches explicit bits=7 and pre-3.6.0 indices (confidence_interval is ignored); gate on index
+            // version before productionizing.
+            if (p.getBits() == QuantizationBits.SEVEN.getValue() && ctx.getVectorDataType() == VectorDataType.FLOAT) {
+                return new KNN1040HnswScalarQuantizedVectorsFormat(
+                    ScalarEncoding.UNSIGNED_BYTE,
+                    p.getMaxConnections(),
+                    p.getBeamWidth(),
+                    merge.v1(),
+                    merge.v2(),
+                    threshold,
+                    VectorDataType.FLOAT,
+                    dataBlindMode
                 );
             }
             return new Lucene99RWHnswScalarQuantizedVectorsFormat(

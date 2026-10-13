@@ -12,7 +12,6 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
-import org.apache.lucene.backward_codecs.lucene99.Lucene99RWHnswScalarQuantizedVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswScalarQuantizedVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.KNN1040PerFieldKnnVectorsFormat;
@@ -690,9 +689,9 @@ public class BasePerFieldKnnVectorsFormatTests extends KNNTestCase {
         assertLuceneHnswSQFormatType(4, KNN1040HnswScalarQuantizedVectorsFormat.class);
     }
 
-    public void testGetKnnVectorsFormatForField_whenLuceneHnswSQSevenBit_thenReturnLuceneRWHnswFormat() {
-        // bits=7 stays on the legacy Lucene99 RW format so confidenceInterval is preserved.
-        assertLuceneHnswSQFormatType(7, Lucene99RWHnswScalarQuantizedVectorsFormat.class);
+    public void testGetKnnVectorsFormatForField_whenLuceneHnswSQSevenBit_thenReturnLucene104HnswFormat() {
+        // POC: float bits=7 (x4) moves to the Lucene104 8-bit data-blind format.
+        assertLuceneHnswSQFormatType(7, KNN1040HnswScalarQuantizedVectorsFormat.class);
     }
 
     private void assertLuceneHnswSQFormatType(int bits, Class<? extends KnnVectorsFormat> expectedFormatClass) {
