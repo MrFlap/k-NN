@@ -17,6 +17,7 @@ import org.opensearch.knn.index.KNNSettings;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.datablind.Lucene104ScalarQuantizedVectorsFormat.Mode;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.KNNEngine;
 
@@ -74,7 +75,16 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
     private KNN1040ScalarQuantizedVectorsFormat flatFormatFor(final ScalarEncoding encoding) {
         return vectorDataType == VectorDataType.HALF_FLOAT
             ? FLAT_FORMAT_CACHE_HALF_FLOAT.computeIfAbsent(encoding, KNN1040HalfFloatScalarQuantizedVectorsFormat::new)
-            : FLAT_FORMAT_CACHE_FLOAT.computeIfAbsent(encoding, KNN1040ScalarQuantizedVectorsFormat::new);
+            : FLAT_FORMAT_CACHE_FLOAT.computeIfAbsent(
+                encoding,
+                // POC: 4-bit (x8) is written data-blind (zero centroid, floats kept); every other encoding stays centered. All float SQ
+                // fields go through the vendored codec so data-blind segments are readable.
+                e -> new KNN1040ScalarQuantizedVectorsFormat(
+                    e,
+                    VectorDataType.FLOAT,
+                    e == ScalarEncoding.PACKED_NIBBLE ? Mode.DATA_BLIND_WITH_FLOATS : Mode.CENTERED
+                )
+            );
     }
 
     /**

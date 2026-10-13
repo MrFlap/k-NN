@@ -98,6 +98,10 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         return delegateFlatVectorsReader.ramBytesUsed();
     }
 
+    public FlatVectorsReader getDelegateFlatVectorsReader() {
+        return delegateFlatVectorsReader;
+    }
+
     @Override
     public FlatVectorsScorer getFlatVectorScorer(String field) throws IOException {
         return delegateFlatVectorsReader.getFlatVectorScorer(field);
