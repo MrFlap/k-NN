@@ -96,6 +96,20 @@ public class FaissMethodResolverTests extends KNNTestCase {
         );
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.INNER_PRODUCT, ENCODER_SQ, true);
 
+        // x4 auto-resolves to SQ 8-bit (data-blind int8).
+        resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
+                .compressionLevel(CompressionLevel.x4)
+                .versionCreated(Version.CURRENT)
+                .build(),
+            false,
+            SpaceType.INNER_PRODUCT
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x4, SpaceType.INNER_PRODUCT, ENCODER_SQ, true);
+
         // Pre-3.9 index (BWC path): x8 without a user-provided encoder still auto-resolves to BQ.
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -425,7 +439,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
     }
 
     public void testResolveMethod_whenInvalid_thenThrow() {
-        // Invalid compression
+        // x4 is data-blind int8, which needs an index created on 3.9.0+
         expectThrows(
             ValidationException.class,
             () -> TEST_RESOLVER.resolveMethod(
@@ -433,7 +447,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
                 KNNMethodConfigContext.builder()
                     .vectorDataType(VectorDataType.FLOAT)
                     .compressionLevel(CompressionLevel.x4)
-                    .versionCreated(Version.CURRENT)
+                    .versionCreated(Version.V_3_8_0)
                     .build(),
                 false,
                 SpaceType.L2

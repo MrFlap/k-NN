@@ -71,6 +71,7 @@ public class FaissSQEncoder implements Encoder {
         QuantizationBits.ONE.getValue(),
         QuantizationBits.TWO.getValue(),
         QuantizationBits.FOUR.getValue(),
+        QuantizationBits.EIGHT.getValue(),
         QuantizationBits.SIXTEEN.getValue()
     );
     private final static MethodComponent METHOD_COMPONENT = MethodComponent.Builder.builder(ENCODER_SQ)
@@ -91,10 +92,10 @@ public class FaissSQEncoder implements Encoder {
             Map<String, Object> params = methodComponentContext.getParameters();
             Object bitsObj = params.get(SQ_BITS);
 
-            // Multi-bit MOS path (bits in {1,2,4}): document vectors are scalar-quantized to B bits and
-            // stored in Lucene's flat SQ files; Faiss only builds the HNSW graph. Use the flat description
+            // Multi-bit MOS path (bits in {1,2,4}, or 8 for data-blind int8): document vectors are quantized to
+            // B bits and stored in flat files; Faiss only builds the HNSW graph. Use the flat description
             // and carry SQ_BITS = B so the codec/build path can resolve the document bit width.
-            if (bitsObj instanceof Integer && QuantizationBits.isSQCodedBits((Integer) bitsObj)) {
+            if (bitsObj instanceof Integer && QuantizationBits.isFaissMosSQBits((Integer) bitsObj)) {
                 int bits = (Integer) bitsObj;
                 return KNNLibraryIndexingContextImpl.builder().parameters(new HashMap<>() {
                     {

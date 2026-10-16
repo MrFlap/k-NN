@@ -42,6 +42,7 @@ public class FaissMethodResolver extends AbstractMethodResolver {
     private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS = Set.of(
         CompressionLevel.x1,
         CompressionLevel.x2,
+        CompressionLevel.x4,
         CompressionLevel.x8,
         CompressionLevel.x16,
         CompressionLevel.x32
@@ -139,6 +140,27 @@ public class FaissMethodResolver extends AbstractMethodResolver {
             }
         }
 
+        if (CompressionLevel.x4 == resolvedCompressionLevel) {
+            // Data-blind int8. There is no older x4 encoder to fall back to, so reject what int8 cannot serve.
+            if (shouldUseSQForX8X16(knnMethodConfigContext, encoderMap) == false) {
+                final ValidationException validationException = new ValidationException();
+                validationException.addValidationError(
+                    String.format(
+                        Locale.ROOT,
+                        "Compression level [%s] for engine [%s] requires the [%s] encoder on an index created with version %s or later",
+                        CompressionLevel.x4.getName(),
+                        KNNEngine.FAISS.getName(),
+                        ENCODER_SQ,
+                        Version.V_3_9_0
+                    )
+                );
+                throw validationException;
+            }
+            encoderComponentContext = new MethodComponentContext(ENCODER_SQ, new HashMap<>());
+            encoder = encoderMap.get(ENCODER_SQ);
+            encoderComponentContext.getParameters().put(SQ_BITS, Encoder.QuantizationBits.EIGHT.getValue());
+        }
+
         if (CompressionLevel.x8 == resolvedCompressionLevel) {
             if (shouldUseSQForX8X16(knnMethodConfigContext, encoderMap)) {
                 encoderComponentContext = new MethodComponentContext(ENCODER_SQ, new HashMap<>());
@@ -191,11 +213,11 @@ public class FaissMethodResolver extends AbstractMethodResolver {
         );
         encoderComponentContext.getParameters().putAll(resolvedParams);
 
-        // When auto-resolved to a coded SQ bit width (bits ∈ {1, 2, 4}), remove the type and clip
+        // When auto-resolved to a coded SQ bit width (bits ∈ {1, 2, 4, 8}), remove the type and clip
         // defaults that were injected — those parameters are only applicable to fp16 (bits=16),
         // and validateEncoderConfig would reject them for the coded-bit paths.
         if (encoderComponentContext.getParameters().get(SQ_BITS) instanceof Integer bitsVal
-            && Encoder.QuantizationBits.isSQCodedBits(bitsVal)) {
+            && Encoder.QuantizationBits.isFaissMosSQBits(bitsVal)) {
             encoderComponentContext.getParameters().remove(FAISS_SQ_TYPE);
             encoderComponentContext.getParameters().remove(FAISS_SQ_CLIP);
         }

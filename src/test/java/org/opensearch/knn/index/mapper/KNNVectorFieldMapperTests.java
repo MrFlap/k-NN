@@ -2828,10 +2828,10 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             .startObject()
             .field(TYPE_FIELD_NAME, KNN_VECTOR_TYPE)
             .field(DIMENSION_FIELD_NAME, dimension)
-            .field(COMPRESSION_LEVEL_PARAMETER, CompressionLevel.x4.getName())
+            .field(COMPRESSION_LEVEL_PARAMETER, CompressionLevel.x2.getName())
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
-            .field(KNN_ENGINE, KNNEngine.FAISS.getName())
+            .field(KNN_ENGINE, KNNEngine.LUCENE.getName())
             .endObject()
             .endObject();
 

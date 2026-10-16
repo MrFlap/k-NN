@@ -102,7 +102,7 @@ public class FaissFP16Util {
         }
 
         Object bitsObj = encoderContext.getParameters().get(SQ_BITS);
-        if (bitsObj instanceof Integer && QuantizationBits.isSQCodedBits((Integer) bitsObj)) {
+        if (bitsObj instanceof Integer && QuantizationBits.isFaissMosSQBits((Integer) bitsObj)) {
             return false;
         }
 

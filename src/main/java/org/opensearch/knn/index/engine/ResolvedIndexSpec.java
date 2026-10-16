@@ -328,14 +328,15 @@ public final class ResolvedIndexSpec {
 
     /**
      * True when the encoder is SQ configured for the memory-optimized multi-bit path
-     * (bits ∈ {1, 2, 4}). Document vectors are stored as integer-coded scalar-quantization
-     * codes in Lucene's flat SQ files; Faiss only builds the HNSW graph.
+     * (bits ∈ {1, 2, 4}, or 8 for Faiss data-blind int8). Document vectors are stored as
+     * integer-coded quantization codes in flat files; Faiss only builds the HNSW graph.
      */
     public boolean isSQMultiBit() {
         return encoderType == Encoder.EncoderType.SQ
             && (quantizationBits == Encoder.QuantizationBits.ONE
                 || quantizationBits == Encoder.QuantizationBits.TWO
-                || quantizationBits == Encoder.QuantizationBits.FOUR);
+                || quantizationBits == Encoder.QuantizationBits.FOUR
+                || quantizationBits == Encoder.QuantizationBits.EIGHT);
     }
 
     /**

@@ -10,12 +10,14 @@ import org.opensearch.common.Nullable;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040DataBlindInt8KnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990HalfFloatKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.CodecFormatResolver;
+import org.opensearch.knn.index.engine.Encoder;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 
@@ -67,9 +69,12 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
                 : new NativeEngines990HalfFloatKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
         }
 
-        return resolvedSpec.isFaissSQMultiBit()
-            ? new Faiss1040ScalarQuantizedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory)
-            : resolve();
+        if (resolvedSpec.isFaissSQMultiBit() == false) {
+            return resolve();
+        }
+        return resolvedSpec.getQuantizationBits() == Encoder.QuantizationBits.EIGHT
+            ? new Faiss1040DataBlindInt8KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory)
+            : new Faiss1040ScalarQuantizedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
     }
 
     @Override
