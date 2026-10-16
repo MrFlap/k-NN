@@ -165,6 +165,48 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_sc
     return 0.0f;
 }
 
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_saveInt8SearchContext
+  (JNIEnv *env, jclass clazz, jbyteArray queryCode, jfloat queryScale, jint querySum, jfloat querySqNorm,
+   jlongArray addressAndSize, jint functionTypeOrd, jint dimension) {
+    try {
+      const jsize queryByteSize = JNI_UTIL.GetJavaBytesArrayLength(env, queryCode);
+      if (dimension <= 0 || queryByteSize != dimension) {
+          throw std::runtime_error("query code has " + std::to_string(queryByteSize) + " bytes, expected dimension="
+                                   + std::to_string(dimension));
+      }
+      jbyte* queryPtr = static_cast<jbyte*>(JNI_UTIL.GetPrimitiveArrayCritical(env, queryCode, nullptr));
+      knn_jni::JNIReleaseElements queryRelease {[=]{
+        JNI_UTIL.ReleasePrimitiveArrayCritical(env, queryCode, queryPtr, JNI_ABORT);
+      }};
+
+      const jsize mmapAddressAndSizeLength = JNI_UTIL.GetJavaLongArrayLength(env, addressAndSize);
+      jlong* mmapAddressAndSize = static_cast<jlong*>(JNI_UTIL.GetPrimitiveArrayCritical(env, addressAndSize, nullptr));
+      knn_jni::JNIReleaseElements mmapAddressAndSizeRelease {[=]{
+        JNI_UTIL.ReleasePrimitiveArrayCritical(env, addressAndSize, mmapAddressAndSize, JNI_ABORT);
+      }};
+
+      SimilarityFunction::saveSearchContext(
+          reinterpret_cast<uint8_t*>(queryPtr), queryByteSize,
+          dimension,
+          reinterpret_cast<int64_t*>(mmapAddressAndSize), mmapAddressAndSizeLength,
+          functionTypeOrd);
+
+      SimdVectorSearchContext* ctx = SimilarityFunction::getSearchContext();
+      // The query arrives as unsigned codes (q + 128); the kernel takes signed codes, the same byte with the top bit flipped.
+      auto* query = static_cast<uint8_t*>(ctx->queryVectorSimdAligned);
+      for (int32_t d = 0 ; d < dimension ; ++d) {
+          query[d] ^= 0x80u;
+      }
+      // saveSearchContext cleared tmpBuffer; the query terms sit at its front, like the SQ correction factors.
+      ctx->tmpBuffer.resize(3 * sizeof(float));
+      std::memcpy(ctx->tmpBuffer.data(), &queryScale, sizeof(float));
+      std::memcpy(ctx->tmpBuffer.data() + 4, &querySum, sizeof(int32_t));
+      std::memcpy(ctx->tmpBuffer.data() + 8, &querySqNorm, sizeof(float));
+    } catch (...) {
+      JNI_UTIL.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_saveSQSearchContext
   (JNIEnv *env, jclass clazz, jbyteArray quantizedQuery,
    jfloat lowerInterval, jfloat upperInterval, jfloat additionalCorrection,

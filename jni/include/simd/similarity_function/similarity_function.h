@@ -28,8 +28,11 @@ namespace knn_jni::simd::similarity_function {
         // Cosine for FP16. Vectors are L2-normalized so cosine = inner product with score = (1 + dot) / 2.
         FP16_COSINE,
         // Cosine for SQ. Same IP intermediate math as SQ_IP but with cosine score transform.
-        SQ_COSINE
-
+        SQ_COSINE,
+        // Data-blind int8 records ([code | scale | sum | squared norm | unused]), see data_blind_int8.h.
+        DB_INT8_IP,
+        DB_INT8_L2,
+        DB_INT8_COSINE
     };
 
     struct SimilarityFunction;
@@ -109,6 +112,9 @@ namespace knn_jni::simd::similarity_function {
         // Select similarity function based on the function type.
         static SimilarityFunction* selectSimilarityFunction(NativeSimilarityFunctionType nativeFunctionType);
     };
+
+    // Data-blind int8 (DB_INT8_*): one kernel for every ISA, selected by its own compile flags.
+    SimilarityFunction* dataBlindInt8SimilarityFunction(NativeSimilarityFunctionType nativeFunctionType);
 }
 
 #endif  // OPENSEARCH_KNN_SIMD_SIMILARITY_FUNCTION_H

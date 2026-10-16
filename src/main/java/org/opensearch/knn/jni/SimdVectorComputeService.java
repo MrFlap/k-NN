@@ -33,8 +33,32 @@ public class SimdVectorComputeService {
         // FP16 Cosine. Vectors are guaranteed to be L2-normalized, so cosine = inner product with score = (1 + dot) / 2.
         FP16_COSINE,
         // SQ Cosine. Same IP math as SQ_IP but with cosine score transform.
-        SQ_COSINE
+        SQ_COSINE,
+        // Data-blind int8 (DataBlindInt8Quantizer). Scores match DataBlindInt8Quantizer.score bit for bit.
+        DB_INT8_IP,
+        DB_INT8_L2,
+        DB_INT8_COSINE
     }
+
+    /**
+     * Prepares data-blind int8 scoring of the records at {@code addressAndSize} for this thread; score them with
+     * {@link #scoreSimilarityInBulk} or {@link #scoreSimilarity}.
+     *
+     * @param queryCode the query encoded by {@code DataBlindInt8Quantizer}, one unsigned byte (q + 128) per dimension
+     * @param queryScale the query's {@code maxAbs / 127}
+     * @param querySum the query's sum of signed codes
+     * @param querySqNorm the query's squared norm
+     * @param nativeFunctionTypeOrd one of {@code DB_INT8_*}
+     */
+    public static native void saveInt8SearchContext(
+        byte[] queryCode,
+        float queryScale,
+        int querySum,
+        float querySqNorm,
+        long[] addressAndSize,
+        int nativeFunctionTypeOrd,
+        int dimension
+    );
 
     public static native void saveSQSearchContext(
         byte[] quantizedQuery,

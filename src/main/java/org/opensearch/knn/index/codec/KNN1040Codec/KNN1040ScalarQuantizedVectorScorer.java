@@ -108,8 +108,13 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
 
         if (quantizedByteVectorValues instanceof DataBlindInt8VectorValues int8) {
             // Int8 codes carry no ord-to-doc mapping of their own, so score them against the still-wrapped values.
+            final FloatVectorValues docMapped = (FloatVectorValues) docMappedValues;
+            final IndexInput slice = int8.getSlice();
+            final long[] addressAndSize = MemorySegmentAddressExtractorUtil.tryExtractAddressAndSize(slice, 0, slice.length());
             return new PrefetchableRandomVectorScorer(
-                new DataBlindInt8RandomVectorScorer((FloatVectorValues) docMappedValues, int8, target, similarityFunction)
+                addressAndSize != null
+                    ? new DataBlindInt8BulkSimdRandomVectorScorer(docMapped, int8, target, addressAndSize, similarityFunction)
+                    : new DataBlindInt8RandomVectorScorer(docMapped, int8, target, similarityFunction)
             );
         }
         return new PrefetchableRandomVectorScorer(getScorer(similarityFunction, quantizedByteVectorValues, target));

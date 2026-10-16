@@ -157,8 +157,13 @@ set(SIMD_COMPUTING_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_SimdVectorComputeService.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_SimdFp16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/simd/similarity_function/similarity_function.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/simd/similarity_function/data_blind_int8_similarity_function.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/simd/fp16_codec/fp16_codec.cpp
 )
+
+# No fused multiply-add in the int8 epilogue, so native scores are bit-identical to Java's DataBlindInt8Quantizer.
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/simd/similarity_function/data_blind_int8_similarity_function.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 # Make it a shared library
 add_library(${TARGET_LIB_SIMD} SHARED ${SIMD_COMPUTING_SRCS})
