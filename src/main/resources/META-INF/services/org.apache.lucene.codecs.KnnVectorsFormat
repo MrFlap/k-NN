@@ -15,6 +15,7 @@ org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFo
 org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat
 org.opensearch.knn.index.codec.KNN9120Codec.KNN9120HnswBinaryVectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040ScalarQuantizedVectorsFormat
+org.opensearch.knn.index.codec.KNN1040Codec.KNN1040DataBlindInt8VectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HalfFloatScalarQuantizedVectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswScalarQuantizedVectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswHalfFloatScalarQuantizedVectorsFormat
