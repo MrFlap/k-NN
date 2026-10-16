@@ -11,6 +11,7 @@
 #include "faiss/MetricType.h"
 #include "faiss/impl/DistanceComputer.h"
 #include "memory_util.h"
+#include "sq/faiss_data_blind_int8_distance_computer.h"
 
 #include <cstdint>
 #include <cstring>
@@ -316,7 +317,7 @@ namespace knn_jni {
         // For safely casting uint8_t* to float*, we should enforce 8-byte alignment for the vector.
         std::vector<uint8_t, knn_jni::NBytesAlignedAllocator<uint8_t, 8>> quantizedVectorsAndCorrectionFactors;
         int32_t dimension;
-        // Document bit width (1, 2, or 4). quantizedVectorBytes == docBits * binaryCodeBytes.
+        // Document bit width (1, 2, or 4), or 8 for data-blind int8 where quantizedVectorBytes == dimension.
         int32_t docBits;
 
         FaissSQFlat(int64_t _numVectors, int32_t _quantizedVectorBytes, float _centroidDp, int32_t _dimension, faiss::MetricType _metric, int32_t _docBits)
@@ -342,6 +343,16 @@ namespace knn_jni {
         }
 
         faiss::DistanceComputer* get_distance_computer() const {
+            // Data-blind int8 elements share this storage layout but not the OSQ scoring.
+            if (docBits == 8) {
+                if (metric_type == faiss::MetricType::METRIC_L2) {
+                    return new FaissDataBlindInt8DistanceComputer<false>(oneElementSize, quantizedVectorsAndCorrectionFactors.data(), dimension);
+                }
+                if (metric_type == faiss::MetricType::METRIC_INNER_PRODUCT) {
+                    return new FaissDataBlindInt8DistanceComputer<true>(oneElementSize, quantizedVectorsAndCorrectionFactors.data(), dimension);
+                }
+                throw std::runtime_error("Unsupported metric type - " + std::to_string(metric_type));
+            }
             // When quantizedVectorBytes is a multiple of 8, oneElementSize is also a
             // multiple of 8 (quantizedVectorBytes + 16 bytes of correction factors),
             // so element starts are 8-byte aligned and we can use the fast

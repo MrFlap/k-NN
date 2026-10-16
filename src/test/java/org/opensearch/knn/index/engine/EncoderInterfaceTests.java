@@ -32,6 +32,11 @@ public class EncoderInterfaceTests extends KNNTestCase {
     public void testQuantizationBits_fromCompressionLevel_isInverseOfGetCompressionLevel() {
         // For every enum value, fromCompressionLevel(getCompressionLevel(bits)) must return bits.
         for (Encoder.QuantizationBits bits : Encoder.QuantizationBits.values()) {
+            if (bits == Encoder.QuantizationBits.EIGHT) {
+                // Faiss int8 shares x4 with Lucene's SEVEN, and x4 maps back to SEVEN.
+                assertEquals(Encoder.QuantizationBits.SEVEN, Encoder.QuantizationBits.fromCompressionLevel(bits.getCompressionLevel()));
+                continue;
+            }
             assertEquals("round-trip failed for " + bits, bits, Encoder.QuantizationBits.fromCompressionLevel(bits.getCompressionLevel()));
         }
     }

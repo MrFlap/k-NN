@@ -1872,7 +1872,7 @@ public class FaissMemoryOptimizedSearcherTests extends KNNTestCase {
      * or {@code .veb}.
      */
     static class ReadTrackingDirectory extends Directory {
-        private static final Set<String> TRACKED_EXTENSIONS = Set.of(".faiss", ".vec", ".veb", ".veq");
+        private static final Set<String> TRACKED_EXTENSIONS = Set.of(".faiss", ".vec", ".veb", ".veq", ".vdbi");
         private final Directory delegate;
         final Map<String, ReadTrackingIndexInput> trackedInputs = new ConcurrentHashMap<>();
 

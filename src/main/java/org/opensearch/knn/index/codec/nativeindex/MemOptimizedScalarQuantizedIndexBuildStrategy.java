@@ -8,10 +8,13 @@ package org.opensearch.knn.index.codec.nativeindex;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN1040Codec.DataBlindInt8VectorValues;
 import org.opensearch.knn.index.codec.KNN1040Codec.ScalarEncodingResolver;
+import org.opensearch.knn.index.engine.Encoder.QuantizationBits;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
@@ -128,7 +131,9 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
         final float centroidDp = binarizedVectorValues.getCentroidDP();
         // Document bit width (1, 2, or 4), derived from the stored encoding. The native build path
         // splits the quantized code into docBits bit planes for the symmetric distance computation.
-        final int docBits = ScalarEncodingResolver.docBits(binarizedVectorValues.getScalarEncoding());
+        final int docBits = binarizedVectorValues instanceof DataBlindInt8VectorValues
+            ? QuantizationBits.EIGHT.getValue()
+            : ScalarEncodingResolver.docBits(binarizedVectorValues.getScalarEncoding());
         final Map<String, Object> indexParameters = new HashMap<>(indexInfo.getIndexParameters());
         // Force override vector data type as binary so that Faiss can treat it as binary index.
         indexParameters.put(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.BINARY.getValue());
@@ -306,6 +311,19 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
         // Cap the transfer buffer at ~64KB to limit Java heap usage per JNI call.
         // Math.floor ensures we get at least 1 vector per batch even for very large vectors.
         final int batchSize = Math.max(1, (int) Math.floor(1024 * 64 / oneBlockSize));
+        if (binarizedVectorValues instanceof DataBlindInt8VectorValues int8) {
+            // Data-blind int8 records are stored in exactly this layout, so copy them as they are.
+            final IndexInput records = int8.getSlice().clone();
+            records.seek(0);
+            final byte[] buffer = new byte[oneBlockSize * batchSize];
+            for (int i = 0; i < int8.size();) {
+                final int loopSize = Math.min(int8.size() - i, batchSize);
+                records.readBytes(buffer, 0, loopSize * oneBlockSize);
+                JNIService.passSQVectorsWithCorrectionFactors(indexMemoryAddress, buffer, loopSize, knnEngine);
+                i += loopSize;
+            }
+            return;
+        }
         byte[] buffer = null;
         for (int i = 0; i < binarizedVectorValues.size();) {
             // Determine how many vectors to include in this batch

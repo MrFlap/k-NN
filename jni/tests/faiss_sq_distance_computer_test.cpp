@@ -11,7 +11,10 @@
 
 #include "sq/faiss_sq_flat.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <memory>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -964,6 +967,67 @@ TEST(FaissSQDistanceComputerValidation, AcceptsAllSupportedDocBits) {
         EXPECT_NO_THROW(
             (FaissSQDistanceComputer<false, true>(oneElementByteSize, dummy.data(), 0.0f, 128, 1, docBits))
         ) << "docBits=" << docBits << " must be accepted";
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Data-blind int8 (docBits == 8): FaissSQFlat hands out FaissDataBlindInt8DistanceComputer, whose distances estimate the
+// true float distances. Elements are encoded as Java's DataBlindInt8Quantizer does.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static void encodeDataBlindInt8(const std::vector<float>& v, uint8_t* element) {
+    const int32_t dim = static_cast<int32_t>(v.size());
+    float maxAbs = 0;
+    double sqNorm = 0;
+    for (float x : v) {
+        maxAbs = std::max(maxAbs, std::abs(x));
+        sqNorm += static_cast<double>(x) * x;
+    }
+    const float scale = maxAbs / 127;
+    int32_t sum = 0;
+    for (int32_t d = 0; d < dim; ++d) {
+        const int32_t q = std::clamp(static_cast<int32_t>(std::lround(v[d] * (127 / maxAbs))), -127, 127);
+        sum += q;
+        element[d] = static_cast<uint8_t>(q + 128);
+    }
+    const float sqNormF = static_cast<float>(sqNorm);
+    const int32_t unused = 0;
+    std::memcpy(element + dim, &scale, 4);
+    std::memcpy(element + dim + 4, &sum, 4);
+    std::memcpy(element + dim + 8, &sqNormF, 4);
+    std::memcpy(element + dim + 12, &unused, 4);
+}
+
+TEST(FaissDataBlindInt8DistanceComputer, EstimatesTrueDistancesForL2AndInnerProduct) {
+    constexpr int32_t dim = 37;  // odd, so element starts are unaligned
+    constexpr int32_t numVecs = 6;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> gaussian;
+    std::vector<std::vector<float>> vectors(numVecs, std::vector<float>(dim));
+    for (auto& v : vectors) {
+        for (auto& x : v) x = gaussian(rng);
+    }
+
+    for (const auto metric : {faiss::MetricType::METRIC_L2, faiss::MetricType::METRIC_INNER_PRODUCT}) {
+        FaissSQFlat flat(numVecs, dim, 0.0f, dim, metric, 8);
+        std::vector<uint8_t> buf(static_cast<size_t>(numVecs) * flat.oneElementSize);
+        for (int32_t i = 0; i < numVecs; ++i) {
+            encodeDataBlindInt8(vectors[i], buf.data() + static_cast<size_t>(i) * flat.oneElementSize);
+        }
+        flat.quantizedVectorsAndCorrectionFactors.assign(buf.begin(), buf.end());
+
+        std::unique_ptr<faiss::DistanceComputer> dc(flat.get_distance_computer());
+        dc->set_query(reinterpret_cast<const float*>(flat.quantizedVectorsAndCorrectionFactors.data()));
+        for (idx_t i = 0; i < numVecs; ++i) {
+            double dot = 0, l2 = 0;
+            for (int32_t d = 0; d < dim; ++d) {
+                dot += static_cast<double>(vectors[0][d]) * vectors[i][d];
+                l2 += (vectors[0][d] - vectors[i][d]) * static_cast<double>(vectors[0][d] - vectors[i][d]);
+            }
+            const double expected = metric == faiss::MetricType::METRIC_L2 ? l2 : -dot;
+            EXPECT_NEAR((*dc)(i), expected, 0.02 * std::abs(expected) + 0.2) << "metric=" << metric << " i=" << i;
+            EXPECT_FLOAT_EQ(dc->symmetric_dis(0, i), (*dc)(i));
+        }
     }
 }
 

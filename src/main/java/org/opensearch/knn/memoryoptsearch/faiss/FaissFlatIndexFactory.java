@@ -37,7 +37,7 @@ public class FaissFlatIndexFactory {
      */
     static FaissIndex createFlatIndex(final FieldInfo fieldInfo, final FlatVectorsReader flatVectorsReader) {
         if (FieldInfoExtractor.isSQField(fieldInfo)
-            && QuantizationBits.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits())) {
+            && QuantizationBits.isFaissMosSQBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits())) {
             return new FaissScalarQuantizedFlatIndex(flatVectorsReader, fieldInfo.getName());
         }
         return null;

@@ -8,6 +8,7 @@ package org.opensearch.knn.index.codec.KNN1040Codec;
 import com.google.common.annotations.VisibleForTesting;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.index.FieldInfo;
@@ -71,7 +72,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
     private final int approximateThreshold;
     private final VectorDataType vectorDataType;
 
-    private KNN1040ScalarQuantizedVectorsFormat flatFormatFor(final ScalarEncoding encoding) {
+    private FlatVectorsFormat flatFormatFor(final ScalarEncoding encoding) {
         return vectorDataType == VectorDataType.HALF_FLOAT
             ? FLAT_FORMAT_CACHE_HALF_FLOAT.computeIfAbsent(encoding, KNN1040HalfFloatScalarQuantizedVectorsFormat::new)
             : FLAT_FORMAT_CACHE_FLOAT.computeIfAbsent(encoding, KNN1040ScalarQuantizedVectorsFormat::new);
@@ -82,12 +83,12 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
      * matching this instance's {@link #vectorDataType}. Used on the read path, where the encoding
      * itself is unused downstream (see {@link #fieldsReader}) but the raw vector delegate is not.
      */
-    private KNN1040ScalarQuantizedVectorsFormat flatFormatFor() {
+    protected FlatVectorsFormat flatFormatFor() {
         return flatFormatFor(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
     }
 
     @VisibleForTesting
-    KNN1040ScalarQuantizedVectorsFormat getFaissSqFlatFormat() {
+    FlatVectorsFormat getFaissSqFlatFormat() {
         return flatFormatFor();
     }
 
@@ -145,6 +146,11 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
         return ScalarEncodingResolver.forDocBits(bits);
     }
 
+    /** The flat format that writes {@code fieldInfo}, resolved from its {@code SQ_CONFIG}. */
+    protected FlatVectorsFormat flatFormatFor(final FieldInfo fieldInfo) {
+        return flatFormatFor(resolveEncodingForField(fieldInfo));
+    }
+
     @Override
     public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
         // Encoding is resolved LAZILY inside the wrapper writer, on the first addField() or
@@ -153,7 +159,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
         // IndexingChain calls fieldsWriter() before FieldInfos is populated.
         return new Faiss1040ScalarQuantizedKnnVectorsWriter(
             state,
-            fieldInfo -> flatFormatFor(resolveEncodingForField(fieldInfo)),
+            this::flatFormatFor,
             nativeIndexBuildStrategyFactory,
             approximateThreshold
         );

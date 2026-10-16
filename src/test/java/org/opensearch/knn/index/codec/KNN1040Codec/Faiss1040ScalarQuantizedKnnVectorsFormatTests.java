@@ -307,7 +307,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormatTests extends KNNTestCase {
             final Faiss1040ScalarQuantizedKnnVectorsFormat format = new Faiss1040ScalarQuantizedKnnVectorsFormat();
             SegmentReadState readState = KNN1040ScalarQuantizedTestUtils.writeQuantizedVectors(
                 dir,
-                format.getFaissSqFlatFormat(),
+                (KNN1040ScalarQuantizedVectorsFormat) format.getFaissSqFlatFormat(),
                 random()
             );
 

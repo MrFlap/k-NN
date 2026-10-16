@@ -68,6 +68,8 @@ public interface Encoder {
         TWO(2, CompressionLevel.x16),
         FOUR(4, CompressionLevel.x8),
         SEVEN(7, CompressionLevel.x4),
+        /** Faiss data-blind int8. Shares x4 with SEVEN; declared after it so fromCompressionLevel(x4) stays SEVEN. */
+        EIGHT(8, CompressionLevel.x4),
         SIXTEEN(16, CompressionLevel.x2),
         /** Identity value for FLAT encoders: full precision float32 with no quantization applied. */
         FULL_PRECISION(32, CompressionLevel.x1);
@@ -131,6 +133,11 @@ public interface Encoder {
         public static boolean isSQCodedBits(int bits) {
             // fromValue falls back to FULL_PRECISION for widths with no constant, which is never SQ-coded.
             return SQ_CODED_BITS.contains(fromValue(bits));
+        }
+
+        /** Whether the Faiss memory-optimized SQ path stores {@code bits}: the SQ-coded widths plus data-blind int8. */
+        public static boolean isFaissMosSQBits(int bits) {
+            return isSQCodedBits(bits) || bits == EIGHT.value;
         }
 
         public static boolean isSQCoded(CompressionLevel compressionLevel, VectorDataType vectorDataType) {

@@ -62,7 +62,7 @@ public final class NativeIndexBuildStrategyFactory {
         final boolean isTemplate = fieldInfo.attributes().containsKey(MODEL_ID);
         final boolean iterative = !isTemplate && knnEngine.supportsIterativeBuild();
         final boolean isFaissSQMosField = FieldInfoExtractor.isSQField(fieldInfo)
-            && QuantizationBits.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits());
+            && QuantizationBits.isFaissMosSQBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits());
 
         // Determine build strategy
         final NativeIndexBuildStrategy strategy;

@@ -10,6 +10,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatFieldVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
+import org.apache.lucene.codecs.hnsw.FlatVectorsFormat;
 import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.apache.lucene.index.FieldInfo;
@@ -55,10 +56,10 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
     // Faiss1040ScalarQuantizedKnnVectorsFormat.fieldsWriter(state) time, state.fieldInfos may
     // still be null on the initial-write path (Lucene's IndexingChain calls fieldsWriter before
     // fieldInfos is populated).
-    private final Function<FieldInfo, KNN1040ScalarQuantizedVectorsFormat> flatFormatResolver;
+    private final Function<FieldInfo, FlatVectorsFormat> flatFormatResolver;
     // The lazily-constructed flat writer — non-null after the first addField/mergeOneField call.
     private FlatVectorsWriter flatVectorsWriter;
-    private KNN1040ScalarQuantizedVectorsFormat resolvedFlatFormat;
+    private FlatVectorsFormat resolvedFlatFormat;
     // Single field — SQ gets a dedicated format per field via BasePerFieldKnnVectorsFormat
     private FlatFieldVectorsWriter<?> fieldWriter;
     private FieldInfo fieldInfo;
@@ -71,7 +72,7 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
 
     Faiss1040ScalarQuantizedKnnVectorsWriter(
         @NonNull SegmentWriteState segmentWriteState,
-        @NonNull Function<FieldInfo, KNN1040ScalarQuantizedVectorsFormat> flatFormatResolver,
+        @NonNull Function<FieldInfo, FlatVectorsFormat> flatFormatResolver,
         @NonNull NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
         Integer approximateThreshold
     ) {
