@@ -19,6 +19,11 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.MMapDirectory;
@@ -27,6 +32,7 @@ import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.codec.KNN1040Codec.DataBlindInt8Quantizer;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040DataBlindInt8KnnVectorsFormat;
 import org.opensearch.knn.index.warmup.WarmableReader;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
@@ -36,6 +42,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 /**
  * End to end through {@link Faiss1040DataBlindInt8KnnVectorsFormat}: writes float vectors of a {@code bits=8} SQ field,
@@ -57,10 +64,71 @@ public class Faiss1040DataBlindInt8FormatTests extends KNNTestCase {
         assertWriteThenRead("innerproduct", VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT);
     }
 
+    @SneakyThrows
+    public void testSearch_whenL2_thenHitsCarryInt8ScoresAndMatchBruteForce() {
+        assertSearch("l2", VectorSimilarityFunction.EUCLIDEAN, 1);
+    }
+
+    @SneakyThrows
+    public void testSearch_whenInnerProduct_thenHitsCarryInt8ScoresAndMatchBruteForce() {
+        assertSearch("innerproduct", VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT, 1);
+    }
+
+    @SneakyThrows
+    public void testSearch_whenSparseDocs_thenOrdinalsAreMappedToDocs() {
+        assertSearch("l2", VectorSimilarityFunction.EUCLIDEAN, 3);
+    }
+
+    private void assertSearch(final String spaceType, final VectorSimilarityFunction similarity, final int docStride) throws Exception {
+        final int k = 10;
+        try (Directory directory = new MMapDirectory(createTempDir("faiss1040_int8_search"))) {
+            final Random random = new Random(7);
+            final float[][] vectors = randomVectors(random, NUM_DOCS, DIMENSIONS);
+            final SegmentReadState readState = write(directory, spaceType, similarity, vectors, docStride);
+            try (KnnVectorsReader reader = new Faiss1040DataBlindInt8KnnVectorsFormat().fieldsReader(readState)) {
+                final float[] query = randomVectors(random, 1, DIMENSIONS)[0];
+                final TopKnnCollector collector = new TopKnnCollector(k, Integer.MAX_VALUE, KnnSearchStrategy.Hnsw.DEFAULT);
+                reader.search(FIELD_NAME, query, collector, AcceptDocs.fromLiveDocs(null, NUM_DOCS * docStride));
+                final TopDocs topDocs = collector.topDocs();
+                assertEquals(k, topDocs.scoreDocs.length);
+
+                final float[] int8Scores = new float[NUM_DOCS];
+                for (int ord = 0; ord < NUM_DOCS; ord++) {
+                    int8Scores[ord] = int8Score(query, vectors[ord], similarity);
+                }
+                final Set<Integer> bruteForceTopK = new HashSet<>();
+                IntStream.range(0, NUM_DOCS)
+                    .boxed()
+                    .sorted((a, b) -> Float.compare(int8Scores[b], int8Scores[a]))
+                    .limit(k)
+                    .forEach(ord -> bruteForceTopK.add(ord * docStride));
+
+                int matched = 0;
+                for (ScoreDoc hit : topDocs.scoreDocs) {
+                    assertEquals("doc " + hit.doc + " has no vector", 0, hit.doc % docStride);
+                    assertEquals("score of doc " + hit.doc, int8Scores[hit.doc / docStride], hit.score, 0f);
+                    matched += bruteForceTopK.contains(hit.doc) ? 1 : 0;
+                }
+                assertTrue("recall@" + k + " was " + matched, matched >= 9);
+            }
+        }
+    }
+
+    /** The Java int8 score of {@code doc} against {@code query}, as the searcher computes it. */
+    static float int8Score(final float[] query, final float[] doc, final VectorSimilarityFunction similarity) {
+        final DataBlindInt8Quantizer quantizer = new DataBlindInt8Quantizer(query.length);
+        final byte[] queryCode = new byte[query.length];
+        final byte[] docCode = new byte[query.length];
+        final DataBlindInt8Quantizer.QueryTerms terms = quantizer.queryTerms(quantizer.encode(query, queryCode));
+        final DataBlindInt8Quantizer.Int8Code d = quantizer.encode(doc, docCode);
+        final long unsignedDot = DataBlindInt8Quantizer.unsignedDot(queryCode, docCode, 0, query.length);
+        return DataBlindInt8Quantizer.score(unsignedDot, terms, d.scale(), d.sum(), d.sqNorm(), similarity);
+    }
+
     private void assertWriteThenRead(final String spaceType, final VectorSimilarityFunction similarity) throws Exception {
         try (Directory rawDirectory = new MMapDirectory(createTempDir("faiss1040_int8"))) {
             final float[][] vectors = randomVectors(new Random(42), NUM_DOCS, DIMENSIONS);
-            final SegmentReadState readState = write(rawDirectory, spaceType, similarity, vectors);
+            final SegmentReadState readState = write(rawDirectory, spaceType, similarity, vectors, 1);
             final FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory spyDirectory =
                 new FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory(rawDirectory);
             final SegmentReadState spyReadState = new SegmentReadState(
@@ -81,13 +149,15 @@ public class Faiss1040DataBlindInt8FormatTests extends KNNTestCase {
         }
     }
 
-    /** Flushes {@code vectors} as one dense segment and returns a read state for it. */
+    /** Flushes {@code vectors} as one segment, vector {@code i} on doc {@code i * docStride}, and returns a read state. */
     static SegmentReadState write(
         final Directory directory,
         final String spaceType,
         final VectorSimilarityFunction similarity,
-        final float[][] vectors
+        final float[][] vectors,
+        final int docStride
     ) throws Exception {
+        final int maxDoc = vectors.length * docStride;
         final FieldInfo fieldInfo = fieldInfo(spaceType, similarity);
         final FieldInfos fieldInfos = new FieldInfos(new FieldInfo[] { fieldInfo });
         final SegmentInfo segInfo = new SegmentInfo(
@@ -95,7 +165,7 @@ public class Faiss1040DataBlindInt8FormatTests extends KNNTestCase {
             Version.LATEST,
             Version.LATEST,
             "_0",
-            vectors.length,
+            maxDoc,
             false,
             false,
             null,
@@ -115,10 +185,10 @@ public class Faiss1040DataBlindInt8FormatTests extends KNNTestCase {
         try (KnnVectorsWriter writer = new Faiss1040DataBlindInt8KnnVectorsFormat().fieldsWriter(writeState)) {
             @SuppressWarnings("unchecked")
             final KnnFieldVectorsWriter<float[]> fw = (KnnFieldVectorsWriter<float[]>) writer.addField(fieldInfo);
-            for (int doc = 0; doc < vectors.length; doc++) {
-                fw.addValue(doc, vectors[doc]);
+            for (int ord = 0; ord < vectors.length; ord++) {
+                fw.addValue(ord * docStride, vectors[ord]);
             }
-            writer.flush(vectors.length, null);
+            writer.flush(maxDoc, null);
             writer.finish();
         }
         final Set<String> files = new HashSet<>();

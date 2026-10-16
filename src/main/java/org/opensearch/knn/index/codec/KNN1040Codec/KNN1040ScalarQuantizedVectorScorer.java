@@ -11,6 +11,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorScorer;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IndexInput;
@@ -87,6 +88,7 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
         // For the sparse case, KnnVectorValues having `QuantizedByteVectorValues` might be wrapped to support
         // vector ordinal to doc id mapping. For the dense case, it's not needed as vector ordinal is always the same
         // as doc id.
+        final KnnVectorValues docMappedValues = vectorValues;
         if (vectorValues instanceof WrappedFloatVectorValues) {
             vectorValues = WrappedFloatVectorValues.getBottomFloatVectorValues(vectorValues);
         }
@@ -104,6 +106,12 @@ public class KNN1040ScalarQuantizedVectorScorer extends Lucene104ScalarQuantized
             quantizedByteVectorValues = KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(vectorValues);
         }
 
+        if (quantizedByteVectorValues instanceof DataBlindInt8VectorValues int8) {
+            // Int8 codes carry no ord-to-doc mapping of their own, so score them against the still-wrapped values.
+            return new PrefetchableRandomVectorScorer(
+                new DataBlindInt8RandomVectorScorer((FloatVectorValues) docMappedValues, int8, target, similarityFunction)
+            );
+        }
         return new PrefetchableRandomVectorScorer(getScorer(similarityFunction, quantizedByteVectorValues, target));
     }
 
