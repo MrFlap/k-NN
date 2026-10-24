@@ -40,6 +40,8 @@ import org.opensearch.knn.index.vectorvalues.KNNVectorValuesFactory;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValuesIterator;
 import org.opensearch.knn.indices.ModelDao;
 
+import org.opensearch.knn.index.query.TopDocsDISI;
+import org.opensearch.knn.index.KNNSettings;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -364,6 +366,13 @@ public class ExactSearcher {
         final KNNVectorValues<?> vectorValues = KNNVectorValuesFactory.getVectorValues(fieldInfo, reader);
         final KNNVectorValuesIterator.DocIdsIteratorValues iteratorValues = (KNNVectorValuesIterator.DocIdsIteratorValues) vectorValues
             .getVectorValuesIterator();
+
+        // Rescore candidates are known up front: issue their full-precision reads as one batch instead of one by one.
+        if (scorerMode == VectorScorerMode.RESCORE
+            && context.getMatchedDocsIterator() instanceof TopDocsDISI topDocsDISI
+            && KNNSettings.isRescorePrefetchEnabled()) {
+            iteratorValues.prefetchByDocIds(topDocsDISI.getSortedDocIds());
+        }
 
         if (VectorDataType.BINARY == vectorDataType) {
             return VectorScorers.createScorer(

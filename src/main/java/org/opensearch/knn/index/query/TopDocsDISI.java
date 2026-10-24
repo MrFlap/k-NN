@@ -62,6 +62,13 @@ public class TopDocsDISI extends DocIdSetIterator {
         return sortedDocIds.length;
     }
 
+    /**
+     * @return the doc ids of the top docs in ascending order
+     */
+    public int[] getSortedDocIds() {
+        return sortedDocIds;
+    }
+
     public float score() {
         if (idx == -1) {
             return idx;

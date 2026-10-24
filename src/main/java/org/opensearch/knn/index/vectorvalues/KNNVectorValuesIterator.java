@@ -9,11 +9,14 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
+import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.index.KnnVectorValues;
+import org.opensearch.knn.index.codec.KNN1040Codec.ScalarQuantizedFloatVectorValues;
+import org.opensearch.knn.index.codec.scorer.PrefetchHelper;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 
 import java.io.IOException;
@@ -148,6 +151,39 @@ public interface KNNVectorValuesIterator {
         @Override
         public VectorValueExtractorStrategy getVectorExtractorStrategy() {
             return new VectorValueExtractorStrategy.DISIVectorExtractor();
+        }
+
+        /**
+         * Issues one batch of prefetches for the vectors of {@code sortedDocIds} (ascending), so the reads that follow
+         * do not each wait on storage in turn. Vector values without an index slice are skipped.
+         */
+        public void prefetchByDocIds(final int[] sortedDocIds) throws IOException {
+            if (sortedDocIds == null || sortedDocIds.length <= 1) {
+                return;
+            }
+            // SQ fields wrap the full-precision values; prefetch the full-precision slice that rescoring reads.
+            final KnnVectorValues fullPrecision = knnVectorValues instanceof ScalarQuantizedFloatVectorValues sq
+                ? sq.getFloatVectorValues()
+                : knnVectorValues;
+            if (!(fullPrecision instanceof HasIndexSlice hasIndexSlice) || hasIndexSlice.getSlice() == null) {
+                return;
+            }
+
+            // Map doc ids to ords with a copy, so this iterator's position is untouched
+            final KnnVectorValues.DocIndexIterator ordIterator = knnVectorValues.copy().iterator();
+            final int[] ordsToPrefetch = new int[sortedDocIds.length];
+            int count = 0;
+            int docIdWithVectorValue = -1;
+            for (int docId : sortedDocIds) {
+                if (docIdWithVectorValue < docId) {
+                    docIdWithVectorValue = ordIterator.advance(docId);
+                }
+                if (docIdWithVectorValue == docId) {
+                    ordsToPrefetch[count++] = ordIterator.index();
+                }
+            }
+            // The slice starts at ord 0, so the base offset is 0
+            PrefetchHelper.prefetch(hasIndexSlice.getSlice(), 0, fullPrecision.getVectorByteLength(), ordsToPrefetch, count);
         }
 
     }
