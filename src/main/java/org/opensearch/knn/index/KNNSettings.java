@@ -127,6 +127,8 @@ public class KNNSettings {
     // match_mapping_type: knn_vector template handler). Off by default because the auto-inference
     // heuristic is shape-based and can misclaim non-vector numeric arrays; operators must opt in.
     public static final String KNN_DYNAMIC_MAPPING_ENABLED = "knn.dynamic_mapping.enabled";
+    public static final String KNN_MEMORY_OPTIMIZED_BEAM_WIDTH = "knn.memoryopt.beam_width";
+    public static final String KNN_RESCORE_PREFETCH_ENABLED = "knn.rescore.prefetch.enabled";
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -512,6 +514,28 @@ public class KNNSettings {
      * to core's default mapping behavior. Operators opt in per cluster to trade shape-based inference
      * risk for zero-config vector fields.
      */
+    /**
+     * Candidates expanded per round by the memory optimized beam searcher on seeded, unfiltered searches.
+     * 1 keeps Lucene's HNSW searcher.
+     */
+    public static final Setting<Integer> KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING = Setting.intSetting(
+        KNN_MEMORY_OPTIMIZED_BEAM_WIDTH,
+        1,
+        1,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Whether rescoring prefetches the full-precision vectors of all candidates of a segment before scoring them.
+     */
+    public static final Setting<Boolean> KNN_RESCORE_PREFETCH_ENABLED_SETTING = Setting.boolSetting(
+        KNN_RESCORE_PREFETCH_ENABLED,
+        false,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<Boolean> KNN_DYNAMIC_MAPPING_ENABLED_SETTING = Setting.boolSetting(
         KNN_DYNAMIC_MAPPING_ENABLED,
         false,
@@ -683,6 +707,14 @@ public class KNNSettings {
             return KNN_ALGO_PARAM_INDEX_THREAD_QTY_SETTING;
         }
 
+        if (KNN_MEMORY_OPTIMIZED_BEAM_WIDTH.equals(key)) {
+            return KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING;
+        }
+
+        if (KNN_RESCORE_PREFETCH_ENABLED.equals(key)) {
+            return KNN_RESCORE_PREFETCH_ENABLED_SETTING;
+        }
+
         if (ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD.equals(key)) {
             return ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING;
         }
@@ -804,7 +836,9 @@ public class KNNSettings {
             KNN_REMOTE_BUILD_SERVER_PASSWORD_SETTING,
             INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
             KNN_DYNAMIC_MAPPING_ENABLED_SETTING,
-            INDEX_KNN_REORDERING_ENABLED_SETTING
+            INDEX_KNN_REORDERING_ENABLED_SETTING,
+            KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING,
+            KNN_RESCORE_PREFETCH_ENABLED_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1107,6 +1141,14 @@ public class KNNSettings {
      */
     public static boolean isMemoryOptimizedKnnSearchModeEnabled(@NonNull final String indexName) {
         return getIndexSettings(indexName).getAsBoolean(MEMORY_OPTIMIZED_KNN_SEARCH_MODE, DEFAULT_MEMORY_OPTIMIZED_KNN_SEARCH_MODE);
+    }
+
+    public static int getMemoryOptimizedBeamWidth() {
+        return KNNSettings.state().getSettingValue(KNN_MEMORY_OPTIMIZED_BEAM_WIDTH);
+    }
+
+    public static boolean isRescorePrefetchEnabled() {
+        return KNNSettings.state().getSettingValue(KNN_RESCORE_PREFETCH_ENABLED);
     }
 
     public static boolean isReOrderingEnabled(@NonNull final IndexSettings indexSettings) {

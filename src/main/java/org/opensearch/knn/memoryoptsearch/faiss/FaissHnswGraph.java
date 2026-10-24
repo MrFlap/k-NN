@@ -8,6 +8,7 @@ package org.opensearch.knn.memoryoptsearch.faiss;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.HnswGraph;
+import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 
 import java.io.IOException;
 import java.util.NoSuchElementException;
@@ -57,6 +58,22 @@ public class FaissHnswGraph extends HnswGraph {
         final long begin = o + faissHnsw.getCumNumberNeighborPerLevel()[level];
         final long end = o + faissHnsw.getCumNumberNeighborPerLevel()[level + 1];
         loadNeighborIdList(begin, end);
+    }
+
+    /**
+     * Starts loading the neighbor lists of {@code nodes[0..numNodes)} at {@code level} together, so the {@link #seek}
+     * calls that follow do not each wait on storage in turn.
+     */
+    public void prefetchNeighborLists(final int level, final int[] nodes, final int numNodes) throws IOException {
+        if (KNNFeatureFlags.isPrefetchEnabled() == false) {
+            return;
+        }
+        final int[] cumNeighbors = faissHnsw.getCumNumberNeighborPerLevel();
+        final long base = faissHnsw.getNeighbors().getBaseOffset() + (long) Integer.BYTES * cumNeighbors[level];
+        final long listBytes = (long) Integer.BYTES * (cumNeighbors[level + 1] - cumNeighbors[level]);
+        for (int i = 0; i < numNodes; i++) {
+            indexInput.prefetch(base + Integer.BYTES * faissHnsw.getOffsetsReader().get(nodes[i]), listBytes);
+        }
     }
 
     private void loadNeighborIdList(final long begin, final long end) {

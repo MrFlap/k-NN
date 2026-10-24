@@ -19,12 +19,14 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.common.RobustUniqueRandomIterator;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.codec.scorer.PageTouchTracker;
@@ -33,6 +35,7 @@ import org.opensearch.knn.memoryoptsearch.VectorSearcher;
 import org.opensearch.knn.memoryoptsearch.faiss.cagra.FaissCagraHNSW;
 
 import java.io.IOException;
+import java.util.Arrays;
 
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.EXHAUSTIVE_BULK_SCORE_ORDS;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
@@ -221,8 +224,15 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         pageTouchTracker.begin();
         try {
             if (knnCollector.k() < scorer.maxOrd()) {
-                // Do ANN search with Lucene's HNSW graph searcher.
-                HnswGraphSearcher.search(scorer, collector, new FaissHnswGraph(hnsw, indexInput.clone()), acceptedOrds);
+                final FaissHnswGraph graph = new FaissHnswGraph(hnsw, indexInput.clone());
+                final int beamWidth = KNNSettings.getMemoryOptimizedBeamWidth();
+                final int[] seeds = beamSearchSeeds(beamWidth, collector, acceptedOrds);
+                if (seeds != null) {
+                    BeamHnswGraphSearcher.search(scorer, collector, graph, acceptedOrds, seeds, beamWidth);
+                } else {
+                    // Do ANN search with Lucene's HNSW graph searcher.
+                    HnswGraphSearcher.search(scorer, collector, graph, acceptedOrds);
+                }
             } else {
                 // if k is larger than the number of vectors we expect to visit in an HNSW search,
                 // we can just iterate over all vectors and collect them.
@@ -260,6 +270,27 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         } finally {
             pageTouchTracker.end("nvec=" + faissIndex.getTotalNumberOfVectors() + " k=" + knnCollector.k());
         }
+    }
+
+    /**
+     * Entry ordinals for {@link BeamHnswGraphSearcher}, or null to use Lucene's searcher. The beam only takes seeded
+     * searches (the locality-reordered format always seeds from its closest hub) without a filter, since filtered
+     * searches go through Lucene's filtered searcher.
+     */
+    private static int[] beamSearchSeeds(final int beamWidth, final KnnCollector collector, final Bits acceptedOrds) throws IOException {
+        if (beamWidth <= 1
+            || acceptedOrds instanceof BitSet
+            || !(collector.getSearchStrategy() instanceof KnnSearchStrategy.Seeded seeded)
+            || seeded.numberOfEntryPoints() <= 0) {
+            return null;
+        }
+        final int[] seeds = new int[seeded.numberOfEntryPoints()];
+        final DocIdSetIterator entryPoints = seeded.entryPoints();
+        int numSeeds = 0;
+        for (int ord; numSeeds < seeds.length && (ord = entryPoints.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS;) {
+            seeds[numSeeds++] = ord;
+        }
+        return numSeeds == seeds.length ? seeds : Arrays.copyOf(seeds, numSeeds);
     }
 
     @VisibleForTesting
