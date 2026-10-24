@@ -168,7 +168,8 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
                 approximateThreshold,
                 segmentWriteState,
                 nativeIndexBuildStrategyFactory,
-                quantizedValues
+                quantizedValues,
+                null
             );
         } finally {
             IOUtils.close(flatVectorsReader);
@@ -216,7 +217,8 @@ class Faiss1040ScalarQuantizedKnnVectorsWriter extends AbstractNativeEnginesKnnV
                 approximateThreshold,
                 segmentWriteState,
                 nativeIndexBuildStrategyFactory,
-                quantizedValues
+                quantizedValues,
+                null
             );
         } finally {
             IOUtils.close(flatVectorsReader);

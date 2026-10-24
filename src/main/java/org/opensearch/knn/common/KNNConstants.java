@@ -242,4 +242,5 @@ public class KNNConstants {
     // created before this version only support SQ 1-bit (x32) and 7-bit (x4) on Lucene HNSW.
     // 1-bit was introduced in 3.6.0 and stays gated there; 2/4-bit require the newer version.
     public static final Version LUCENE_HNSW_SQ_2BIT_4BIT_MIN_VERSION = Version.V_3_9_0;
+    public static final int MAX_HUBS_IN_HNSW = 32;
 }

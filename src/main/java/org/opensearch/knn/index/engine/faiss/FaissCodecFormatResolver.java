@@ -5,12 +5,14 @@
 
 package org.opensearch.knn.index.engine.faiss;
 
+import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.opensearch.common.Nullable;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat;
+import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040SQHNSWReorderedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990HalfFloatKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
@@ -29,6 +31,7 @@ import java.util.Map;
  * <p>Placed in the {@code faiss} package alongside {@link FaissMethodResolver} because
  * NMSLIB is deprecated and no new NMSLIB indices are created.</p>
  */
+@Log4j2
 public class FaissCodecFormatResolver implements CodecFormatResolver {
 
     @Nullable
@@ -65,6 +68,11 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
             return resolvedSpec.isFaissSQMultiBit()
                 ? new Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory)
                 : new NativeEngines990HalfFloatKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
+        }
+
+        if (resolvedSpec.isFaissSQOneBit() && mapperService != null && KNNSettings.isReOrderingEnabled(mapperService.getIndexSettings())) {
+            log.info("Reordering enabled for index {}", mapperService.index().getName());
+            return new Faiss1040SQHNSWReorderedKnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
         }
 
         return resolvedSpec.isFaissSQMultiBit()

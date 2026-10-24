@@ -5,14 +5,17 @@
 
 package org.opensearch.knn.index.codec.nativeindex;
 
+import com.google.common.base.Stopwatch;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
+import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN1040Codec.ScalarEncodingResolver;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
+import org.opensearch.knn.index.codec.nativeindex.model.Layer0LocalityOrdering;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
 import org.opensearch.knn.jni.JNIService;
@@ -72,9 +75,18 @@ import static org.opensearch.knn.index.codec.util.KNNCodecUtil.initializeVectorV
  * @see NativeIndexBuildStrategyFactory — returns this strategy when field info contains sq_config
  */
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
+@Log4j2
 public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeIndexBuildStrategy {
 
     private static MemOptimizedScalarQuantizedIndexBuildStrategy INSTANCE = new MemOptimizedScalarQuantizedIndexBuildStrategy();
+
+    // Experimental switch for the layer-0 locality ordering. Default = the shipped, AOSS-validated
+    // plain-affinity greedy (buildOrderingOfVectorsUsingIndexStructure). Set -Dknn.locality.ordering=sibling
+    // to use the greedy + shared-neighbor (Gorder co-visitation) + affinity/degree variant
+    // (buildOrderingOfVectorsUsingSiblingGreedy); tune its weight with -Dknn.locality.sibling.weight
+    // (default 0.5). Read once at class-load so it can be flipped per JVM without a code change.
+    private static final boolean USE_SIBLING_GREEDY = "sibling".equalsIgnoreCase(System.getProperty("knn.locality.ordering", "greedy"));
+    private static final double SIBLING_WEIGHT = Double.parseDouble(System.getProperty("knn.locality.sibling.weight", "0.5"));
 
     public static MemOptimizedScalarQuantizedIndexBuildStrategy getInstance() {
         return INSTANCE;
@@ -149,6 +161,14 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
             )
         );
 
+        if (indexInfo.isBuildLayer0Graph()) {
+            log.info("Updating the faiss index to use layer 0 only");
+            AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+                JNIService.setFaissSQHnswToSingleLayer(indexMemoryAddress, indexInfo.getKnnEngine());
+                return null;
+            });
+        }
+
         // Track whether writeIndex (Phase 3) was reached. Once writeIndex is called,
         // the native C++ side wraps the pointer in a unique_ptr that frees the index on exit
         // (even if writeIndex itself throws). Calling releaseSQIndex after that would be a
@@ -163,6 +183,60 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
             // hierarchy (IndexBinaryIDMap → FaissSQHnsw → FaissSQFlat) via own_fields = true.
             JNIService.releaseSQIndex(indexMemoryAddress, indexInfo.getKnnEngine());
             throw e;
+        }
+
+        // Deliver the graph-derived page-locality permutation back to the locality writer via the sink
+        // threaded down through BuildIndexParams (see Layer0LocalityOrdering for the rationale). The
+        // permutation is computed natively over the in-place layer-0 adjacency (zero-copy) and returned
+        // as the forward map int[ntotal] (ordering[originalOrdinal] = physicalPosition).
+        if (indexInfo.isBuildLayer0Graph()) {
+            log.info("building the ordering of the docIds");
+            final Stopwatch stopwatch = Stopwatch.createStarted();
+            final Layer0LocalityOrdering layer0LocalityOrdering = indexInfo.getLayer0LocalityOrdering();
+            if (layer0LocalityOrdering.isPopulated() == false) {
+                int numberOfHubs = Math.min(indexInfo.getTotalLiveDocs(), KNNConstants.MAX_HUBS_IN_HNSW);
+                layer0LocalityOrdering.populate(new int[indexInfo.getTotalLiveDocs()], new int[numberOfHubs]);
+            }
+            // Cluster-size bound for the dense greedy layout: one 32 KB page worth of records. A record
+            // is the quantized code plus the 4 correction factors (4 bytes each), matching the locality
+            // store's on-disk record layout. Greedy grows each affine cluster up to this many nodes, then
+            // packs clusters back-to-back (dense 0..n-1, no padding) — see
+            // buildOrderingOfVectorsUsingIndexStructure. Greedy co-locates a node's own dense neighborhood
+            // far better than BFS (higher intra-page edge ratio), so more neighbor reads hit one page.
+            final int recordSizeBytes = quantizedVecBytes + Integer.BYTES * 4;
+            final int pageCapacity = Math.max(1, (32 * 1024) / recordSizeBytes);
+            // Native also fills the hub array (top-degree original ordinals, -1-padded; pool capped at 32)
+            // in layer0LocalityOrdering. The locality writer persists these (see writeHubs), and the reader
+            // uses the closest one as the search entry point (selectBestHubOrdinal / maybeSeedWithClosestHub).
+            AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
+                if (USE_SIBLING_GREEDY) {
+                    // Greedy + shared-neighbor (Gorder co-visitation) + affinity/degree variant.
+                    JNIService.buildOrderingOfVectorsUsingSiblingGreedy(
+                        indexMemoryAddress,
+                        layer0LocalityOrdering.getPhysicalOrdinals(),
+                        pageCapacity,
+                        layer0LocalityOrdering.getHubs(),
+                        SIBLING_WEIGHT,
+                        indexInfo.getKnnEngine()
+                    );
+                } else {
+                    JNIService.buildOrderingOfVectorsUsingIndexStructure(
+                        indexMemoryAddress,
+                        layer0LocalityOrdering.getPhysicalOrdinals(),
+                        pageCapacity,
+                        layer0LocalityOrdering.getHubs(),
+                        indexInfo.getKnnEngine()
+                    );
+                }
+                return null;
+            });
+            log.info("layer-0 locality ordering used: {}", USE_SIBLING_GREEDY ? "sibling-greedy (b=" + SIBLING_WEIGHT + ")" : "greedy");
+            stopwatch.stop();
+            log.info(
+                "The total time to get ordering of vectors from HNSW graph is : {} ms, total vectors: {}",
+                stopwatch.elapsed().toMillis(),
+                indexInfo.getTotalLiveDocs()
+            );
         }
 
         // Phase 3: write index to disk.
