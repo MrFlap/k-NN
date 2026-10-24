@@ -80,8 +80,8 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
 
     private static MemOptimizedScalarQuantizedIndexBuildStrategy INSTANCE = new MemOptimizedScalarQuantizedIndexBuildStrategy();
 
-    // Experimental switch for the layer-0 locality ordering. Default = the shipped, AOSS-validated
-    // plain-affinity greedy (buildOrderingOfVectorsUsingIndexStructure). Set -Dknn.locality.ordering=sibling
+    // Experimental switch for the layer-0 locality ordering. Default = the plain-affinity
+    // greedy (buildOrderingOfVectorsUsingIndexStructure). Set -Dknn.locality.ordering=sibling
     // to use the greedy + shared-neighbor (Gorder co-visitation) + affinity/degree variant
     // (buildOrderingOfVectorsUsingSiblingGreedy); tune its weight with -Dknn.locality.sibling.weight
     // (default 0.5). Read once at class-load so it can be flipped per JVM without a code change.
