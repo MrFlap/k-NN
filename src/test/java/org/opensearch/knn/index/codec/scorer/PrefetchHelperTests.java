@@ -9,6 +9,8 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.util.Constants;
 import org.mockito.MockedStatic;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
@@ -275,5 +277,62 @@ public class PrefetchHelperTests extends KNNTestCase {
         }
         IndexInput delegate = dir.openInput("test", IOContext.DEFAULT);
         return new TrackingIndexInput(delegate);
+    }
+
+    private static final int PAGE = 4096;
+
+    public void testPrefetchRange_whenMMapInput_thenDirectMadvise() throws IOException {
+        try (MMapDirectory dir = new MMapDirectory(createTempDir()); IndexInput in = openPattern(dir, 8 * PAGE)) {
+            assertEquals(Constants.LINUX, PrefetchHelper.tryMadvise(in, 0, PAGE));
+            try (IndexInput slice = in.slice("slice", PAGE, 4 * PAGE)) {
+                assertEquals(Constants.LINUX, PrefetchHelper.tryMadvise(slice, 0, PAGE));
+            }
+            assertFalse(PrefetchHelper.tryMadvise(in, 0, 0));
+        }
+    }
+
+    public void testPrefetchRange_whenByteBuffersInput_thenFallsBackToLucenePrefetch() throws IOException {
+        try (ByteBuffersDirectory dir = new ByteBuffersDirectory(); IndexInput in = openPattern(dir, 4 * PAGE)) {
+            assertFalse(PrefetchHelper.tryMadvise(in, 0, PAGE));
+            PrefetchHelper.prefetchRange(in, 10, 2 * PAGE); // Lucene's default prefetch: no-op
+            assertPattern(in, 4 * PAGE);
+        }
+    }
+
+    public void testPrefetchRange_whenUnalignedRangesCrossPages_thenAdvisesAndDataIntact() throws IOException {
+        try (MMapDirectory dir = new MMapDirectory(createTempDir()); IndexInput in = openPattern(dir, 8 * PAGE + 123)) {
+            long[][] ranges = { { PAGE - 1, 2 }, { 1, 3L * PAGE + 5 }, { 7L * PAGE + 100, PAGE + 23 }, { 8L * PAGE + 122, 1 } };
+            for (long[] r : ranges) {
+                assertEquals(Constants.LINUX, PrefetchHelper.tryMadvise(in, r[0], r[1]));
+                PrefetchHelper.prefetchRange(in, r[0], r[1]);
+            }
+            assertPattern(in, 8 * PAGE + 123);
+        }
+    }
+
+    public void testPrefetchRange_whenRangeSpansMMapChunks_thenFallsBack() throws IOException {
+        // 4KB chunks: a range crossing a chunk boundary has no single segment, so Lucene's prefetch is used
+        try (MMapDirectory dir = new MMapDirectory(createTempDir(), PAGE); IndexInput in = openPattern(dir, 4 * PAGE)) {
+            assertFalse(PrefetchHelper.tryMadvise(in, PAGE - 10, 20));
+            assertEquals(Constants.LINUX, PrefetchHelper.tryMadvise(in, PAGE + 10, 20));
+            PrefetchHelper.prefetchRange(in, PAGE - 10, 20);
+            assertPattern(in, 4 * PAGE);
+        }
+    }
+
+    private static IndexInput openPattern(org.apache.lucene.store.Directory dir, int size) throws IOException {
+        try (IndexOutput out = dir.createOutput("pattern", IOContext.DEFAULT)) {
+            for (int i = 0; i < size; i++) {
+                out.writeByte((byte) i);
+            }
+        }
+        return dir.openInput("pattern", IOContext.DEFAULT);
+    }
+
+    private static void assertPattern(IndexInput in, int size) throws IOException {
+        in.seek(0);
+        for (int i = 0; i < size; i++) {
+            assertEquals((byte) i, in.readByte());
+        }
     }
 }

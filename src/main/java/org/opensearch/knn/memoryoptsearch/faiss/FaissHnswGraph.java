@@ -9,6 +9,7 @@ import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.HnswGraph;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.codec.scorer.PrefetchHelper;
 
 import java.io.IOException;
 import java.util.NoSuchElementException;
@@ -72,7 +73,7 @@ public class FaissHnswGraph extends HnswGraph {
         final long base = faissHnsw.getNeighbors().getBaseOffset() + (long) Integer.BYTES * cumNeighbors[level];
         final long listBytes = (long) Integer.BYTES * (cumNeighbors[level + 1] - cumNeighbors[level]);
         for (int i = 0; i < numNodes; i++) {
-            indexInput.prefetch(base + Integer.BYTES * faissHnsw.getOffsetsReader().get(nodes[i]), listBytes);
+            PrefetchHelper.prefetchRange(indexInput, base + Integer.BYTES * faissHnsw.getOffsetsReader().get(nodes[i]), listBytes);
         }
     }
 

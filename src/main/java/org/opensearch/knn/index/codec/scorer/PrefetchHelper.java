@@ -9,10 +9,17 @@ import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.apache.lucene.util.Constants;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Array;
 import java.util.Arrays;
+import java.util.Optional;
 
 /**
  * Helper class to prefetch vector data from disk to improve query performance.
@@ -125,7 +132,7 @@ public class PrefetchHelper {
             long currentBlock = currentOffset / BYTES_32;
             if (currentBlock != groupBlock) {
                 long prevEnd = baseOffset + (long) ordsToPrefetch[i - 1] * oneVectorByteSize + oneVectorByteSize;
-                indexInput.prefetch(groupStartOffset, prevEnd - groupStartOffset);
+                prefetchRange(indexInput, groupStartOffset, prevEnd - groupStartOffset);
                 groupCount++;
                 groupStartOffset = currentOffset;
                 groupBlock = currentBlock;
@@ -133,7 +140,7 @@ public class PrefetchHelper {
         }
         // Prefetch final group
         long lastEnd = baseOffset + (long) ordsToPrefetch[numOrds - 1] * oneVectorByteSize + oneVectorByteSize;
-        indexInput.prefetch(groupStartOffset, lastEnd - groupStartOffset);
+        prefetchRange(indexInput, groupStartOffset, lastEnd - groupStartOffset);
 
         log.trace("Prefetching [{}] block-aligned groups from [{}] ordinals, record size: {}", groupCount, numOrds, oneVectorByteSize);
     }
@@ -166,14 +173,14 @@ public class PrefetchHelper {
             long currentOffset = baseOffset + (long) ordsToPrefetch[i] * oneVectorByteSize;
             if ((currentOffset + oneVectorByteSize) - groupStartOffset > BYTES_32) {
                 long prevOffset = baseOffset + (long) ordsToPrefetch[i - 1] * oneVectorByteSize;
-                indexInput.prefetch(groupStartOffset, (prevOffset + oneVectorByteSize) - groupStartOffset);
+                prefetchRange(indexInput, groupStartOffset, (prevOffset + oneVectorByteSize) - groupStartOffset);
                 groupCount++;
                 groupStartOffset = currentOffset;
             }
         }
         // Prefetch final group
         long lastOffset = baseOffset + (long) ordsToPrefetch[numOrds - 1] * oneVectorByteSize;
-        indexInput.prefetch(groupStartOffset, (lastOffset + oneVectorByteSize) - groupStartOffset);
+        prefetchRange(indexInput, groupStartOffset, (lastOffset + oneVectorByteSize) - groupStartOffset);
 
         log.trace(
             "Prefetching grouped [{}] vectors where num of ords was [{}] using exact prefetch size, vector size: {}",
@@ -181,5 +188,122 @@ public class PrefetchHelper {
             numOrds,
             oneVectorByteSize
         );
+    }
+
+    /**
+     * Asks the OS to start reading {@code [offset, offset + length)} of {@code indexInput}. Callers gate this on
+     * {@link KNNFeatureFlags#isPrefetchEnabled()}.
+     * <p>
+     * For mmap'd inputs this calls {@code madvise(MADV_WILLNEED)} directly. Lucene's
+     * {@link IndexInput#prefetch} skips the call unless a per-file counter (shared across clones) is zero or a power
+     * of two, and resets it only when a range is not resident, so on a partly cached file most prefetches are
+     * silently dropped and the reads that follow go serial.
+     */
+    public static void prefetchRange(final IndexInput indexInput, final long offset, final long length) throws IOException {
+        if (tryMadvise(indexInput, offset, length) == false) {
+            indexInput.prefetch(offset, length);
+        }
+    }
+
+    /** Returns true if madvise was issued, false if the caller should fall back to {@link IndexInput#prefetch}. */
+    static boolean tryMadvise(final IndexInput indexInput, final long offset, final long length) throws IOException {
+        if (DirectMadvise.MADVISE == null || length <= 0 || (indexInput instanceof MemorySegmentAccessInput) == false) {
+            return false;
+        }
+        try {
+            // null when the range spans two mmap chunks
+            final Object segment = (Object) DirectMadvise.SLICE.invokeExact((MemorySegmentAccessInput) indexInput, offset, length);
+            if (segment == null) {
+                return false;
+            }
+            final long address = (long) DirectMadvise.ADDRESS.invokeExact(segment);
+            // mmap chunks are page aligned, so rounding the start down stays inside the mapping; the kernel rounds len up.
+            final long alignedAddress = address & DirectMadvise.PAGE_MASK;
+            // Non-zero return ignored: prefetch is only a hint.
+            final int ignored = (int) DirectMadvise.MADVISE.invokeExact(alignedAddress, address + length - alignedAddress, MADV_WILLNEED);
+            return true;
+        } catch (IOException | RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IOException(t);
+        }
+    }
+
+    private static final int MADV_WILLNEED = 3; // Linux value
+
+    /**
+     * Binds {@code madvise} through the FFM {@code Linker} once. Uses reflection and method handles because the
+     * plugin compiles for Java 21, where {@code java.lang.foreign} is still a preview API. The pointer argument is
+     * passed as a 64-bit integer, which matches the LP64 calling convention on Linux x86_64 and aarch64.
+     */
+    private static final class DirectMadvise {
+        static final MethodHandle SLICE; // (MemorySegmentAccessInput, long, long) -> MemorySegment as Object
+        static final MethodHandle ADDRESS; // (MemorySegment as Object) -> long
+        static final MethodHandle MADVISE; // (long addr, long len, int advice) -> int
+        static final long PAGE_MASK;
+
+        static {
+            MethodHandle slice = null, address = null, madvise = null;
+            long pageMask = 0;
+            if (Constants.LINUX && Constants.JRE_IS_64BIT) {
+                try {
+                    final Class<?> segmentClass = Class.forName("java.lang.foreign.MemorySegment");
+                    final Class<?> layoutClass = Class.forName("java.lang.foreign.MemoryLayout");
+                    final Class<?> descriptorClass = Class.forName("java.lang.foreign.FunctionDescriptor");
+                    final Class<?> linkerClass = Class.forName("java.lang.foreign.Linker");
+                    final Class<?> optionClass = Class.forName("java.lang.foreign.Linker$Option");
+                    final Class<?> valueLayoutClass = Class.forName("java.lang.foreign.ValueLayout");
+                    final Object javaInt = valueLayoutClass.getField("JAVA_INT").get(null);
+                    final Object javaLong = valueLayoutClass.getField("JAVA_LONG").get(null);
+                    final Object linker = linkerClass.getMethod("nativeLinker").invoke(null);
+                    final Object libc = linkerClass.getMethod("defaultLookup").invoke(linker);
+                    final java.lang.reflect.Method find = Class.forName("java.lang.foreign.SymbolLookup").getMethod("find", String.class);
+                    final java.lang.reflect.Method descriptorOf = descriptorClass.getMethod("of", layoutClass, layoutClass.arrayType());
+                    final java.lang.reflect.Method downcall = linkerClass.getMethod(
+                        "downcallHandle",
+                        segmentClass,
+                        descriptorClass,
+                        optionClass.arrayType()
+                    );
+                    final Object noOptions = Array.newInstance(optionClass, 0);
+
+                    final Object madviseArgs = Array.newInstance(layoutClass, 3);
+                    Array.set(madviseArgs, 0, javaLong);
+                    Array.set(madviseArgs, 1, javaLong);
+                    Array.set(madviseArgs, 2, javaInt);
+                    madvise = (MethodHandle) downcall.invoke(
+                        linker,
+                        ((Optional<?>) find.invoke(libc, "madvise")).orElseThrow(),
+                        descriptorOf.invoke(null, javaInt, madviseArgs),
+                        noOptions
+                    );
+                    final MethodHandle getPageSize = (MethodHandle) downcall.invoke(
+                        linker,
+                        ((Optional<?>) find.invoke(libc, "getpagesize")).orElseThrow(),
+                        descriptorOf.invoke(null, javaInt, Array.newInstance(layoutClass, 0)),
+                        noOptions
+                    );
+                    pageMask = -(long) (int) getPageSize.invokeExact();
+
+                    final MethodHandles.Lookup lookup = MethodHandles.publicLookup();
+                    slice = lookup.findVirtual(
+                        MemorySegmentAccessInput.class,
+                        "segmentSliceOrNull",
+                        MethodType.methodType(segmentClass, long.class, long.class)
+                    ).asType(MethodType.methodType(Object.class, MemorySegmentAccessInput.class, long.class, long.class));
+                    address = lookup.findVirtual(segmentClass, "address", MethodType.methodType(long.class))
+                        .asType(MethodType.methodType(long.class, Object.class));
+                    log.info("k-NN prefetch uses direct madvise(MADV_WILLNEED)");
+                } catch (Throwable t) {
+                    // e.g. no FFM, native access denied (--illegal-native-access=deny): keep Lucene's prefetch.
+                    log.warn("Direct madvise unavailable, falling back to IndexInput#prefetch: {}", t.toString());
+                    slice = address = madvise = null;
+                }
+            }
+            SLICE = slice;
+            ADDRESS = address;
+            MADVISE = madvise;
+            PAGE_MASK = pageMask;
+        }
     }
 }
