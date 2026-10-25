@@ -12,6 +12,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.util.Constants;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.KNNSettings;
 
 import java.io.IOException;
 import java.lang.invoke.MethodHandle;
@@ -200,9 +201,14 @@ public class PrefetchHelper {
      * silently dropped and the reads that follow go serial.
      */
     public static void prefetchRange(final IndexInput indexInput, final long offset, final long length) throws IOException {
-        if (tryMadvise(indexInput, offset, length) == false) {
+        if (directMadvise(indexInput, offset, length) == false) {
             indexInput.prefetch(offset, length);
         }
+    }
+
+    /** Issues madvise directly unless disabled by {@code knn.prefetch.direct_madvise.enabled}; false means use Lucene's prefetch. */
+    static boolean directMadvise(final IndexInput indexInput, final long offset, final long length) throws IOException {
+        return KNNSettings.isDirectMadviseEnabled() && tryMadvise(indexInput, offset, length);
     }
 
     /** Returns true if madvise was issued, false if the caller should fall back to {@link IndexInput#prefetch}. */

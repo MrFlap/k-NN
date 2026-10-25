@@ -129,6 +129,7 @@ public class KNNSettings {
     public static final String KNN_DYNAMIC_MAPPING_ENABLED = "knn.dynamic_mapping.enabled";
     public static final String KNN_MEMORY_OPTIMIZED_BEAM_WIDTH = "knn.memoryopt.beam_width";
     public static final String KNN_RESCORE_PREFETCH_ENABLED = "knn.rescore.prefetch.enabled";
+    public static final String KNN_PREFETCH_DIRECT_MADVISE_ENABLED = "knn.prefetch.direct_madvise.enabled";
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -536,6 +537,17 @@ public class KNNSettings {
         Dynamic
     );
 
+    /**
+     * Whether k-NN prefetches call madvise(MADV_WILLNEED) directly on mmap'd inputs. When false they go through
+     * IndexInput#prefetch, whose per-file back-off skips most calls on a partly cached file.
+     */
+    public static final Setting<Boolean> KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING = Setting.boolSetting(
+        KNN_PREFETCH_DIRECT_MADVISE_ENABLED,
+        true,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<Boolean> KNN_DYNAMIC_MAPPING_ENABLED_SETTING = Setting.boolSetting(
         KNN_DYNAMIC_MAPPING_ENABLED,
         false,
@@ -715,6 +727,10 @@ public class KNNSettings {
             return KNN_RESCORE_PREFETCH_ENABLED_SETTING;
         }
 
+        if (KNN_PREFETCH_DIRECT_MADVISE_ENABLED.equals(key)) {
+            return KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING;
+        }
+
         if (ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD.equals(key)) {
             return ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING;
         }
@@ -838,7 +854,8 @@ public class KNNSettings {
             KNN_DYNAMIC_MAPPING_ENABLED_SETTING,
             INDEX_KNN_REORDERING_ENABLED_SETTING,
             KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING,
-            KNN_RESCORE_PREFETCH_ENABLED_SETTING
+            KNN_RESCORE_PREFETCH_ENABLED_SETTING,
+            KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1149,6 +1166,10 @@ public class KNNSettings {
 
     public static boolean isRescorePrefetchEnabled() {
         return KNNSettings.state().getSettingValue(KNN_RESCORE_PREFETCH_ENABLED);
+    }
+
+    public static boolean isDirectMadviseEnabled() {
+        return KNNSettings.state().getSettingValue(KNN_PREFETCH_DIRECT_MADVISE_ENABLED);
     }
 
     public static boolean isReOrderingEnabled(@NonNull final IndexSettings indexSettings) {

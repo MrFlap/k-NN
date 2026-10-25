@@ -13,14 +13,14 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
-import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.knn.KNNTestCase;
 
 import java.util.Arrays;
 import java.util.Random;
 
 import static org.opensearch.knn.memoryoptsearch.FaissHNSWTests.loadHnswBinary;
 
-public class BeamHnswGraphSearcherTests extends OpenSearchTestCase {
+public class BeamHnswGraphSearcherTests extends KNNTestCase {
     private static final int NUM_VECTORS = 100;
     private static final int K = 10;
 

@@ -12,7 +12,9 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.Constants;
 import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 
 import java.io.IOException;
@@ -70,13 +72,13 @@ public class PrefetchHelperTests extends KNNTestCase {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
             TrackingIndexInput trackingInput = createTrackingInput(500 * 1024);
-            int[] ords = { 0, 100, 300 };
+            int[] ords = { 0, 10, 100 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 3);
             assertEquals(2, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(101 * vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(300 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(11 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(100 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
         }
     }
@@ -97,15 +99,14 @@ public class PrefetchHelperTests extends KNNTestCase {
     public void testPrefetch_whenUnorderedOrds_thenSortsAndGroups() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(500 * 1024);
-            int[] ords = { 300, 0, 100 };
+            int[] ords = { 100, 0, 10 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 3);
             assertEquals(2, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(101 * vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(300 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(11 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(100 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
         }
     }
@@ -125,48 +126,44 @@ public class PrefetchHelperTests extends KNNTestCase {
         }
     }
 
-    public void testPrefetch_whenVectorsExactly128KBApart_thenCreatesNewGroup() throws IOException {
+    public void testPrefetch_whenVectorsExactly32KBApart_thenCreatesNewGroup() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(300 * 1024);
-            int[] ords = { 0, 128 };
+            int[] ords = { 0, 32 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 2);
             assertEquals(2, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(128 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(32 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
         }
     }
 
-    public void testPrefetch_whenVectorsJustUnder128KBApart_thenSameGroup() throws IOException {
+    public void testPrefetch_whenVectorsJustUnder32KBApart_thenSameGroup() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(300 * 1024);
-            int[] ords = { 0, 127 };
+            int[] ords = { 0, 31 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 2);
             assertEquals(1, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(128 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(32 * vectorSize, trackingInput.prefetchCalls.get(0).length());
         }
     }
 
     public void testPrefetch_whenMultipleGroupsAndFileBoundary_thenRespectsFileLength() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
-            int fileSize = 350 * 1024;
-            TrackingIndexInput trackingInput = createTrackingInput(fileSize);
-            int[] ords = { 0, 100, 340 };
+            TrackingIndexInput trackingInput = createTrackingInput(350 * 1024);
+            int[] ords = { 0, 10, 340 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 3);
             assertEquals(2, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(101 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(11 * vectorSize, trackingInput.prefetchCalls.get(0).length());
             assertEquals(340 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
         }
@@ -175,47 +172,42 @@ public class PrefetchHelperTests extends KNNTestCase {
     public void testPrefetch_whenFinalVectorEndsExactlyAtFileLength_thenPrefetchesExactly() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
-            int fileSize = 100 * 1024;
-            TrackingIndexInput trackingInput = createTrackingInput(fileSize);
-            int[] ords = { 0, 99 };
+            TrackingIndexInput trackingInput = createTrackingInput(32 * 1024);
+            int[] ords = { 0, 31 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 2);
             assertEquals(1, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(100 * vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(fileSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(32 * vectorSize, trackingInput.prefetchCalls.get(0).length());
         }
     }
 
-    public void testPrefetch_whenGroupLengthExactly128KB_thenPrefetches128KB() throws IOException {
+    public void testPrefetch_whenGroupLengthExactly32KB_thenPrefetches32KB() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(300 * 1024);
-            int[] ords = { 0, 127 };
+            int[] ords = { 0, 31 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 2);
             assertEquals(1, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(128 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(32 * 1024L, trackingInput.prefetchCalls.get(0).length());
         }
     }
 
-    public void testPrefetch_whenMultipleVectorsAt128KBIntervals_thenMultipleGroups() throws IOException {
+    public void testPrefetch_whenMultipleVectorsAt32KBIntervals_thenMultipleGroups() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(600 * 1024);
-            int[] ords = { 0, 128, 256 };
+            int[] ords = { 0, 32, 64 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 3);
             assertEquals(3, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(128 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(32 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
-            assertEquals(256 * vectorSize, trackingInput.prefetchCalls.get(2).offset());
+            assertEquals(64 * vectorSize, trackingInput.prefetchCalls.get(2).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(2).length());
         }
     }
@@ -237,35 +229,33 @@ public class PrefetchHelperTests extends KNNTestCase {
     public void testPrefetch_whenThreeOrMoreGroups_thenCreatesAllGroups() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(800 * 1024);
-            int[] ords = { 0, 50, 200, 400, 600 };
+            int[] ords = { 0, 20, 50, 100, 150 };
             long vectorSize = 1024L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 5);
             assertEquals(4, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
-            assertEquals(51 * vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(200 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(21 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(50 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
-            assertEquals(400 * vectorSize, trackingInput.prefetchCalls.get(2).offset());
+            assertEquals(100 * vectorSize, trackingInput.prefetchCalls.get(2).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(2).length());
-            assertEquals(600 * vectorSize, trackingInput.prefetchCalls.get(3).offset());
+            assertEquals(150 * vectorSize, trackingInput.prefetchCalls.get(3).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(3).length());
         }
     }
 
-    public void testPrefetch_whenVectorEndExactly128KBPlusOneByte_thenCreatesNewGroup() throws IOException {
+    public void testPrefetch_whenVectorEnd32KBPlusBytes_thenCreatesNewGroup() throws IOException {
         try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
             mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
-
             TrackingIndexInput trackingInput = createTrackingInput(300 * 1024);
-            int[] ords = { 0, 127 };
+            int[] ords = { 0, 31 };
             long vectorSize = 1025L;
             PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, 2);
             assertEquals(2, trackingInput.prefetchCalls.size());
             assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(0).length());
-            assertEquals(127 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(31 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
             assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
         }
     }
@@ -288,6 +278,18 @@ public class PrefetchHelperTests extends KNNTestCase {
                 assertEquals(Constants.LINUX, PrefetchHelper.tryMadvise(slice, 0, PAGE));
             }
             assertFalse(PrefetchHelper.tryMadvise(in, 0, 0));
+        }
+    }
+
+    public void testPrefetchRange_whenDirectMadviseDisabled_thenUsesLucenePrefetch() throws IOException {
+        try (MMapDirectory dir = new MMapDirectory(createTempDir()); IndexInput in = openPattern(dir, 8 * PAGE)) {
+            assertEquals(Constants.LINUX, PrefetchHelper.directMadvise(in, 0, PAGE));
+            try (MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)) {
+                settings.when(KNNSettings::isDirectMadviseEnabled).thenReturn(false);
+                assertFalse(PrefetchHelper.directMadvise(in, 0, PAGE));
+                PrefetchHelper.prefetchRange(in, 0, 2 * PAGE); // falls back to IndexInput#prefetch
+                assertPattern(in, 8 * PAGE);
+            }
         }
     }
 
