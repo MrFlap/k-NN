@@ -72,9 +72,11 @@ public class FaissHnswGraph extends HnswGraph {
         final int[] cumNeighbors = faissHnsw.getCumNumberNeighborPerLevel();
         final long base = faissHnsw.getNeighbors().getBaseOffset() + (long) Integer.BYTES * cumNeighbors[level];
         final long listBytes = (long) Integer.BYTES * (cumNeighbors[level + 1] - cumNeighbors[level]);
+        final long[] starts = new long[numNodes];
         for (int i = 0; i < numNodes; i++) {
-            PrefetchHelper.prefetchRange(indexInput, base + Integer.BYTES * faissHnsw.getOffsetsReader().get(nodes[i]), listBytes);
+            starts[i] = base + Integer.BYTES * faissHnsw.getOffsetsReader().get(nodes[i]);
         }
+        PrefetchHelper.prefetchRanges(indexInput, starts, numNodes, listBytes, PrefetchHelper.Grouping.NONE);
     }
 
     private void loadNeighborIdList(final long begin, final long end) {

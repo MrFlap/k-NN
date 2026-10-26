@@ -130,6 +130,7 @@ public class KNNSettings {
     public static final String KNN_MEMORY_OPTIMIZED_BEAM_WIDTH = "knn.memoryopt.beam_width";
     public static final String KNN_RESCORE_PREFETCH_ENABLED = "knn.rescore.prefetch.enabled";
     public static final String KNN_PREFETCH_DIRECT_MADVISE_ENABLED = "knn.prefetch.direct_madvise.enabled";
+    public static final String KNN_PREFETCH_MERGE_GAP_BYTES = "knn.prefetch.merge_gap_bytes";
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -548,6 +549,18 @@ public class KNNSettings {
         Dynamic
     );
 
+    /**
+     * Prefetch merges byte ranges whose gap is at most this many bytes into one range of up to 256 KiB, trading spare
+     * bandwidth for fewer IOs. 0 keeps the fixed 32 KB grouping.
+     */
+    public static final Setting<Integer> KNN_PREFETCH_MERGE_GAP_BYTES_SETTING = Setting.intSetting(
+        KNN_PREFETCH_MERGE_GAP_BYTES,
+        0,
+        0,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<Boolean> KNN_DYNAMIC_MAPPING_ENABLED_SETTING = Setting.boolSetting(
         KNN_DYNAMIC_MAPPING_ENABLED,
         false,
@@ -731,6 +744,10 @@ public class KNNSettings {
             return KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING;
         }
 
+        if (KNN_PREFETCH_MERGE_GAP_BYTES.equals(key)) {
+            return KNN_PREFETCH_MERGE_GAP_BYTES_SETTING;
+        }
+
         if (ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD.equals(key)) {
             return ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING;
         }
@@ -855,7 +872,8 @@ public class KNNSettings {
             INDEX_KNN_REORDERING_ENABLED_SETTING,
             KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING,
             KNN_RESCORE_PREFETCH_ENABLED_SETTING,
-            KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING
+            KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING,
+            KNN_PREFETCH_MERGE_GAP_BYTES_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1170,6 +1188,10 @@ public class KNNSettings {
 
     public static boolean isDirectMadviseEnabled() {
         return KNNSettings.state().getSettingValue(KNN_PREFETCH_DIRECT_MADVISE_ENABLED);
+    }
+
+    public static int getPrefetchMergeGapBytes() {
+        return KNNSettings.state().getSettingValue(KNN_PREFETCH_MERGE_GAP_BYTES);
     }
 
     public static boolean isReOrderingEnabled(@NonNull final IndexSettings indexSettings) {

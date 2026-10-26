@@ -260,6 +260,90 @@ public class PrefetchHelperTests extends KNNTestCase {
         }
     }
 
+    public void testPrefetch_whenMergeGapSet_thenMergesSmallGapsUpTo256KB() throws IOException {
+        try (
+            MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);
+            MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+            settings.when(KNNSettings::getPrefetchMergeGapBytes).thenReturn(16 * 1024);
+            TrackingIndexInput trackingInput = createTrackingInput(2 * 1024 * 1024);
+            long vectorSize = 4096L;
+            // 0..40 sit 4 vectors (12KB gap) apart and span 164KB; 100 is 236KB past 40; 60 would push 0's group past 256KB.
+            int[] ords = { 40, 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 60, 100 };
+            PrefetchHelper.prefetch(trackingInput, 0L, vectorSize, ords, ords.length);
+            assertEquals(3, trackingInput.prefetchCalls.size());
+            assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
+            assertEquals(41 * vectorSize, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(60 * vectorSize, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(vectorSize, trackingInput.prefetchCalls.get(1).length());
+            assertEquals(100 * vectorSize, trackingInput.prefetchCalls.get(2).offset());
+            for (TrackingIndexInput.PrefetchCall call : trackingInput.prefetchCalls) {
+                assertTrue(call.length() <= PrefetchHelper.MAX_MERGED_BYTES);
+            }
+        }
+    }
+
+    public void testPrefetch_whenContiguousRunLongerThan256KB_thenCapsEachRange() throws IOException {
+        try (
+            MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);
+            MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+            settings.when(KNNSettings::getPrefetchMergeGapBytes).thenReturn(16 * 1024);
+            TrackingIndexInput trackingInput = createTrackingInput(2 * 1024 * 1024);
+            int[] ords = new int[100];
+            for (int i = 0; i < ords.length; i++) {
+                ords[i] = i;
+            }
+            PrefetchHelper.prefetch(trackingInput, 0L, 4096L, ords, ords.length);
+            assertEquals(2, trackingInput.prefetchCalls.size());
+            assertEquals(PrefetchHelper.MAX_MERGED_BYTES, trackingInput.prefetchCalls.get(0).length());
+            assertEquals(PrefetchHelper.MAX_MERGED_BYTES, trackingInput.prefetchCalls.get(1).offset());
+            assertEquals(36 * 4096L, trackingInput.prefetchCalls.get(1).length());
+        }
+    }
+
+    public void testPrefetchBasedOnOrdinals_whenMergeGapSet_thenMergesAcrossBlocks() throws IOException {
+        try (
+            MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);
+            MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+            TrackingIndexInput trackingInput = createTrackingInput(1024 * 1024);
+            // 1KB records: 31 and 33 are in different 32KB blocks, 1KB apart.
+            PrefetchHelper.prefetchBasedOnOrdinals(trackingInput, 0L, 1024L, new int[] { 33, 31 }, 2);
+            assertEquals(2, trackingInput.prefetchCalls.size());
+
+            trackingInput.prefetchCalls.clear();
+            settings.when(KNNSettings::getPrefetchMergeGapBytes).thenReturn(4096);
+            PrefetchHelper.prefetchBasedOnOrdinals(trackingInput, 0L, 1024L, new int[] { 33, 31 }, 2);
+            assertEquals(1, trackingInput.prefetchCalls.size());
+            assertEquals(31 * 1024L, trackingInput.prefetchCalls.get(0).offset());
+            assertEquals(3 * 1024L, trackingInput.prefetchCalls.get(0).length());
+        }
+    }
+
+    public void testPrefetchRanges_whenNoFixedGrouping_thenOneCallPerRangeUnlessGapAllows() throws IOException {
+        try (
+            MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);
+            MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+            TrackingIndexInput trackingInput = createTrackingInput(1024 * 1024);
+            PrefetchHelper.prefetchRanges(trackingInput, new long[] { 8192, 0, 128 }, 3, 128, PrefetchHelper.Grouping.NONE);
+            assertEquals(3, trackingInput.prefetchCalls.size());
+            assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
+
+            trackingInput.prefetchCalls.clear();
+            settings.when(KNNSettings::getPrefetchMergeGapBytes).thenReturn(8192);
+            PrefetchHelper.prefetchRanges(trackingInput, new long[] { 8192, 0, 128 }, 3, 128, PrefetchHelper.Grouping.NONE);
+            assertEquals(1, trackingInput.prefetchCalls.size());
+            assertEquals(0L, trackingInput.prefetchCalls.get(0).offset());
+            assertEquals(8192L + 128, trackingInput.prefetchCalls.get(0).length());
+        }
+    }
+
     private TrackingIndexInput createTrackingInput(int sizeInBytes) throws IOException {
         ByteBuffersDirectory dir = new ByteBuffersDirectory();
         try (IndexOutput out = dir.createOutput("test", IOContext.DEFAULT)) {

@@ -25,9 +25,10 @@ import java.util.Optional;
 /**
  * Helper class to prefetch vector data from disk to improve query performance.
  * <p>
- * Prefetches vector data using exact byte range strategy. Vectors are grouped together when
- * the end of a vector (start offset + vector size) falls within 128KB from the group's start offset.
- * This minimizes I/O operations while fetching only the exact bytes needed.
+ * A batch of byte ranges is sorted by offset and grouped, and each group is prefetched as one range. Ranges are grouped
+ * by a fixed 32KB rule (see {@link Grouping}), and also when the gap between them is at most
+ * {@code knn.prefetch.merge_gap_bytes} with the group staying within {@link #MAX_MERGED_BYTES}; reading the small gaps
+ * trades spare bandwidth for fewer IOs. A gap of 0 keeps the 32KB grouping alone.
  * <p>
  * Prefetching is controlled by {@link KNNFeatureFlags#isPrefetchEnabled()}. When disabled,
  * no prefetch operations are performed.
@@ -35,24 +36,34 @@ import java.util.Optional;
  * <b>Example:</b><br>
  * Given vectors at offsets [100KB, 120KB, 300KB] with 10KB vector size:
  * <ul>
- *   <li>Group 1: Prefetch 40KB (100KB to 130KB, covers vectors at 100KB and 120KB)</li>
+ *   <li>Group 1: Prefetch 30KB (100KB to 130KB, covers vectors at 100KB and 120KB)</li>
  *   <li>Group 2: Prefetch 10KB (300KB to 310KB, covers vector at 300KB)</li>
  * </ul>
- * Result: 2 prefetch operations, 50KB total prefetched (vs 6 random seeks without prefetch)
+ * Result: 2 prefetch operations, 40KB total prefetched (vs 3 random seeks without prefetch)
  */
 @Log4j2
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class PrefetchHelper {
 
-    // TODO: If needed we can get this value via Cluster Settings
     private static final long BYTES_32 = 32 * 1024;
+    /** gp3 counts an IO of up to 256 KiB as one operation, and the kernel reads ahead at most that much per call. */
+    static final long MAX_MERGED_BYTES = 256 * 1024;
+
+    /** The fixed grouping a batch gets regardless of {@code knn.prefetch.merge_gap_bytes}. */
+    public enum Grouping {
+        /** Group while the group spans at most 32KB from its first range. */
+        WINDOW_32KB,
+        /** Group ranges starting in the same absolute 32KB block. */
+        BLOCK_32KB,
+        /** No fixed grouping: only the merge gap groups ranges. */
+        NONE
+    }
 
     /**
      * Prefetches vector data from disk using exact byte range strategy.
      * <p>
-     * Vectors are sorted by offset and grouped when the end of a vector falls within 128KB
-     * from the group start. Each group is prefetched with exact byte range needed.
-     * Returns early if prefetch is disabled, ordinals are null, or fewer than 2 vectors.
+     * Vectors are sorted by offset and grouped while a group spans at most 32KB, or by the merge gap. Each group is
+     * prefetched as one range. Returns early if prefetch is disabled, ordinals are null, or fewer than 2 vectors.
      *
      * @param indexInput the index input to prefetch from
      * @param baseOffset the base offset in the file where vectors start
@@ -76,7 +87,8 @@ public class PrefetchHelper {
         // prefetch feature flag so the metric reflects reads whether or not prefetch I/O is issued.
         PageTouchTracker.get().recordBatch(baseOffset, oneVectorByteSize, ordsToPrefetch, numOrds);
         if (KNNFeatureFlags.isPrefetchEnabled()) {
-            prefetchExactVectorSize(indexInput, baseOffset, oneVectorByteSize, ordsToPrefetch, numOrds);
+            final long[] starts = offsets(baseOffset, oneVectorByteSize, ordsToPrefetch, numOrds);
+            prefetchGrouped(indexInput, starts, numOrds, oneVectorByteSize, Grouping.WINDOW_32KB);
         } else {
             log.debug("KNNVectors Prefetch is disabled");
         }
@@ -122,73 +134,66 @@ public class PrefetchHelper {
             log.debug("KNNVectors Prefetch is disabled");
             return;
         }
-
-        int groupCount = 1;
-        long groupStartOffset = baseOffset + (long) ordsToPrefetch[0] * oneVectorByteSize;
-        // Block boundaries are anchored at offset 0 (vector 0), so a group flushes whenever the next
-        // record starts in a different absolute 32KB block.
-        long groupBlock = groupStartOffset / BYTES_32;
-        for (int i = 1; i < numOrds; i++) {
-            long currentOffset = baseOffset + (long) ordsToPrefetch[i] * oneVectorByteSize;
-            long currentBlock = currentOffset / BYTES_32;
-            if (currentBlock != groupBlock) {
-                long prevEnd = baseOffset + (long) ordsToPrefetch[i - 1] * oneVectorByteSize + oneVectorByteSize;
-                prefetchRange(indexInput, groupStartOffset, prevEnd - groupStartOffset);
-                groupCount++;
-                groupStartOffset = currentOffset;
-                groupBlock = currentBlock;
-            }
-        }
-        // Prefetch final group
-        long lastEnd = baseOffset + (long) ordsToPrefetch[numOrds - 1] * oneVectorByteSize + oneVectorByteSize;
-        prefetchRange(indexInput, groupStartOffset, lastEnd - groupStartOffset);
-
-        log.trace("Prefetching [{}] block-aligned groups from [{}] ordinals, record size: {}", groupCount, numOrds, oneVectorByteSize);
+        final long[] starts = offsets(baseOffset, oneVectorByteSize, ordsToPrefetch, numOrds);
+        prefetchGrouped(indexInput, starts, numOrds, oneVectorByteSize, Grouping.BLOCK_32KB);
     }
 
     /**
-     * Prefetches vectors using exact byte ranges.
-     * <p>
-     * Groups vectors within 128KB ranges and prefetches only the exact bytes needed for each group.
-     *
-     * @param indexInput the index input to prefetch from
-     * @param baseOffset the base offset in the file where vectors start
-     * @param oneVectorByteSize the size of one vector in bytes
-     * @param ordsToPrefetch array of vector ordinals to prefetch
-     * @param numOrds number of valid ordinals in the array
-     * @throws IOException if an I/O error occurs during prefetch
+     * Prefetches {@code [starts[i], starts[i] + length)} for {@code i < numRanges}, grouped by {@code grouping} and the
+     * merge gap. Sorts {@code starts} in place. No-op if prefetch is disabled.
      */
-    private static void prefetchExactVectorSize(
+    public static void prefetchRanges(
         final IndexInput indexInput,
-        final long baseOffset,
-        final long oneVectorByteSize,
-        final int[] ordsToPrefetch,
-        final int numOrds
+        final long[] starts,
+        final int numRanges,
+        final long length,
+        final Grouping grouping
     ) throws IOException {
-        Arrays.sort(ordsToPrefetch, 0, numOrds);
-
-        int groupCount = 1;
-        long groupStartOffset = baseOffset + (long) ordsToPrefetch[0] * oneVectorByteSize;
-
-        for (int i = 1; i < numOrds; i++) {
-            long currentOffset = baseOffset + (long) ordsToPrefetch[i] * oneVectorByteSize;
-            if ((currentOffset + oneVectorByteSize) - groupStartOffset > BYTES_32) {
-                long prevOffset = baseOffset + (long) ordsToPrefetch[i - 1] * oneVectorByteSize;
-                prefetchRange(indexInput, groupStartOffset, (prevOffset + oneVectorByteSize) - groupStartOffset);
-                groupCount++;
-                groupStartOffset = currentOffset;
-            }
+        if (numRanges > 0 && KNNFeatureFlags.isPrefetchEnabled()) {
+            prefetchGrouped(indexInput, starts, numRanges, length, grouping);
         }
-        // Prefetch final group
-        long lastOffset = baseOffset + (long) ordsToPrefetch[numOrds - 1] * oneVectorByteSize;
-        prefetchRange(indexInput, groupStartOffset, (lastOffset + oneVectorByteSize) - groupStartOffset);
+    }
 
-        log.trace(
-            "Prefetching grouped [{}] vectors where num of ords was [{}] using exact prefetch size, vector size: {}",
-            groupCount,
-            numOrds,
-            oneVectorByteSize
-        );
+    private static long[] offsets(final long baseOffset, final long stride, final int[] ords, final int numOrds) {
+        final long[] starts = new long[numOrds];
+        for (int i = 0; i < numOrds; i++) {
+            starts[i] = baseOffset + (long) ords[i] * stride;
+        }
+        return starts;
+    }
+
+    /** Sorts the ranges, groups them, and issues one {@link #prefetchRange} per group. */
+    private static void prefetchGrouped(
+        final IndexInput indexInput,
+        final long[] starts,
+        final int numRanges,
+        final long length,
+        final Grouping grouping
+    ) throws IOException {
+        Arrays.sort(starts, 0, numRanges);
+        final long mergeGap = KNNSettings.getPrefetchMergeGapBytes();
+        int groupCount = 1;
+        long groupStart = starts[0];
+        long groupEnd = groupStart + length;
+        for (int i = 1; i < numRanges; i++) {
+            final long start = starts[i];
+            final long end = start + length;
+            final boolean fixed = switch (grouping) {
+                case WINDOW_32KB -> end - groupStart <= BYTES_32;
+                case BLOCK_32KB -> start / BYTES_32 == groupStart / BYTES_32;
+                case NONE -> false;
+            };
+            if (fixed || (mergeGap > 0 && start - groupEnd <= mergeGap && end - groupStart <= MAX_MERGED_BYTES)) {
+                groupEnd = Math.max(groupEnd, end);
+                continue;
+            }
+            prefetchRange(indexInput, groupStart, groupEnd - groupStart);
+            groupCount++;
+            groupStart = start;
+            groupEnd = end;
+        }
+        prefetchRange(indexInput, groupStart, groupEnd - groupStart);
+        log.trace("Prefetching [{}] groups from [{}] ranges of [{}] bytes, grouping [{}]", groupCount, numRanges, length, grouping);
     }
 
     /**
