@@ -19,6 +19,7 @@ import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.IOFunction;
 import org.apache.lucene.util.IORunnable;
 import org.apache.lucene.util.IOUtils;
@@ -28,10 +29,16 @@ import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWr
 import org.opensearch.knn.index.codec.nativeindex.AbstractNativeEnginesKnnVectorsWriter;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.codec.nativeindex.model.Layer0LocalityOrdering;
+import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissHnswGraph;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissIdMapIndex;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissIndex;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+
+import static org.opensearch.knn.index.codec.util.KNNCodecUtil.buildEngineFileName;
 
 /**
  * Writer for locality-reordered Faiss SQ 1-bit HNSW fields (single field per format instance).
@@ -170,7 +177,7 @@ class Faiss1040SQHNSWReorderedWriter extends AbstractNativeEnginesKnnVectorsWrit
                 layer0LocalityOrdering
             );
             // Post-graph: write the physically-reordered locality store.
-            writeReorderedLocalityStore(fieldInfo, quantizedValues, ensurePopulated(layer0LocalityOrdering, quantizedValues.size()));
+            writeReorderedLocalityStore(fieldInfo, quantizedValues, layer0LocalityOrdering);
         } finally {
             IOUtils.close(sqFlatVectorReader);
         }
@@ -218,7 +225,7 @@ class Faiss1040SQHNSWReorderedWriter extends AbstractNativeEnginesKnnVectorsWrit
                 layer0LocalityOrdering
             );
             // Post-graph: write the physically-reordered locality store.
-            writeReorderedLocalityStore(fieldInfo, quantizedValues, ensurePopulated(layer0LocalityOrdering, quantizedValues.size()));
+            writeReorderedLocalityStore(fieldInfo, quantizedValues, layer0LocalityOrdering);
         } finally {
             IOUtils.close(flatVectorsReader);
         }
@@ -261,7 +268,28 @@ class Faiss1040SQHNSWReorderedWriter extends AbstractNativeEnginesKnnVectorsWrit
         final QuantizedByteVectorValues quantizedValues,
         final Layer0LocalityOrdering layer0LocalityOrdering
     ) throws IOException {
-        localityVectorsWriter.writeReorderedLocalityStore(fieldInfo, quantizedValues, layer0LocalityOrdering);
+        if (layer0LocalityOrdering.isPopulated() == false) {
+            // No native build, so no graph: records without neighbor lists.
+            localityVectorsWriter.writeReorderedLocalityStore(
+                fieldInfo,
+                quantizedValues,
+                ensurePopulated(layer0LocalityOrdering, quantizedValues.size()),
+                null
+            );
+            return;
+        }
+        // Copy each node's layer-0 neighbor list from the .faiss file just written into its record.
+        final String faissFileName = buildEngineFileName(
+            segmentWriteState.segmentInfo.name,
+            KNNEngine.FAISS.getVersion(),
+            fieldInfo.name,
+            KNNEngine.FAISS.getExtension()
+        );
+        try (IndexInput faissInput = segmentWriteState.directory.openInput(faissFileName, segmentWriteState.context)) {
+            final FaissIndex faissIndex = FaissIndex.load(faissInput);
+            final FaissHnswGraph graph = new FaissHnswGraph(((FaissIdMapIndex) faissIndex).getFaissHnsw(), faissInput);
+            localityVectorsWriter.writeReorderedLocalityStore(fieldInfo, quantizedValues, layer0LocalityOrdering, graph);
+        }
     }
 
     @Override

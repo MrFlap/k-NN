@@ -9,6 +9,7 @@ import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.HnswGraph;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.codec.locality.InlineNeighborLists;
 import org.opensearch.knn.index.codec.scorer.PrefetchHelper;
 
 import java.io.IOException;
@@ -25,17 +26,28 @@ import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
  * NOTE: This is not thread safe. It should be created every time in {@link KnnVectorsReader}.search likewise
  * <a href="https://github.com/apache/lucene/blob/92290a0201458152c9e03d199f38f2e8a479f045/lucene/core/src/java/org/apache/lucene/codecs/lucene99/Lucene99HnswVectorsReader.java#L467">OffHeapHnswGraph</a>
  * in Lucene.
+ * <p>
+ * Given {@link InlineNeighborLists}, layer-0 neighbors come from the locality-ordered records instead of the FAISS file.
  */
 public class FaissHnswGraph extends HnswGraph {
     private final FaissHNSW faissHnsw;
     private final IndexInput indexInput;
     private final int numVectors;
+    private final InlineNeighborLists inlineNeighbors;
     private int[] neighborIdList;
     private int numNeighbors;
     private int nextNeighborIndex;
 
     public FaissHnswGraph(final FaissHNSW faissHNSW, final IndexInput indexInput) {
+        this(faissHNSW, indexInput, null);
+    }
+
+    /**
+     * @param inlineNeighbors source of layer-0 neighbor lists, or null to read them from {@code indexInput}
+     */
+    public FaissHnswGraph(final FaissHNSW faissHNSW, final IndexInput indexInput, final InlineNeighborLists inlineNeighbors) {
         this.faissHnsw = faissHNSW;
+        this.inlineNeighbors = inlineNeighbors;
         // Offset readers MUST non null.
         Objects.requireNonNull(faissHNSW.getOffsetsReader());
         this.indexInput = indexInput;
@@ -49,6 +61,18 @@ public class FaissHnswGraph extends HnswGraph {
      */
     @Override
     public void seek(int level, int internalVectorId) {
+        if (level == 0 && inlineNeighbors != null) {
+            if (neighborIdList == null || neighborIdList.length < inlineNeighbors.maxNeighbors()) {
+                neighborIdList = new int[inlineNeighbors.maxNeighbors()];
+            }
+            try {
+                numNeighbors = inlineNeighbors.read(internalVectorId, neighborIdList);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            nextNeighborIndex = 0;
+            return;
+        }
         // Get a relative starting offset of neighbor list at `level`.
         final long o = faissHnsw.getOffsetsReader().get(internalVectorId);
 
@@ -67,6 +91,10 @@ public class FaissHnswGraph extends HnswGraph {
      */
     public void prefetchNeighborLists(final int level, final int[] nodes, final int numNodes) throws IOException {
         if (KNNFeatureFlags.isPrefetchEnabled() == false) {
+            return;
+        }
+        if (level == 0 && inlineNeighbors != null) {
+            inlineNeighbors.prefetch(nodes, numNodes);
             return;
         }
         final int[] cumNeighbors = faissHnsw.getCumNumberNeighborPerLevel();

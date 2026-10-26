@@ -24,6 +24,8 @@ import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
@@ -49,6 +51,8 @@ import java.util.stream.Stream;
 import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.CODEC_NAME;
 import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.EXTENSION;
 import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.METADATA_EXTENSION;
+import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.PAGE_BYTES;
+import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.VERSION_INLINE_NEIGHBORS;
 import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.VERSION_CURRENT;
 import static org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter.VERSION_START;
 
@@ -110,14 +114,21 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         try {
             // Metadata (.vemlo): per-field scalars + centroid + ordToPhysicalOrdMap.
             meta = state.directory.openInput(metaFileName, state.context.withHints(RANDOM_ACCESS_HINT));
-            CodecUtil.checkIndexHeader(meta, CODEC_NAME, VERSION_START, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            final int version = CodecUtil.checkIndexHeader(
+                meta,
+                CODEC_NAME,
+                VERSION_START,
+                VERSION_CURRENT,
+                state.segmentInfo.getId(),
+                state.segmentSuffix
+            );
 
             // Data (.veqlo): the permuted quantized records.
             data = state.directory.openInput(dataFileName, state.context.withHints(RANDOM_ACCESS_HINT));
             CodecUtil.checkIndexHeader(data, CODEC_NAME, VERSION_START, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
 
             // we will have only 1 field for now
-            final FieldEntry entry = readFieldEntry(meta, data, state.fieldInfos, state.segmentSuffix);
+            final FieldEntry entry = readFieldEntry(meta, data, state.fieldInfos, state.segmentSuffix, version);
 
             // Validate the footer checksums (each seek to end; done after we've captured the record slice).
             CodecUtil.retrieveChecksum(meta);
@@ -156,7 +167,8 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         final IndexInput meta,
         final IndexInput data,
         final FieldInfos fieldInfos,
-        final String segmentSuffix
+        final String segmentSuffix,
+        final int version
     ) throws IOException {
         final int fieldNumber = meta.readInt();
         final int dimension = meta.readVInt();
@@ -166,6 +178,14 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         final QuantizedByteVectorValues.ScalarEncoding scalarEncoding = QuantizedByteVectorValues.ScalarEncoding.fromWireNumber(
             meta.readVInt()
         ).get();
+        final int neighborSlots = version >= VERSION_INLINE_NEIGHBORS ? meta.readVInt() : 0;
+        final LocalityOrderedQuantizedVectorsWriter.RecordLayout layout = LocalityOrderedQuantizedVectorsWriter.RecordLayout.of(
+            codeLength,
+            neighborSlots
+        );
+        if (layout.recordSize() != recordSize) {
+            throw new CorruptIndexException("recordSize " + recordSize + " != " + layout.recordSize(), meta);
+        }
 
         final float[] centroid = new float[dimension];
         meta.readFloats(centroid, 0, dimension);
@@ -235,16 +255,18 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             scalarEncoding
         );
 
-        // Records live in the data file, right after its index header.
-        final long dataOffset = CodecUtil.indexHeaderLength(CODEC_NAME, segmentSuffix);
-        final IndexInput dataSlice = data.slice("veqo-records" + fieldName, dataOffset, (long) count * recordSize);
+        // Records live in the data file, right after its index header, or the next page with inline neighbors.
+        final long headerLength = CodecUtil.indexHeaderLength(CODEC_NAME, segmentSuffix);
+        final long dataOffset = neighborSlots > 0 ? IndexOutput.alignOffset(headerLength, PAGE_BYTES) : headerLength;
+        final IndexInput dataSlice = data.slice("veqo-records" + fieldName, dataOffset, layout.length(count));
 
         return new FieldEntry(
             fieldNumber,
             dimension,
             count,
             codeLength,
-            recordSize,
+            layout,
+            neighborSlots,
             centroidDp,
             scalarEncoding,
             centroid,
@@ -344,6 +366,26 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
     }
 
     /**
+     * @return a reader of the layer-0 neighbor lists stored in the field's records, in original ordinals, or null if
+     * the segment has none (written before {@link LocalityOrderedQuantizedVectorsWriter#VERSION_INLINE_NEIGHBORS}, or
+     * without a graph). Not thread safe; {@link InlineNeighborLists#clone() clone} it per search.
+     */
+    public InlineNeighborLists getInlineNeighborLists(final String field) {
+        final FieldEntry entry = fields.get(field);
+        if (entry == null || entry.neighborSlots == 0) {
+            return null;
+        }
+        return new InlineNeighborLists(
+            entry.dataSlice.clone(),
+            entry.layout,
+            entry.codeLength,
+            entry.neighborSlots,
+            entry.ordToPhysicalOrdMap,
+            entry.physicalToOrdMap()
+        );
+    }
+
+    /**
      * Picks the single hub closest to {@code target} to seed the HNSW search.
      *
      * <p>Scores the query against each stored hub's quantized record (from the metadata hub section)
@@ -409,7 +451,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             entry.dimension,
             entry.count,
             entry.codeLength,
-            entry.recordSize,
+            entry.layout,
             entry.centroid,
             entry.centroidDp,
             quantizer,
@@ -511,8 +553,12 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         final int count;
         /** Packed 1-bit code length per record, {@code ceil(dimension / 8)} bytes. */
         final int codeLength;
-        /** Total bytes per record, {@code codeLength + 16} (code + 4 correction fields). */
-        final int recordSize;
+        /** Record size and placement in {@link #dataSlice}. */
+        final LocalityOrderedQuantizedVectorsWriter.RecordLayout layout;
+        /** Inline layer-0 neighbor list length per record; 0 when the records hold none. */
+        final int neighborSlots;
+        /** Inverse of {@link #ordToPhysicalOrdMap}, built on first use by the inline neighbor reader. */
+        private int[] physicalToOrdMap;
         /** Dot product of the centroid with itself, used in ADC scoring. */
         final float centroidDp;
         /** {@code VectorSimilarityFunction.ordinal()} the vectors were quantized against. */
@@ -535,7 +581,8 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             final int dimension,
             final int count,
             final int codeLength,
-            final int recordSize,
+            final LocalityOrderedQuantizedVectorsWriter.RecordLayout layout,
+            final int neighborSlots,
             final float centroidDp,
             final QuantizedByteVectorValues.ScalarEncoding scalarEncoding,
             final float[] centroid,
@@ -548,7 +595,8 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             this.dimension = dimension;
             this.count = count;
             this.codeLength = codeLength;
-            this.recordSize = recordSize;
+            this.layout = layout;
+            this.neighborSlots = neighborSlots;
             this.centroidDp = centroidDp;
             this.scalarEncoding = scalarEncoding;
             this.centroid = centroid;
@@ -556,6 +604,17 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             this.ordToPhysicalOrdMap = ordToPhysicalOrdMap;
             this.hubOrdinals = hubOrdinals;
             this.hubValues = hubValues;
+        }
+
+        synchronized int[] physicalToOrdMap() {
+            if (physicalToOrdMap == null) {
+                final int[] inverse = new int[count];
+                for (int ord = 0; ord < count; ord++) {
+                    inverse[ordToPhysicalOrdMap[ord]] = ord;
+                }
+                physicalToOrdMap = inverse;
+            }
+            return physicalToOrdMap;
         }
     }
 }

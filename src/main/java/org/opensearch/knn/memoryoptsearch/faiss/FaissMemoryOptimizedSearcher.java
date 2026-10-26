@@ -29,6 +29,7 @@ import org.opensearch.knn.common.RobustUniqueRandomIterator;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.codec.locality.InlineNeighborLists;
 import org.opensearch.knn.index.codec.scorer.PageTouchTracker;
 import org.opensearch.knn.index.util.WarmupUtil;
 import org.opensearch.knn.memoryoptsearch.VectorSearcher;
@@ -50,6 +51,7 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
     private final FlatVectorsScorer flatVectorsScorer;
     private final FaissHNSW hnsw;
     private final VectorSimilarityFunction vectorSimilarityFunction;
+    private final InlineNeighborLists inlineNeighbors;
     private boolean isAdc;
 
     /**
@@ -62,7 +64,22 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         final FieldInfo fieldInfo,
         final FlatVectorsScorer flatVectorsScorer
     ) {
+        this(indexInput, faissIndex, fieldInfo, flatVectorsScorer, null);
+    }
+
+    /**
+     * @param inlineNeighbors layer-0 neighbor lists stored with the vectors, used instead of the FAISS file's while
+     *                        {@code knn.locality.inline_neighbors.enabled} is true; null if there are none
+     */
+    public FaissMemoryOptimizedSearcher(
+        final IndexInput indexInput,
+        final FaissIndex faissIndex,
+        final FieldInfo fieldInfo,
+        final FlatVectorsScorer flatVectorsScorer,
+        final InlineNeighborLists inlineNeighbors
+    ) {
         this.indexInput = indexInput;
+        this.inlineNeighbors = inlineNeighbors;
         this.faissIndex = faissIndex;
         // Faiss's on-disk format only stores METRIC_INNER_PRODUCT or METRIC_L2; there is no
         // cosine metric. Cosinesimil indices are written as IP on L2-normalized vectors, so
@@ -224,7 +241,11 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         pageTouchTracker.begin();
         try {
             if (knnCollector.k() < scorer.maxOrd()) {
-                final FaissHnswGraph graph = new FaissHnswGraph(hnsw, indexInput.clone());
+                final FaissHnswGraph graph = new FaissHnswGraph(
+                    hnsw,
+                    indexInput.clone(),
+                    inlineNeighbors != null && KNNSettings.isInlineNeighborsEnabled() ? inlineNeighbors.clone() : null
+                );
                 final int beamWidth = KNNSettings.getMemoryOptimizedBeamWidth();
                 final int[] seeds = beamSearchSeeds(beamWidth, collector, acceptedOrds);
                 if (seeds != null) {

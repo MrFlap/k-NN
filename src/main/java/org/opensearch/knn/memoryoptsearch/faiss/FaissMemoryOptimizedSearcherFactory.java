@@ -13,6 +13,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.IOUtils;
+import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsReader;
 import org.opensearch.knn.memoryoptsearch.VectorSearcher;
 import org.opensearch.knn.memoryoptsearch.VectorSearcherFactory;
 
@@ -45,7 +46,15 @@ public class FaissMemoryOptimizedSearcherFactory implements VectorSearcherFactor
                 faissIndex.getVectorSimilarityFunction(),
                 flatVectorsReader.getFlatVectorScorer(fieldInfo.name)
             );
-            return new FaissMemoryOptimizedSearcher(indexInput, faissIndex, fieldInfo, vectorScorer);
+            return new FaissMemoryOptimizedSearcher(
+                indexInput,
+                faissIndex,
+                fieldInfo,
+                vectorScorer,
+                flatVectorsReader instanceof LocalityOrderedQuantizedVectorsReader locality
+                    ? locality.getInlineNeighborLists(fieldInfo.name)
+                    : null
+            );
         } catch (UnsupportedFaissIndexException e) {
             // Clean up input stream.
             try {

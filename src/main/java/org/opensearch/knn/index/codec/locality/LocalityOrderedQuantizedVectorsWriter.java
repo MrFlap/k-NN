@@ -12,6 +12,7 @@ import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.hnsw.HnswGraph;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.packed.DirectWriter;
 import org.apache.lucene.util.quantization.OptimizedScalarQuantizer;
@@ -22,6 +23,8 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+
+import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 
 /**
  * Writes 1-bit scalar-quantized vectors to a locality-ordered store split across two files: a
@@ -52,8 +55,9 @@ import java.nio.ByteOrder;
  *    dimension             (vInt)
  *    count                 (vInt)
  *    codeLength            (vInt)  packed 1-bit code bytes per record
- *    recordSize            (vInt)  codeLength + CORRECTION_BYTES (= codeLength + 16)
+ *    recordSize            (vInt)  codeLength + CORRECTION_BYTES (= codeLength + 16) + 4 * neighborSlots
  *    encodingWireNumber    (vInt)  ScalarEncoding.getWireNumber() (similarity is derived from FieldInfo)
+ *    neighborSlots         (vInt)  version &gt;= 1 only: inline layer-0 neighbor list length (2M), 0 = none
  *    centroid              (dimension x f32, LE int bits)
  *    centroidDp            (int, f32 bits)  dot(centroid, centroid)
  *    requiredBits          (vInt)  bits/value of the DirectWriter block that follows
@@ -73,8 +77,12 @@ import java.nio.ByteOrder;
  *             [ upperInterval (4B f32 LE) ]
  *             [ additionalCorrection (4B f32 LE) ]
  *             [ quantizedComponentSum (4B i32 LE) ]
+ *             [ neighbors (neighborSlots x i32 LE) ]   physical positions of the layer-0 neighbors, -1 padded
  * [CodecUtil footer + CRC32]
  * </pre>
+ * With {@code neighborSlots > 0} (version 1) the records start at the first 4096-byte boundary after the header and
+ * are grouped {@code 4096 / recordSize} per 4 KB page, each page zero-padded, so no record straddles a page (see
+ * {@link RecordLayout}). Version 0 files, and version 1 files without neighbors, pack records back to back.
  *
  * <p><b>The {@code ordToPhysicalOrdMap} block.</b> It is packed with {@link DirectWriter} (fixed
  * {@code requiredBits} bits/value — near-optimal for a permutation, which is not monotonic so
@@ -98,10 +106,38 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
     public static final String EXTENSION = "veqlo";
     public static final String METADATA_EXTENSION = "vemlo";
     public static final int VERSION_START = 0;
-    public static final int VERSION_CURRENT = VERSION_START;
+    /** Adds {@code neighborSlots} to the metadata and, when non-zero, inline neighbor lists in page-aligned records. */
+    public static final int VERSION_INLINE_NEIGHBORS = 1;
+    public static final int VERSION_CURRENT = VERSION_INLINE_NEIGHBORS;
+    static final int PAGE_BYTES = 4096;
 
     /** 3 correction floats + 1 correction int, all 4 bytes. */
     static final int CORRECTION_BYTES = Integer.BYTES * 4;
+
+    /**
+     * Where the record at physical position {@code p} starts in the record slice. Without neighbor lists records are
+     * packed back to back ({@code recordsPerPage = 1}, {@code pageBytes = recordSize}); with them,
+     * {@code recordsPerPage} records share each zero-padded {@code pageBytes} block, so none crosses a 4 KB page.
+     */
+    record RecordLayout(int recordSize, int recordsPerPage, int pageBytes) {
+        static RecordLayout of(final int codeLength, final int neighborSlots) {
+            final int recordSize = codeLength + CORRECTION_BYTES + Integer.BYTES * neighborSlots;
+            if (neighborSlots == 0) {
+                return new RecordLayout(recordSize, 1, recordSize);
+            }
+            final int recordsPerPage = Math.max(1, PAGE_BYTES / recordSize);
+            final long pageBytes = IndexOutput.alignOffset((long) recordsPerPage * recordSize, PAGE_BYTES);
+            return new RecordLayout(recordSize, recordsPerPage, Math.toIntExact(pageBytes));
+        }
+
+        long offset(final int physicalOrd) {
+            return (long) (physicalOrd / recordsPerPage) * pageBytes + (long) (physicalOrd % recordsPerPage) * recordSize;
+        }
+
+        long length(final int count) {
+            return (long) ((count + recordsPerPage - 1) / recordsPerPage) * pageBytes;
+        }
+    }
 
     private final IndexOutput vectordata;
     private final IndexOutput metadata;
@@ -187,11 +223,14 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
      * @param layer0LocalityOrdering     holds the forward permutation {@code [originalOrdinal] =
      *                                   physicalPosition} produced by the native build; must be a DENSE
      *                                   permutation (BFS or dense greedy)
+     * @param layer0Graph                the built graph, in original ordinals, whose layer-0 neighbor lists are
+     *                                   stored in each record; null to store none
      */
     public void writeReorderedLocalityStore(
         @NonNull final FieldInfo fieldInfo,
         @NonNull final QuantizedByteVectorValues quantizedByteVectorValues,
-        @NonNull final Layer0LocalityOrdering layer0LocalityOrdering
+        @NonNull final Layer0LocalityOrdering layer0LocalityOrdering,
+        final HnswGraph layer0Graph
     ) throws IOException {
 
         final int[] physicalOrdinalsArray = new int[layer0LocalityOrdering.getPhysicalOrdinals().length];
@@ -205,13 +244,23 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
             physicalOrdinalsArray[ordinalToPhysicalOrdinal[i]] = i;
         }
 
-        writeMetadata(fieldInfo, quantizedByteVectorValues.getCentroid(), physicalOrdinalsArray);
+        // Faiss's maxConn() is M; layer 0 holds up to 2M neighbors.
+        final int neighborSlots = layer0Graph == null ? 0 : layer0Graph.maxConn() * 2;
+        final RecordLayout layout = RecordLayout.of(scalarEncoding.getDocPackedLength(fieldInfo.getVectorDimension()), neighborSlots);
+        writeMetadata(fieldInfo, quantizedByteVectorValues.getCentroid(), physicalOrdinalsArray, layout, neighborSlots);
 
         // Hub entry-point candidates go at the very end of the metadata file (after the
         // ordToPhysicalOrdMap DirectWriter block); see writeHubs.
         writeHubs(layer0LocalityOrdering.getHubs(), quantizedByteVectorValues.copy());
 
-        writeVectorDataUsingQuantizedVectorValues(physicalOrdinalsArray, quantizedByteVectorValues.copy());
+        writeVectorDataUsingQuantizedVectorValues(
+            physicalOrdinalsArray,
+            quantizedByteVectorValues.copy(),
+            layout,
+            neighborSlots,
+            layer0Graph,
+            ordinalToPhysicalOrdinal
+        );
     }
 
     /**
@@ -265,7 +314,13 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
      * Writes one field's metadata to the {@code .vemlo} file: the scalar header, the centroid, and
      * the {@code originalOrdinal -> physicalPosition} map.
      */
-    private void writeMetadata(final FieldInfo fieldInfo, final float[] centroid, final int[] physicalOrdinals) throws IOException {
+    private void writeMetadata(
+        final FieldInfo fieldInfo,
+        final float[] centroid,
+        final int[] physicalOrdinals,
+        final RecordLayout layout,
+        final int neighborSlots
+    ) throws IOException {
         final int count = physicalOrdinals.length;
         final int dimension = fieldInfo.getVectorDimension();
         final float centroidDp = count > 0 ? VectorUtil.dotProduct(centroid, centroid) : 0;
@@ -274,8 +329,8 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
         final int encodingWireNumber = scalarEncoding.getWireNumber();
         // Number of bytes of the packed quantized vector.
         final int codeLength = scalarEncoding.getDocPackedLength(dimension);
-        // Number of bytes per record, including the correction factors.
-        final int recordSize = codeLength + CORRECTION_BYTES;
+        // Number of bytes per record, including the correction factors and the neighbor list.
+        final int recordSize = layout.recordSize();
 
         // field.number stays a fixed writeInt (mirrors Lucene, which uses -1 as an end-of-fields
         // marker). The rest are small non-negative ints -> VInt to save space (like Lucene's meta).
@@ -285,6 +340,7 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
         metadata.writeVInt(codeLength);
         metadata.writeVInt(recordSize);
         metadata.writeVInt(encodingWireNumber);
+        metadata.writeVInt(neighborSlots);
 
         final ByteBuffer buffer = ByteBuffer.allocate(dimension * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
         buffer.asFloatBuffer().put(centroid);
@@ -314,9 +370,18 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
 
     private void writeVectorDataUsingQuantizedVectorValues(
         final int[] physicalOrdinals,
-        final QuantizedByteVectorValues quantizedByteVectorValues
+        final QuantizedByteVectorValues quantizedByteVectorValues,
+        final RecordLayout layout,
+        final int neighborSlots,
+        final HnswGraph layer0Graph,
+        final int[] ordinalToPhysicalOrdinal
     ) throws IOException {
         final int count = physicalOrdinals.length;
+        if (neighborSlots > 0) {
+            // The reader starts the records at the same boundary (see RecordLayout).
+            vectordata.alignFilePointer(PAGE_BYTES);
+        }
+        final byte[] zeros = new byte[layout.pageBytes()];
         for (int p = 0; p < count; p++) {
             // get quantized vector using the original ordinal.
             byte[] vectorToBeWritten = quantizedByteVectorValues.vectorValue(physicalOrdinals[p]);
@@ -328,6 +393,31 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
             vectordata.writeInt(Float.floatToIntBits(quantizationResult.upperInterval()));
             vectordata.writeInt(Float.floatToIntBits(quantizationResult.additionalCorrection()));
             vectordata.writeInt(quantizationResult.quantizedComponentSum());
+            if (neighborSlots > 0) {
+                writeNeighbors(layer0Graph, physicalOrdinals[p], neighborSlots, ordinalToPhysicalOrdinal);
+            }
+            final int inPage = p % layout.recordsPerPage() + 1;
+            if (inPage == layout.recordsPerPage() || p == count - 1) {
+                // Pad the page, including a partial last page, so the slice length is whole pages.
+                vectordata.writeBytes(zeros, layout.pageBytes() - inPage * layout.recordSize());
+            }
+        }
+    }
+
+    /** Writes the layer-0 neighbors of {@code ord} as physical positions, -1 padded to {@code neighborSlots}. */
+    private void writeNeighbors(final HnswGraph graph, final int ord, final int neighborSlots, final int[] ordinalToPhysicalOrdinal)
+        throws IOException {
+        graph.seek(0, ord);
+        int written = 0;
+        for (int neighbor = graph.nextNeighbor(); neighbor != NO_MORE_DOCS; neighbor = graph.nextNeighbor()) {
+            if (written == neighborSlots) {
+                throw new IllegalStateException("Node " + ord + " has more than " + neighborSlots + " layer-0 neighbors");
+            }
+            vectordata.writeInt(ordinalToPhysicalOrdinal[neighbor]);
+            written++;
+        }
+        for (; written < neighborSlots; written++) {
+            vectordata.writeInt(-1);
         }
     }
 

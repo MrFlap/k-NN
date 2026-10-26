@@ -131,6 +131,7 @@ public class KNNSettings {
     public static final String KNN_RESCORE_PREFETCH_ENABLED = "knn.rescore.prefetch.enabled";
     public static final String KNN_PREFETCH_DIRECT_MADVISE_ENABLED = "knn.prefetch.direct_madvise.enabled";
     public static final String KNN_PREFETCH_MERGE_GAP_BYTES = "knn.prefetch.merge_gap_bytes";
+    public static final String KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED = "knn.locality.inline_neighbors.enabled";
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -561,6 +562,17 @@ public class KNNSettings {
         Dynamic
     );
 
+    /**
+     * Whether memory optimized search reads layer-0 neighbor lists from the locality-ordered records, where a segment
+     * stores them, instead of the FAISS file. Both stay on disk, so this can be flipped on the same index.
+     */
+    public static final Setting<Boolean> KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING = Setting.boolSetting(
+        KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED,
+        true,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<Boolean> KNN_DYNAMIC_MAPPING_ENABLED_SETTING = Setting.boolSetting(
         KNN_DYNAMIC_MAPPING_ENABLED,
         false,
@@ -748,6 +760,10 @@ public class KNNSettings {
             return KNN_PREFETCH_MERGE_GAP_BYTES_SETTING;
         }
 
+        if (KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED.equals(key)) {
+            return KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING;
+        }
+
         if (ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD.equals(key)) {
             return ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING;
         }
@@ -873,7 +889,8 @@ public class KNNSettings {
             KNN_MEMORY_OPTIMIZED_BEAM_WIDTH_SETTING,
             KNN_RESCORE_PREFETCH_ENABLED_SETTING,
             KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING,
-            KNN_PREFETCH_MERGE_GAP_BYTES_SETTING
+            KNN_PREFETCH_MERGE_GAP_BYTES_SETTING,
+            KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1192,6 +1209,10 @@ public class KNNSettings {
 
     public static int getPrefetchMergeGapBytes() {
         return KNNSettings.state().getSettingValue(KNN_PREFETCH_MERGE_GAP_BYTES);
+    }
+
+    public static boolean isInlineNeighborsEnabled() {
+        return KNNSettings.state().getSettingValue(KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED);
     }
 
     public static boolean isReOrderingEnabled(@NonNull final IndexSettings indexSettings) {

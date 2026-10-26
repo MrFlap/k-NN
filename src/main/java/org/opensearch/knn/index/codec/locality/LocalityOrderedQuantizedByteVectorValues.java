@@ -44,7 +44,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
     private final int dimension;
     private final int size;
     private final int codeLength;
-    private final int recordSize;
+    private final LocalityOrderedQuantizedVectorsWriter.RecordLayout layout;
     private final float[] centroid;
     private final float centroidDp;
     private final OptimizedScalarQuantizer quantizer;
@@ -70,7 +70,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
         final int dimension,
         final int size,
         final int codeLength,
-        final int recordSize,
+        final LocalityOrderedQuantizedVectorsWriter.RecordLayout layout,
         final float[] centroid,
         final float centroidDp,
         final OptimizedScalarQuantizer quantizer,
@@ -84,7 +84,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
         this.dimension = dimension;
         this.size = size;
         this.codeLength = codeLength;
-        this.recordSize = recordSize;
+        this.layout = layout;
         this.centroid = centroid;
         this.centroidDp = centroidDp;
         this.quantizer = quantizer;
@@ -109,7 +109,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
         if (lastOrd == physicalOrd) {
             return vector;
         }
-        slice.seek((long) physicalOrd * recordSize);
+        slice.seek(layout.offset(physicalOrd));
         slice.readBytes(byteBuffer.array(), byteBuffer.arrayOffset(), vector.length);
         slice.readFloats(correctionScratch, 0, 3);
         quantizedComponentSum = slice.readInt();
@@ -129,7 +129,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
             );
         }
 
-        slice.seek((long) physicalOrd * recordSize + codeLength);
+        slice.seek(layout.offset(physicalOrd) + codeLength);
         slice.readFloats(correctionScratch, 0, 3);
         quantizedComponentSum = slice.readInt();
         return new OptimizedScalarQuantizer.QuantizationResult(
@@ -195,7 +195,16 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
         for (int i = 0; i < finalNumOrds; i++) {
             ordToPrefetchScratch[i] = toPhysical(ordsToPrefetch[i]);
         }
-        PrefetchHelper.prefetchBasedOnOrdinals(getSlice(), 0, recordSize, ordToPrefetchScratch, finalNumOrds);
+        if (layout.recordsPerPage() == 1) {
+            PrefetchHelper.prefetchBasedOnOrdinals(getSlice(), 0, layout.pageBytes(), ordToPrefetchScratch, finalNumOrds);
+            return;
+        }
+        // Page-padded records have no fixed stride, so PageTouchTracker (which assumes one) does not see this batch.
+        final long[] starts = new long[finalNumOrds];
+        for (int i = 0; i < finalNumOrds; i++) {
+            starts[i] = layout.offset(ordToPrefetchScratch[i]);
+        }
+        PrefetchHelper.prefetchRanges(getSlice(), starts, finalNumOrds, layout.recordSize(), PrefetchHelper.Grouping.BLOCK_32KB);
     }
 
     @Override
@@ -219,7 +228,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
             dimension,
             size,
             codeLength,
-            recordSize,
+            layout,
             centroid,
             centroidDp,
             quantizer,
@@ -287,7 +296,7 @@ public final class LocalityOrderedQuantizedByteVectorValues extends QuantizedByt
             dimension,
             size,
             codeLength,
-            recordSize,
+            layout,
             centroid,
             centroidDp,
             quantizer,

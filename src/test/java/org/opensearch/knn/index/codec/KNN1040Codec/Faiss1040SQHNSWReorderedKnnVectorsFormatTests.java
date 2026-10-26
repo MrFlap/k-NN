@@ -7,6 +7,7 @@ package org.opensearch.knn.index.codec.KNN1040Codec;
 
 import lombok.SneakyThrows;
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
@@ -28,15 +29,28 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
+import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.locality.InlineNeighborLists;
+import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsReader;
+import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissHnswGraph;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissIdMapIndex;
+import org.opensearch.knn.memoryoptsearch.faiss.FaissIndex;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -558,6 +572,174 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
             verifyVectorsReadable(format, directory, mergedSegInfo, fi, allVectors, totalVectors);
             assertRawVectorDataPageAligned(directory, "_merged");
         }
+    }
+
+    /**
+     * Each record's inline layer-0 neighbor list, after flush and after merge, equals the node's list in the .faiss
+     * file; the lists are stored as physical positions and read back through the inverse map. The record region is
+     * whole 4 KB pages starting on a page boundary.
+     */
+    @SneakyThrows
+    public void testInlineNeighbors_whenFlushedOrMerged_thenMatchFaissNeighborsOfEveryNode() {
+        final int numVectors = 600;
+        final float[][] vectors = generateRandomVectors(numVectors, DIMENSION);
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat();
+        try (Directory flushDir = newDirectory(); Directory mergeDir = newDirectory()) {
+            assertInlineNeighborsMatchFaiss(flushDir, format, indexIntoDirectory(flushDir, format, fi, vectors), fi);
+            assertInlineNeighborsMatchFaiss(mergeDir, format, mergeIntoOneSegment(mergeDir, format, fi, vectors, 3), fi);
+        }
+    }
+
+    private void assertInlineNeighborsMatchFaiss(
+        final Directory dir,
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format,
+        final SegmentWriteState ws,
+        final FieldInfo fi
+    ) throws Exception {
+        final String segment = ws.segmentInfo.name;
+        final long veqloLength = dir.fileLength(filesWithSegmentAndExtension(dir, segment, "veqlo").get(0));
+        assertEquals("record region must be whole pages", 0, (veqloLength - CodecUtil.footerLength()) % 4096);
+        try (
+            KnnVectorsReader knnReader = format.fieldsReader(readStateFor(dir, ws, fi));
+            IndexInput faissInput = dir.openInput(filesWithSegmentAndExtension(dir, segment, "faiss").get(0), IOContext.DEFAULT)
+        ) {
+            final InlineNeighborLists inline = localityReader(knnReader).getInlineNeighborLists(FIELD_NAME);
+            assertNotNull(inline);
+            final FaissIndex faissIndex = FaissIndex.load(faissInput);
+            final FaissHnswGraph faissGraph = new FaissHnswGraph(((FaissIdMapIndex) faissIndex).getFaissHnsw(), faissInput);
+            assertEquals(2 * faissGraph.maxConn(), inline.maxNeighbors());
+            final int[] neighbors = new int[inline.maxNeighbors()];
+            final int count = Math.toIntExact(faissIndex.getTotalNumberOfVectors());
+            assertEquals(ws.segmentInfo.maxDoc(), count);
+            for (int ord = 0; ord < count; ord++) {
+                faissGraph.seek(0, ord);
+                final int numNeighbors = inline.read(ord, neighbors);
+                assertEquals("neighbor count of " + ord, faissGraph.neighborCount(), numNeighbors);
+                assertTrue(numNeighbors > 0);
+                for (int i = 0; i < numNeighbors; i++) {
+                    assertEquals("neighbor " + i + " of " + ord, faissGraph.nextNeighbor(), neighbors[i]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Search returns the same docs and scores whether layer-0 neighbors come from the records or from .faiss, for
+     * Lucene's searcher (beam width 1) and the beam searcher, both seeded from the closest hub.
+     */
+    @SneakyThrows
+    public void testSearch_whenInlineNeighborsToggled_thenResultsIdentical() {
+        final int numVectors = 1000;
+        final float[][] vectors = generateRandomVectors(numVectors, DIMENSION);
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat();
+        try (
+            Directory dir = new MMapDirectory(createTempDir());
+            MockedStatic<KNNSettings> settings = Mockito.mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            final SegmentWriteState ws = indexIntoDirectory(dir, format, fi, vectors);
+            try (KnnVectorsReader knnReader = format.fieldsReader(readStateFor(dir, ws, fi))) {
+                assertNotNull(localityReader(knnReader).getInlineNeighborLists(FIELD_NAME));
+                final float[][] queries = generateQueries(20, DIMENSION, 7);
+                for (final int beamWidth : new int[] { 1, 4 }) {
+                    settings.when(KNNSettings::getMemoryOptimizedBeamWidth).thenReturn(beamWidth);
+                    for (final float[] query : queries) {
+                        settings.when(KNNSettings::isInlineNeighborsEnabled).thenReturn(true);
+                        final TopDocs inline = searchAll(knnReader, query, 10, numVectors);
+                        settings.when(KNNSettings::isInlineNeighborsEnabled).thenReturn(false);
+                        final TopDocs faiss = searchAll(knnReader, query, 10, numVectors);
+                        assertEquals(10, inline.scoreDocs.length);
+                        assertEquals(faiss.scoreDocs.length, inline.scoreDocs.length);
+                        for (int i = 0; i < inline.scoreDocs.length; i++) {
+                            assertEquals("beam " + beamWidth + " rank " + i, faiss.scoreDocs[i].doc, inline.scoreDocs[i].doc);
+                            assertEquals(faiss.scoreDocs[i].score, inline.scoreDocs[i].score, 0.0f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Version 0 locality files (144 B records, no neighborSlots field) still read. A segment without a graph stores no
+     * neighbors, so its files differ from version 0 only by the header version and the neighborSlots field; rewrite
+     * them that way and check the records read the same.
+     */
+    @SneakyThrows
+    public void testRead_whenVersion0LocalityFiles_thenRecordsReadUnchanged() {
+        final int numVectors = 150;
+        final float[][] vectors = generateRandomVectors(numVectors, DIMENSION);
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat(
+            -1,
+            new org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory()
+        );
+        try (Directory dir = newDirectory()) {
+            final SegmentWriteState ws = indexIntoDirectory(dir, format, fi, vectors);
+            final byte[][] codes = new byte[numVectors][];
+            final float[] lower = new float[numVectors];
+            try (KnnVectorsReader knnReader = format.fieldsReader(readStateFor(dir, ws, fi))) {
+                final QuantizedByteVectorValues values = localityReader(knnReader).getQuantizedVectorValues(FIELD_NAME);
+                for (int ord = 0; ord < numVectors; ord++) {
+                    codes[ord] = values.vectorValue(ord).clone();
+                    lower[ord] = values.getCorrectiveTerms(ord).lowerInterval();
+                }
+            }
+            rewriteAsVersion0(dir, filesWithSegmentAndExtension(dir, "_0", "veqlo").get(0), false);
+            rewriteAsVersion0(dir, filesWithSegmentAndExtension(dir, "_0", "vemlo").get(0), true);
+            try (KnnVectorsReader knnReader = format.fieldsReader(readStateFor(dir, ws, fi))) {
+                final LocalityOrderedQuantizedVectorsReader reader = localityReader(knnReader);
+                assertNull(reader.getInlineNeighborLists(FIELD_NAME));
+                final QuantizedByteVectorValues values = reader.getQuantizedVectorValues(FIELD_NAME);
+                for (int ord = 0; ord < numVectors; ord++) {
+                    assertArrayEquals(codes[ord], values.vectorValue(ord));
+                    assertEquals(lower[ord], values.getCorrectiveTerms(ord).lowerInterval(), 0.0f);
+                }
+            }
+            verifyVectorsReadable(format, dir, ws.segmentInfo, fi, vectors, numVectors);
+        }
+    }
+
+    /** Sets the header version to 0, optionally drops the metadata's neighborSlots vInt, and rewrites the footer. */
+    private static void rewriteAsVersion0(final Directory dir, final String file, final boolean dropNeighborSlots) throws IOException {
+        final byte[] bytes;
+        try (IndexInput in = dir.openInput(file, IOContext.READONCE)) {
+            bytes = new byte[Math.toIntExact(in.length())];
+            in.readBytes(bytes, 0, bytes.length);
+        }
+        final String codec = LocalityOrderedQuantizedVectorsWriter.CODEC_NAME;
+        final int versionPos = Integer.BYTES + 1 + codec.length(); // magic, codec name (1-byte length), version
+        assertEquals(LocalityOrderedQuantizedVectorsWriter.VERSION_INLINE_NEIGHBORS, bytes[versionPos + 3]);
+        Arrays.fill(bytes, versionPos, versionPos + Integer.BYTES, (byte) 0);
+        int drop = -1;
+        if (dropNeighborSlots) {
+            final ByteArrayDataInput meta = new ByteArrayDataInput(bytes);
+            meta.setPosition(CodecUtil.indexHeaderLength(codec, FIELD_NAME));
+            meta.readInt(); // field number
+            for (int i = 0; i < 5; i++) {
+                meta.readVInt(); // dimension, count, codeLength, recordSize, encoding
+            }
+            drop = meta.getPosition();
+            assertEquals("neighborSlots", 0, bytes[drop]);
+        }
+        dir.deleteFile(file);
+        try (IndexOutput out = dir.createOutput(file, IOContext.DEFAULT)) {
+            final int end = bytes.length - CodecUtil.footerLength();
+            if (drop < 0) {
+                out.writeBytes(bytes, 0, end);
+            } else {
+                out.writeBytes(bytes, 0, drop);
+                out.writeBytes(bytes, drop + 1, end - drop - 1);
+            }
+            CodecUtil.writeFooter(out);
+        }
+    }
+
+    private static LocalityOrderedQuantizedVectorsReader localityReader(final KnnVectorsReader knnReader) throws Exception {
+        final java.lang.reflect.Field delegateField = knnReader.getClass().getSuperclass().getDeclaredField("flatVectorsReader");
+        delegateField.setAccessible(true);
+        return (LocalityOrderedQuantizedVectorsReader) delegateField.get(knnReader);
     }
 
     /** Reads the field's vector data offset from the raw {@code .vemf} and checks it is on a page boundary. */
