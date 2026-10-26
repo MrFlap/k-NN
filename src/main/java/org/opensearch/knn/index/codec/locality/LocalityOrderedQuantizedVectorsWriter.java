@@ -139,6 +139,11 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
         }
     }
 
+    /** Records per 4 KB page for a record of {@code codeLength} code bytes and {@code neighborSlots} inline neighbors. */
+    public static int recordsPerPage(final int codeLength, final int neighborSlots) {
+        return RecordLayout.of(codeLength, neighborSlots).recordsPerPage();
+    }
+
     private final IndexOutput vectordata;
     private final IndexOutput metadata;
     private boolean finished;

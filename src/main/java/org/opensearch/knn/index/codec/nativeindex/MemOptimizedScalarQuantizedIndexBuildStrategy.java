@@ -15,6 +15,8 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KNN1040Codec.ScalarEncodingResolver;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
+import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter;
 import org.opensearch.knn.index.codec.nativeindex.model.Layer0LocalityOrdering;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
@@ -197,14 +199,13 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
                 int numberOfHubs = Math.min(indexInfo.getTotalLiveDocs(), KNNConstants.MAX_HUBS_IN_HNSW);
                 layer0LocalityOrdering.populate(new int[indexInfo.getTotalLiveDocs()], new int[numberOfHubs]);
             }
-            // Cluster-size bound for the dense greedy layout: one 32 KB page worth of records. A record
-            // is the quantized code plus the 4 correction factors (4 bytes each), matching the locality
-            // store's on-disk record layout. Greedy grows each affine cluster up to this many nodes, then
-            // packs clusters back-to-back (dense 0..n-1, no padding) — see
-            // buildOrderingOfVectorsUsingIndexStructure. Greedy co-locates a node's own dense neighborhood
-            // far better than BFS (higher intra-page edge ratio), so more neighbor reads hit one page.
-            final int recordSizeBytes = quantizedVecBytes + Integer.BYTES * 4;
-            final int pageCapacity = Math.max(1, (32 * 1024) / recordSizeBytes);
+            // Cluster-size bound for the dense greedy layout: the records that fit one 4 KB page of the
+            // locality store. A graph build always stores inline layer-0 neighbor lists (2M slots), so this is
+            // the inline-neighbor record layout (15 per page for 1024-dim, M=16). Greedy grows each affine
+            // cluster up to this many nodes, then packs clusters back-to-back (dense 0..n-1, no padding) — see
+            // buildOrderingOfVectorsUsingIndexStructure — so a cluster that closes early shifts later ones
+            // off the page grid.
+            final int pageCapacity = layer0PageCapacity(quantizedVecBytes, indexInfo.getIndexParameters());
             // Native also fills the hub array (top-degree original ordinals, -1-padded; pool capped at 32)
             // in layer0LocalityOrdering. The locality writer persists these (see writeHubs), and the reader
             // uses the closest one as the search entry point (selectBestHubOrdinal / maybeSeedWithClosestHub).
@@ -243,6 +244,17 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategy implements NativeInde
         // writeIndex takes ownership of the native pointer via unique_ptr in C++,
         // so the memory is freed regardless of success or failure — no cleanup needed here.
         writeIndex(indexMemoryAddress, indexInfo, indexParameters);
+    }
+
+    /**
+     * Records per 4 KB page of the locality store for this build: the code, the corrections and the 2M inline
+     * layer-0 neighbor slots the reordered writer stores (M from the method parameters, default 16).
+     */
+    static int layer0PageCapacity(final int quantizedVecBytes, final Map<String, Object> indexParameters) {
+        final Object params = indexParameters.get(KNNConstants.PARAMETERS);
+        final Object m = params instanceof Map<?, ?> map ? map.get(KNNConstants.METHOD_PARAMETER_M) : null;
+        final int maxConnections = m instanceof Number number ? number.intValue() : KNNSettings.INDEX_KNN_DEFAULT_ALGO_PARAM_M;
+        return LocalityOrderedQuantizedVectorsWriter.recordsPerPage(quantizedVecBytes, 2 * maxConnections);
     }
 
     /**

@@ -625,6 +625,41 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
     }
 
     /**
+     * The layer-0 ordering grows clusters of exactly the records that fit one 4 KB page of the inline-neighbor layout
+     * (128-dim: 16 B code + 16 B corrections + 32 neighbors = 160 B, 25 per page), and the written record region is
+     * that many records per page.
+     */
+    @SneakyThrows
+    public void testOrdering_whenInlineNeighbors_thenPageCapacityMatchesRecordLayout() {
+        final int numVectors = 500;
+        final int perPage = 4096 / (DIMENSION / 8 + 16 + 32 * Integer.BYTES);
+        assertEquals(25, perPage);
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat();
+        try (
+            Directory dir = newDirectory();
+            MockedStatic<org.opensearch.knn.jni.JNIService> jni = Mockito.mockStatic(
+                org.opensearch.knn.jni.JNIService.class,
+                Mockito.CALLS_REAL_METHODS
+            )
+        ) {
+            final SegmentWriteState ws = indexIntoDirectory(dir, format, fi, generateRandomVectors(numVectors, DIMENSION));
+            jni.verify(
+                () -> org.opensearch.knn.jni.JNIService.buildOrderingOfVectorsUsingIndexStructure(
+                    Mockito.anyLong(),
+                    Mockito.any(),
+                    Mockito.eq(perPage),
+                    Mockito.any(),
+                    Mockito.any()
+                )
+            );
+            final long veqloLength = dir.fileLength(filesWithSegmentAndExtension(dir, "_0", "veqlo").get(0));
+            final long recordPages = (veqloLength - CodecUtil.footerLength()) / 4096 - 1; // minus the header page
+            assertEquals((numVectors + perPage - 1) / perPage, recordPages);
+        }
+    }
+
+    /**
      * Search returns the same docs and scores whether layer-0 neighbors come from the records or from .faiss, for
      * Lucene's searcher (beam width 1) and the beam searcher, both seeded from the closest hub.
      */
