@@ -295,6 +295,7 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
                 }
                 assertEquals(numVectors, count);
             }
+            assertRawVectorDataPageAligned(directory, "_0");
         }
     }
 
@@ -555,6 +556,21 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
                 System.arraycopy(segmentVectors[s], 0, allVectors, s * vectorsPerSegment, vectorsPerSegment);
             }
             verifyVectorsReadable(format, directory, mergedSegInfo, fi, allVectors, totalVectors);
+            assertRawVectorDataPageAligned(directory, "_merged");
+        }
+    }
+
+    /** Reads the field's vector data offset from the raw {@code .vemf} and checks it is on a page boundary. */
+    private void assertRawVectorDataPageAligned(final Directory directory, final String segmentName) throws IOException {
+        final String vemf = filesWithSegmentAndExtension(directory, segmentName, "vemf").get(0);
+        try (org.apache.lucene.store.IndexInput meta = directory.openInput(vemf, IOContext.READONCE)) {
+            meta.seek(org.apache.lucene.codecs.CodecUtil.indexHeaderLength("Lucene99FlatVectorsFormatMeta", FIELD_NAME));
+            meta.readInt(); // field number
+            meta.readInt(); // vector encoding
+            meta.readInt(); // similarity function
+            final long vectorDataOffset = meta.readVLong();
+            assertEquals("vector data offset " + vectorDataOffset, 0, vectorDataOffset % 4096);
+            assertTrue(vectorDataOffset > 0);
         }
     }
 
