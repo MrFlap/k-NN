@@ -109,7 +109,7 @@ public final class LocalityOrderedQuantizedVectorsWriter implements Closeable {
     /** Adds {@code neighborSlots} to the metadata and, when non-zero, inline neighbor lists in page-aligned records. */
     public static final int VERSION_INLINE_NEIGHBORS = 1;
     public static final int VERSION_CURRENT = VERSION_INLINE_NEIGHBORS;
-    static final int PAGE_BYTES = 4096;
+    public static final int PAGE_BYTES = 4096;
 
     /** 3 correction floats + 1 correction int, all 4 bytes. */
     static final int CORRECTION_BYTES = Integer.BYTES * 4;

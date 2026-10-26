@@ -388,11 +388,11 @@ public class MemOptimizedScalarQuantizedIndexBuildStrategyTests extends KNNTestC
     }
 
     public void testLayer0PageCapacity_thenRecordsPerPageOfInlineNeighborLayout() {
-        // 1024-dim 1-bit code (128 B) + 16 B corrections + 2M int32 neighbors, packed whole into 4 KB pages.
+        // 1024-dim 1-bit code (128 B) + 16 B corrections + 2M int32 neighbors; 8 pages of 4 KB per 32 KB cluster.
         final Map<String, Object> m16 = Map.of("parameters", Map.of("m", 16));
-        assertEquals(15, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, m16));
+        assertEquals(8 * 15, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, m16));
         final Map<String, Object> m32 = Map.of("parameters", Map.of("m", 32));
-        assertEquals(10, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, m32));
-        assertEquals(15, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, Map.of())); // default M=16
+        assertEquals(8 * 10, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, m32));
+        assertEquals(8 * 15, MemOptimizedScalarQuantizedIndexBuildStrategy.layer0PageCapacity(128, Map.of())); // default M=16
     }
 }

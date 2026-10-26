@@ -625,12 +625,12 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
     }
 
     /**
-     * The layer-0 ordering grows clusters of exactly the records that fit one 4 KB page of the inline-neighbor layout
-     * (128-dim: 16 B code + 16 B corrections + 32 neighbors = 160 B, 25 per page), and the written record region is
-     * that many records per page.
+     * The layer-0 ordering grows clusters of the records in 32 KB (8 pages) of the inline-neighbor layout (128-dim:
+     * 16 B code + 16 B corrections + 32 neighbors = 160 B, 25 per page, 200 per cluster), and the written record
+     * region holds 25 records per page.
      */
     @SneakyThrows
-    public void testOrdering_whenInlineNeighbors_thenPageCapacityMatchesRecordLayout() {
+    public void testOrdering_whenInlineNeighbors_thenClusterIs32KBOfRecordLayout() {
         final int numVectors = 500;
         final int perPage = 4096 / (DIMENSION / 8 + 16 + 32 * Integer.BYTES);
         assertEquals(25, perPage);
@@ -648,7 +648,7 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
                 () -> org.opensearch.knn.jni.JNIService.buildOrderingOfVectorsUsingIndexStructure(
                     Mockito.anyLong(),
                     Mockito.any(),
-                    Mockito.eq(perPage),
+                    Mockito.eq(8 * perPage),
                     Mockito.any(),
                     Mockito.any()
                 )

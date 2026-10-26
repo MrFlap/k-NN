@@ -45,7 +45,8 @@ import java.util.Optional;
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 public class PrefetchHelper {
 
-    private static final long BYTES_32 = 32 * 1024;
+    /** The fixed prefetch group window; the layer-0 locality ordering sizes its clusters to it too. */
+    public static final long BYTES_32 = 32 * 1024;
     /** gp3 counts an IO of up to 256 KiB as one operation, and the kernel reads ahead at most that much per call. */
     static final long MAX_MERGED_BYTES = 256 * 1024;
 
