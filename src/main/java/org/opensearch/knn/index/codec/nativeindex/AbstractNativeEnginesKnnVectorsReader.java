@@ -34,7 +34,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapper.KNN_FIELD;
 
@@ -55,8 +54,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
     protected final Object vectorSearcherHolderLockObject;
     protected final FieldInfos fieldInfos;
     // Counted into the node's k-NN vector data, which sizes the io_uring block cache.
-    private final long vectorDataBytes;
-    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Closeable vectorData;
 
     protected AbstractNativeEnginesKnnVectorsReader(final SegmentReadState state, final FlatVectorsReader flatVectorsReader) {
         this.flatVectorsReader = flatVectorsReader;
@@ -65,8 +63,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
         this.vectorSearcherHolder = new VectorSearcherHolder();
         this.vectorSearcherHolderLockObject = new Object();
         this.fieldInfos = state.fieldInfos;
-        this.vectorDataBytes = KnnIo.vectorDataBytes(state);
-        KnnIo.addVectorData(vectorDataBytes);
+        this.vectorData = KnnIo.registerVectorData(state);
     }
 
     /**
@@ -96,9 +93,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
      */
     @Override
     public void close() throws IOException {
-        if (closed.compareAndSet(false, true)) {
-            KnnIo.addVectorData(-vectorDataBytes);
-        }
+        vectorData.close();
         final List<Closeable> closeables = new ArrayList<>();
         // Close reader.
         closeables.add(flatVectorsReader);

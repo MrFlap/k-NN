@@ -750,6 +750,34 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
         }
     }
 
+    /** Two readers of one segment count each k-NN file once; the count drops only when the last one closes. */
+    @SneakyThrows
+    public void testVectorData_whenSegmentOpenedTwice_thenEachFileCountedOnce() {
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat();
+        try (Directory dir = new MMapDirectory(createTempDir())) {
+            final SegmentWriteState ws = indexIntoDirectory(dir, format, fi, generateRandomVectors(300, DIMENSION));
+            long distinct = 0;
+            for (final String file : dir.listAll()) {
+                final String extension = file.substring(file.lastIndexOf('.') + 1);
+                if (file.startsWith("_0") && (KnnIo.VECTOR_DATA_EXTENSIONS.contains(extension) || extension.equals("faiss"))) {
+                    distinct += dir.fileLength(file);
+                }
+            }
+            assertTrue(distinct > 0);
+            final long before = (long) KnnIo.stats().get("vector_data_bytes");
+            try (KnnVectorsReader first = format.fieldsReader(readStateFor(dir, ws, fi))) {
+                assertEquals(distinct, (long) KnnIo.stats().get("vector_data_bytes") - before);
+                final KnnVectorsReader second = format.fieldsReader(readStateFor(dir, ws, fi));
+                assertEquals(distinct, (long) KnnIo.stats().get("vector_data_bytes") - before);
+                second.close();
+                second.close();
+                assertEquals(distinct, (long) KnnIo.stats().get("vector_data_bytes") - before);
+            }
+            assertEquals(before, (long) KnnIo.stats().get("vector_data_bytes"));
+        }
+    }
+
     private static void assertSameTopDocs(final TopDocs expected, final TopDocs actual) {
         assertEquals(expected.scoreDocs.length, actual.scoreDocs.length);
         for (int i = 0; i < expected.scoreDocs.length; i++) {

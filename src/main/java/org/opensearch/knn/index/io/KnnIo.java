@@ -11,6 +11,7 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -20,10 +21,13 @@ import org.opensearch.monitor.os.OsProbe;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -46,6 +50,8 @@ public final class KnnIo {
     private static final int RING_ENTRIES = 256;
     private static final long MIN_CAPACITY_BYTES = 16L << 20;
     private static final AtomicLong VECTOR_DATA_BYTES = new AtomicLong();
+    // Open k-NN vector files by path: {readers holding it, its length}.
+    private static final Map<String, long[]> VECTOR_DATA_FILES = new HashMap<>();
     private static final LongAdder PREFETCH_BATCHES = new LongAdder();
     private static final long PHYSICAL_BYTES = OsProbe.getInstance().getTotalPhysicalMemorySize();
     private static final long MAX_HEAP_BYTES = Runtime.getRuntime().maxMemory();
@@ -62,44 +68,79 @@ public final class KnnIo {
         return IO_URING.equals(KNNSettings.getIoBackend()) && blockCache() != null;
     }
 
-    /** Adds (or with a negative value removes) the vector data of a k-NN reader that opened (or closed). */
-    public static void addVectorData(final long bytes) {
+    /** Adjusts the vector data total directly, for tests. */
+    static void addVectorData(final long bytes) {
         VECTOR_DATA_BYTES.addAndGet(bytes);
     }
 
     /**
-     * Bytes of this reader's k-NN vector files: the {@link #VECTOR_DATA_EXTENSIONS} files of its segment suffix plus the
-     * engine files of the segment's vector fields.
+     * Counts a k-NN reader's vector files into the node's vector data: the {@link #VECTOR_DATA_EXTENSIONS} files of its
+     * segment suffix plus the engine files of the segment's vector fields. Each file counts once while any reader
+     * holding it is open, so several readers of one segment, or two formats sharing an engine file, add it once.
+     *
+     * @return releases this reader's hold; closing it again does nothing
      */
-    // shortcut: an engine file is counted by every k-NN reader of its segment (two k-NN formats in one segment count it
-    // twice), and files inside a compound file count but are read with mmap; size per field if that matters.
-    public static long vectorDataBytes(final SegmentReadState state) {
+    // shortcut: files inside a compound file count but are read with mmap.
+    public static Closeable registerVectorData(final SegmentReadState state) {
+        final Map<String, Long> files = vectorDataFiles(state);
+        synchronized (VECTOR_DATA_FILES) {
+            for (final Map.Entry<String, Long> file : files.entrySet()) {
+                final long[] entry = VECTOR_DATA_FILES.computeIfAbsent(file.getKey(), k -> new long[] { 0, file.getValue() });
+                if (entry[0]++ == 0) {
+                    VECTOR_DATA_BYTES.addAndGet(entry[1]);
+                }
+            }
+        }
+        final AtomicBoolean released = new AtomicBoolean();
+        return () -> {
+            if (released.compareAndSet(false, true) == false) {
+                return;
+            }
+            synchronized (VECTOR_DATA_FILES) {
+                for (final String path : files.keySet()) {
+                    final long[] entry = VECTOR_DATA_FILES.get(path);
+                    if (entry != null && --entry[0] == 0) {
+                        VECTOR_DATA_FILES.remove(path);
+                        VECTOR_DATA_BYTES.addAndGet(-entry[1]);
+                    }
+                }
+            }
+        };
+    }
+
+    /** The reader's k-NN vector files with their lengths, keyed by absolute path (or directory and name off a file system). */
+    private static Map<String, Long> vectorDataFiles(final SegmentReadState state) {
+        final Map<String, Long> result = new HashMap<>();
         try {
-            final Set<String> files = Set.of(state.directory.listAll());
-            long total = 0;
+            final Set<String> present = Set.of(state.directory.listAll());
+            final List<String> names = new ArrayList<>();
             for (final String extension : VECTOR_DATA_EXTENSIONS) {
-                total += lengthIfPresent(
-                    state.directory,
-                    files,
-                    IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, extension)
-                );
+                names.add(IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, extension));
             }
             for (final FieldInfo field : state.fieldInfos) {
                 if (field.hasVectorValues()) {
-                    final String engineFile = KNNCodecUtil.getNativeEngineFileFromFieldInfo(field, state.segmentInfo);
-                    total += lengthIfPresent(state.directory, files, engineFile);
+                    names.add(KNNCodecUtil.getNativeEngineFileFromFieldInfo(field, state.segmentInfo));
                 }
             }
-            return total;
+            final Directory unwrapped = FilterDirectory.unwrap(state.directory);
+            for (final String name : names) {
+                if (name != null && present.contains(name)) {
+                    final String key = unwrapped instanceof FSDirectory
+                        ? ((FSDirectory) unwrapped).getDirectory().resolve(name).toAbsolutePath().toString()
+                        : System.identityHashCode(unwrapped) + "/" + name;
+                    result.put(key, state.directory.fileLength(name));
+                }
+            }
         } catch (IOException | RuntimeException e) {
             // e.g. segment files not set yet
             log.debug("Could not size k-NN vector data of segment [{}]", state.segmentInfo.name, e);
-            return 0;
         }
+        return result;
     }
 
-    private static long lengthIfPresent(final Directory directory, final Set<String> files, final String name) throws IOException {
-        return name != null && files.contains(name) ? directory.fileLength(name) : 0;
+    /** Node-wide k-NN vector data bytes counted by {@link #registerVectorData}. */
+    static long vectorDataBytes() {
+        return VECTOR_DATA_BYTES.get();
     }
 
     /**
