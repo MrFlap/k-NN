@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import lombok.SneakyThrows;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.CodecUtil;
@@ -47,6 +48,8 @@ import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.locality.InlineNeighborLists;
 import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsReader;
 import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter;
+import org.opensearch.knn.index.io.IoUringReaperFilter;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
 import org.opensearch.knn.memoryoptsearch.faiss.FaissHnswGraph;
 import org.opensearch.knn.memoryoptsearch.faiss.FaissIdMapIndex;
@@ -72,6 +75,7 @@ import java.util.stream.Collectors;
  * mirroring {@link Faiss1040ScalarQuantizedKnnVectorsWriterTests}.
  */
 @Log4j2
+@ThreadLeakFilters(defaultFilters = true, filters = { IoUringReaperFilter.class })
 public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
 
     private static final int DIMENSION = 128;
@@ -693,6 +697,64 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormatTests extends KNNTestCase {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * The io_uring backend returns the same docs and scores and the same full-precision vectors as mmap, with inline
+     * neighbors on and off and beam widths 1 and 4, and reads through the block cache. With io_uring unavailable it
+     * falls back to mmap.
+     */
+    @SneakyThrows
+    public void testSearch_whenIoUringBackend_thenResultsIdenticalToMMap() {
+        final int numVectors = 1000;
+        final float[][] vectors = generateRandomVectors(numVectors, DIMENSION);
+        final FieldInfo fi = createRealFieldInfo();
+        final Faiss1040SQHNSWReorderedKnnVectorsFormat format = new Faiss1040SQHNSWReorderedKnnVectorsFormat();
+        try (
+            Directory dir = new MMapDirectory(createTempDir());
+            MockedStatic<KNNSettings> settings = Mockito.mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            final SegmentWriteState ws = indexIntoDirectory(dir, format, fi, vectors);
+            try (KnnVectorsReader knnReader = format.fieldsReader(readStateFor(dir, ws, fi))) {
+                settings.when(KNNSettings::getIoBackend).thenReturn(KnnIo.IO_URING);
+                assumeTrue("io_uring unavailable here", KnnIo.useIoUring());
+                final long missesBefore = (long) KnnIo.stats().get("misses");
+                final float[][] queries = generateQueries(10, DIMENSION, 11);
+                for (final boolean inline : new boolean[] { true, false }) {
+                    settings.when(KNNSettings::isInlineNeighborsEnabled).thenReturn(inline);
+                    for (final int beamWidth : new int[] { 1, 4 }) {
+                        settings.when(KNNSettings::getMemoryOptimizedBeamWidth).thenReturn(beamWidth);
+                        for (final float[] query : queries) {
+                            settings.when(KNNSettings::getIoBackend).thenReturn(KnnIo.MMAP);
+                            final TopDocs mmap = searchAll(knnReader, query, 10, numVectors);
+                            settings.when(KNNSettings::getIoBackend).thenReturn(KnnIo.IO_URING);
+                            assertSameTopDocs(mmap, searchAll(knnReader, query, 10, numVectors));
+                            KnnIo.setAvailableForTesting(false);
+                            try {
+                                assertSameTopDocs(mmap, searchAll(knnReader, query, 10, numVectors));
+                            } finally {
+                                KnnIo.setAvailableForTesting(null);
+                            }
+                        }
+                    }
+                }
+                assertTrue("searches read through the block cache", (long) KnnIo.stats().get("misses") > missesBefore);
+                final FloatVectorValues cached = knnReader.getFloatVectorValues(FIELD_NAME);
+                settings.when(KNNSettings::getIoBackend).thenReturn(KnnIo.MMAP);
+                final FloatVectorValues mmap = knnReader.getFloatVectorValues(FIELD_NAME);
+                for (int ord = 0; ord < numVectors; ord++) {
+                    assertArrayEquals(mmap.vectorValue(ord), cached.vectorValue(ord), 0.0f);
+                }
+            }
+        }
+    }
+
+    private static void assertSameTopDocs(final TopDocs expected, final TopDocs actual) {
+        assertEquals(expected.scoreDocs.length, actual.scoreDocs.length);
+        for (int i = 0; i < expected.scoreDocs.length; i++) {
+            assertEquals("rank " + i, expected.scoreDocs[i].doc, actual.scoreDocs[i].doc);
+            assertEquals(expected.scoreDocs[i].score, actual.scoreDocs[i].score, 0.0f);
         }
     }
 

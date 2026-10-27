@@ -25,6 +25,7 @@ import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsRe
 import org.opensearch.knn.index.codec.locality.LocalityOrderedQuantizedVectorsWriter;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
 import java.io.IOException;
@@ -104,7 +105,20 @@ public class Faiss1040SQHNSWReorderedKnnVectorsFormat extends KnnVectorsFormat {
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
         return new Faiss1040SQHNSWReorderedReader(
             state,
-            new LocalityOrderedQuantizedVectorsReader(state, RAW_VECTOR_FORMAT.fieldsReader(state), KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER)
+            new LocalityOrderedQuantizedVectorsReader(
+                state,
+                RAW_VECTOR_FORMAT.fieldsReader(state),
+                KNN_1040_SCALAR_QUANTIZED_VECTOR_SCORER,
+                () -> RAW_VECTOR_FORMAT.fieldsReader(
+                    new SegmentReadState(
+                        KnnIo.cachedDirectory(state.directory, RAW_VECTOR_DATA_EXTENSION),
+                        state.segmentInfo,
+                        state.fieldInfos,
+                        state.context,
+                        state.segmentSuffix
+                    )
+                )
+            )
         );
     }
 

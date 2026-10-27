@@ -9,6 +9,7 @@ import com.google.common.cache.CacheStats;
 import com.google.common.collect.ImmutableMap;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
@@ -83,6 +84,7 @@ public class KNNStats {
         addModelStats(builder);
         addGraphStats(builder);
         addRemoteIndexBuildStats(builder);
+        builder.put(StatNames.IO_BLOCK_CACHE_STATS.getName(), createNodeStat(KnnIo::stats));
         return builder.build();
     }
 

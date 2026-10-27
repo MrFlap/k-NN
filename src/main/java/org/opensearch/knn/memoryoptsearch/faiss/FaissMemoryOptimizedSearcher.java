@@ -21,6 +21,7 @@ import org.apache.lucene.search.knn.KnnSearchStrategy;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
 import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
@@ -30,6 +31,7 @@ import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.codec.locality.InlineNeighborLists;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.index.codec.scorer.PageTouchTracker;
 import org.opensearch.knn.index.util.WarmupUtil;
 import org.opensearch.knn.memoryoptsearch.VectorSearcher;
@@ -52,6 +54,7 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
     private final FaissHNSW hnsw;
     private final VectorSimilarityFunction vectorSimilarityFunction;
     private final InlineNeighborLists inlineNeighbors;
+    private final KnnIo.LazyCachedInput cachedIndexInput;
     private boolean isAdc;
 
     /**
@@ -64,22 +67,25 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         final FieldInfo fieldInfo,
         final FlatVectorsScorer flatVectorsScorer
     ) {
-        this(indexInput, faissIndex, fieldInfo, flatVectorsScorer, null);
+        this(indexInput, faissIndex, fieldInfo, flatVectorsScorer, null, null);
     }
 
     /**
      * @param inlineNeighbors layer-0 neighbor lists stored with the vectors, used instead of the FAISS file's while
      *                        {@code knn.locality.inline_neighbors.enabled} is true; null if there are none
+     * @param cachedIndexInput the same FAISS file through the block cache, for the io_uring backend; null for none
      */
     public FaissMemoryOptimizedSearcher(
         final IndexInput indexInput,
         final FaissIndex faissIndex,
         final FieldInfo fieldInfo,
         final FlatVectorsScorer flatVectorsScorer,
-        final InlineNeighborLists inlineNeighbors
+        final InlineNeighborLists inlineNeighbors,
+        final KnnIo.LazyCachedInput cachedIndexInput
     ) {
         this.indexInput = indexInput;
         this.inlineNeighbors = inlineNeighbors;
+        this.cachedIndexInput = cachedIndexInput;
         this.faissIndex = faissIndex;
         // Faiss's on-disk format only stores METRIC_INNER_PRODUCT or METRIC_L2; there is no
         // cosine metric. Cosinesimil indices are written as IP on L2-normalized vectors, so
@@ -207,7 +213,7 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
 
     @Override
     public void close() throws IOException {
-        indexInput.close();
+        IOUtils.close(indexInput, cachedIndexInput);
     }
 
     private void search(
@@ -243,7 +249,7 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
             if (knnCollector.k() < scorer.maxOrd()) {
                 final FaissHnswGraph graph = new FaissHnswGraph(
                     hnsw,
-                    indexInput.clone(),
+                    cachedIndexInput == null ? indexInput.clone() : cachedIndexInput.select(indexInput, 0, indexInput.length()),
                     inlineNeighbors != null && KNNSettings.isInlineNeighborsEnabled() ? inlineNeighbors.clone() : null
                 );
                 final int beamWidth = KNNSettings.getMemoryOptimizedBeamWidth();

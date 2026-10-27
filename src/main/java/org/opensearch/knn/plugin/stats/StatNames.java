@@ -54,6 +54,7 @@ public enum StatNames {
     REFRESH("refresh"),
     MERGE("merge"),
     REMOTE_VECTOR_INDEX_BUILD_STATS("remote_vector_index_build_stats"),
+    IO_BLOCK_CACHE_STATS("io_block_cache_stats"),
     CLIENT_STATS("client_stats"),
     REPOSITORY_STATS("repository_stats"),
     BUILD_STATS("build_stats"),

@@ -28,6 +28,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManagerDto;
@@ -132,6 +133,8 @@ public class KNNSettings {
     public static final String KNN_PREFETCH_DIRECT_MADVISE_ENABLED = "knn.prefetch.direct_madvise.enabled";
     public static final String KNN_PREFETCH_MERGE_GAP_BYTES = "knn.prefetch.merge_gap_bytes";
     public static final String KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED = "knn.locality.inline_neighbors.enabled";
+    public static final String KNN_IO_BACKEND = "knn.io.backend";
+    public static final String KNN_IO_BLOCK_CACHE_PERCENT = "knn.io.block_cache.percent";
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -573,6 +576,28 @@ public class KNNSettings {
         Dynamic
     );
 
+    /**
+     * How memory optimized search reads k-NN vector files: {@code mmap} (default) through the page cache, or
+     * {@code io_uring}, O_DIRECT reads into the k-NN block cache. Falls back to mmap where io_uring is unavailable.
+     */
+    public static final Setting<String> KNN_IO_BACKEND_SETTING = Setting.simpleString(KNN_IO_BACKEND, KnnIo.MMAP, value -> {
+        if (KnnIo.MMAP.equals(value) == false && KnnIo.IO_URING.equals(value) == false) {
+            throw new IllegalArgumentException(
+                KNN_IO_BACKEND + " must be [" + KnnIo.MMAP + "] or [" + KnnIo.IO_URING + "], got [" + value + "]"
+            );
+        }
+    }, NodeScope, Dynamic);
+
+    /** Size of the io_uring backend's block cache, as a percent of the node's k-NN vector data, in (0, 100]. */
+    public static final Setting<Double> KNN_IO_BLOCK_CACHE_PERCENT_SETTING = Setting.doubleSetting(
+        KNN_IO_BLOCK_CACHE_PERCENT,
+        25.0,
+        Double.MIN_VALUE,
+        100.0,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<Boolean> KNN_DYNAMIC_MAPPING_ENABLED_SETTING = Setting.boolSetting(
         KNN_DYNAMIC_MAPPING_ENABLED,
         false,
@@ -764,6 +789,14 @@ public class KNNSettings {
             return KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING;
         }
 
+        if (KNN_IO_BACKEND.equals(key)) {
+            return KNN_IO_BACKEND_SETTING;
+        }
+
+        if (KNN_IO_BLOCK_CACHE_PERCENT.equals(key)) {
+            return KNN_IO_BLOCK_CACHE_PERCENT_SETTING;
+        }
+
         if (ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD.equals(key)) {
             return ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD_SETTING;
         }
@@ -890,7 +923,9 @@ public class KNNSettings {
             KNN_RESCORE_PREFETCH_ENABLED_SETTING,
             KNN_PREFETCH_DIRECT_MADVISE_ENABLED_SETTING,
             KNN_PREFETCH_MERGE_GAP_BYTES_SETTING,
-            KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING
+            KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED_SETTING,
+            KNN_IO_BACKEND_SETTING,
+            KNN_IO_BLOCK_CACHE_PERCENT_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1213,6 +1248,14 @@ public class KNNSettings {
 
     public static boolean isInlineNeighborsEnabled() {
         return KNNSettings.state().getSettingValue(KNN_LOCALITY_INLINE_NEIGHBORS_ENABLED);
+    }
+
+    public static String getIoBackend() {
+        return KNNSettings.state().getSettingValue(KNN_IO_BACKEND);
+    }
+
+    public static double getBlockCachePercent() {
+        return KNNSettings.state().getSettingValue(KNN_IO_BLOCK_CACHE_PERCENT);
     }
 
     public static boolean isReOrderingEnabled(@NonNull final IndexSettings indexSettings) {

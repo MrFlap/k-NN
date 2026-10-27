@@ -304,6 +304,20 @@ public class PrefetchHelperTests extends KNNTestCase {
         }
     }
 
+    public void testPrefetch_whenMergedGroupWouldTouchMoreThan64Pages_thenSplits() throws IOException {
+        try (
+            MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);
+            MockedStatic<KNNSettings> settings = mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)
+        ) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+            settings.when(KNNSettings::getPrefetchMergeGapBytes).thenReturn(16 * 1024);
+            TrackingIndexInput trackingInput = createTrackingInput(2 * 1024 * 1024);
+            // 256 KiB of bytes from offset 100, but 65 pages: the last range starts a new group.
+            PrefetchHelper.prefetchRanges(trackingInput, new long[] { 100, 100 + 252 * 1024 }, 2, 4096, PrefetchHelper.Grouping.NONE);
+            assertEquals(2, trackingInput.prefetchCalls.size());
+        }
+    }
+
     public void testPrefetchBasedOnOrdinals_whenMergeGapSet_thenMergesAcrossBlocks() throws IOException {
         try (
             MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class);

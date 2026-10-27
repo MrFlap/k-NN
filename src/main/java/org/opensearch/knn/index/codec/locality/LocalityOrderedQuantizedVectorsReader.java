@@ -27,6 +27,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.IOSupplier;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.StringHelper;
@@ -40,6 +41,7 @@ import org.apache.lucene.util.quantization.QuantizedVectorsReader;
 import org.apache.lucene.util.quantization.ScalarQuantizer;
 import org.opensearch.knn.index.codec.KNN1040Codec.ScalarQuantizedFloatVectorValues;
 import org.opensearch.knn.index.codec.scorer.PageTouchTracker;
+import org.opensearch.knn.index.io.KnnIo;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
 import java.io.IOException;
@@ -96,17 +98,36 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
     private final FlatVectorsReader rawFlatVectorsReader;
     private final Lucene104ScalarQuantizedVectorScorer quantizedVectorScorer;
     private final Map<String, FieldEntry> fields = new HashMap<>();
+    // The io_uring backend's views: .veqlo through the block cache, and a raw reader whose .vec goes through it.
+    private final KnnIo.LazyCachedInput cachedData;
+    private final IOSupplier<FlatVectorsReader> cachedRawReaderSupplier;
+    private volatile FlatVectorsReader cachedRawReader;
 
     public LocalityOrderedQuantizedVectorsReader(
         final SegmentReadState state,
         final FlatVectorsReader rawFlatVectorsReader,
         final Lucene104ScalarQuantizedVectorScorer quantizedVectorScorer
     ) throws IOException {
+        this(state, rawFlatVectorsReader, quantizedVectorScorer, null);
+    }
+
+    /**
+     * @param cachedRawReaderSupplier opens the raw reader the io_uring backend reads full-precision vectors with, on
+     *                                first use; null to always use {@code rawFlatVectorsReader}
+     */
+    public LocalityOrderedQuantizedVectorsReader(
+        final SegmentReadState state,
+        final FlatVectorsReader rawFlatVectorsReader,
+        final Lucene104ScalarQuantizedVectorScorer quantizedVectorScorer,
+        final IOSupplier<FlatVectorsReader> cachedRawReaderSupplier
+    ) throws IOException {
         final String dataFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, EXTENSION);
         final String metaFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, METADATA_EXTENSION);
         this.segmentReadState = state;
         this.rawFlatVectorsReader = rawFlatVectorsReader;
         this.quantizedVectorScorer = quantizedVectorScorer;
+        this.cachedData = new KnnIo.LazyCachedInput(state.directory, dataFileName);
+        this.cachedRawReaderSupplier = cachedRawReaderSupplier;
 
         boolean success = false;
         IndexInput meta = null;
@@ -272,6 +293,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             centroid,
             ordToPhysicalOrdMap,
             dataSlice,
+            dataOffset,
             hubOrdinals,
             hubValues
         );
@@ -293,7 +315,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
     @Override
     public void close() throws IOException {
         // Close our own meta + data inputs and the raw flat vectors reader we own (holds the .vec handle).
-        IOUtils.close(metaInput, dataInput, rawFlatVectorsReader);
+        IOUtils.close(metaInput, dataInput, rawFlatVectorsReader, cachedData, cachedRawReader);
     }
 
     @Override
@@ -339,7 +361,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
 
     @Override
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
-        final FloatVectorValues floatVectorValues = rawFlatVectorsReader.getFloatVectorValues(field);
+        final FloatVectorValues floatVectorValues = rawReader().getFloatVectorValues(field);
         if (floatVectorValues == null) {
             return null;
         }
@@ -349,6 +371,30 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         }
 
         return new ScalarQuantizedFloatVectorValues(floatVectorValues, getQuantizedVectorValues(field));
+    }
+
+    /**
+     * The raw reader for this search: on the io_uring backend the one reading {@code .vec} through the block cache.
+     */
+    // shortcut: merges and exact search also read .vec and .veqlo through the block cache while the
+    // backend is io_uring; route getMergeInstance() to the mmap reader if merges run during io_uring benchmarks.
+    private FlatVectorsReader rawReader() throws IOException {
+        if (cachedRawReaderSupplier == null || KnnIo.useIoUring() == false) {
+            return rawFlatVectorsReader;
+        }
+        if (cachedRawReader == null) {
+            synchronized (this) {
+                if (cachedRawReader == null) {
+                    cachedRawReader = cachedRawReaderSupplier.get();
+                }
+            }
+        }
+        return cachedRawReader;
+    }
+
+    /** This search's view of the field's records: mmap, or through the block cache on the io_uring backend. */
+    private IndexInput records(final FieldEntry entry) throws IOException {
+        return cachedData.select(entry.dataSlice, entry.dataOffset, entry.dataSlice.length());
     }
 
     @Override
@@ -376,7 +422,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             return null;
         }
         return new InlineNeighborLists(
-            entry.dataSlice.clone(),
+            () -> records(entry),
             entry.layout,
             entry.codeLength,
             entry.neighborSlots,
@@ -444,7 +490,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
     private LocalityOrderedQuantizedByteVectorValues createValues(final String field, final FieldEntry entry, final int[] ordinalMap)
         throws IOException {
         final FieldInfo fieldInfo = segmentReadState.fieldInfos.fieldInfo(field);
-        final FloatVectorValues floatVectorValues = rawFlatVectorsReader.getFloatVectorValues(field);
+        final FloatVectorValues floatVectorValues = rawReader().getFloatVectorValues(field);
         final VectorSimilarityFunction similarity = fieldInfo.getVectorSimilarityFunction();
         final OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(similarity);
         return new LocalityOrderedQuantizedByteVectorValues(
@@ -459,7 +505,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             similarity,
             quantizedVectorScorer,
             ordinalMap,
-            entry.dataSlice.clone(),
+            records(entry),
             floatVectorValues
         );
     }
@@ -567,6 +613,8 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
         final float[] centroid;
         /** Bounded view over the record region, addressed by physical ordinal. */
         final IndexInput dataSlice;
+        /** Offset of {@link #dataSlice} in the records file. */
+        final long dataOffset;
 
         /** Original (insertion-order) ordinal -&gt; physical position of its record in {@link #dataSlice}. */
         final int[] ordToPhysicalOrdMap;
@@ -588,6 +636,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             final float[] centroid,
             final int[] ordToPhysicalOrdMap,
             final IndexInput dataSlice,
+            final long dataOffset,
             final int[] hubOrdinals,
             final QuantizedByteVectorValues hubValues
         ) {
@@ -601,6 +650,7 @@ public final class LocalityOrderedQuantizedVectorsReader extends FlatVectorsRead
             this.scalarEncoding = scalarEncoding;
             this.centroid = centroid;
             this.dataSlice = dataSlice;
+            this.dataOffset = dataOffset;
             this.ordToPhysicalOrdMap = ordToPhysicalOrdMap;
             this.hubOrdinals = hubOrdinals;
             this.hubValues = hubValues;

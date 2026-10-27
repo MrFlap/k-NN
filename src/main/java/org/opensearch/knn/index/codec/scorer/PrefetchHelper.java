@@ -13,6 +13,7 @@ import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.util.Constants;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.io.KnnIo;
 
 import java.io.IOException;
 import java.lang.invoke.MethodHandle;
@@ -47,7 +48,10 @@ public class PrefetchHelper {
 
     /** The fixed prefetch group window; the layer-0 locality ordering sizes its clusters to it too. */
     public static final long BYTES_32 = 32 * 1024;
-    /** gp3 counts an IO of up to 256 KiB as one operation, and the kernel reads ahead at most that much per call. */
+    /**
+     * gp3 counts an IO of up to 256 KiB as one operation, and the kernel reads ahead at most that much per call. A merged
+     * group's pages stay within it, so the io_uring backend reads the group as one IO.
+     */
     static final long MAX_MERGED_BYTES = 256 * 1024;
 
     /** The fixed grouping a batch gets regardless of {@code knn.prefetch.merge_gap_bytes}. */
@@ -163,6 +167,11 @@ public class PrefetchHelper {
         return starts;
     }
 
+    /** Bytes of the 4 KB pages {@code [start, end)} touches: what the io_uring backend reads as one IO. */
+    private static long pageSpan(final long start, final long end) {
+        return ((end + 4095) & -4096L) - (start & -4096L);
+    }
+
     /** Sorts the ranges, groups them, and issues one {@link #prefetchRange} per group. */
     private static void prefetchGrouped(
         final IndexInput indexInput,
@@ -184,7 +193,7 @@ public class PrefetchHelper {
                 case BLOCK_32KB -> start / BYTES_32 == groupStart / BYTES_32;
                 case NONE -> false;
             };
-            if (fixed || (mergeGap > 0 && start - groupEnd <= mergeGap && end - groupStart <= MAX_MERGED_BYTES)) {
+            if (fixed || (mergeGap > 0 && start - groupEnd <= mergeGap && pageSpan(groupStart, end) <= MAX_MERGED_BYTES)) {
                 groupEnd = Math.max(groupEnd, end);
                 continue;
             }
@@ -194,6 +203,7 @@ public class PrefetchHelper {
             groupEnd = end;
         }
         prefetchRange(indexInput, groupStart, groupEnd - groupStart);
+        KnnIo.recordPrefetchBatch(indexInput);
         log.trace("Prefetching [{}] groups from [{}] ranges of [{}] bytes, grouping [{}]", groupCount, numRanges, length, grouping);
     }
 
