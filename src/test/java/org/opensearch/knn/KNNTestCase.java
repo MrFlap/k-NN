@@ -110,6 +110,8 @@ public class KNNTestCase extends OpenSearchTestCase {
             for (int i = 0; i < 10 && terminate(threadPool) == false; ++i) {
                 Thread.sleep(500);
             }
+            // A cache built later must not schedule on the terminated pool; which suite builds it depends on suite order.
+            f.set(null, null);
         }
     }
 
