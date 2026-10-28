@@ -8,7 +8,9 @@ package org.opensearch.knn.index.io;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.util.Constants;
 
+import java.io.IOException;
 import java.lang.invoke.MethodHandle;
+import java.lang.ref.Cleaner;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
@@ -33,6 +35,7 @@ final class NativeIo {
 
     private static final MethodHandle SYSCALL; // (long nr, long a1..a6) -> long
     private static final MethodHandle MMAP; // (long addr, long len, int prot, int flags, int fd, long off) -> long
+    private static final MethodHandle MUNMAP; // (long addr, long len) -> int
     private static final MethodHandle OPEN; // (long path, int flags) -> int
     private static final MethodHandle CLOSE; // (int fd) -> int
     private static final MethodHandle OF_ADDRESS; // (long) -> MemorySegment
@@ -52,8 +55,8 @@ final class NativeIo {
 
     static {
         String unavailable = null;
-        MethodHandle syscall = null, mmap = null, open = null, close = null, ofAddress = null, asSlice = null, asByteBuffer = null,
-            segmentAddress = null, ofAuto = null, allocate = null;
+        MethodHandle syscall = null, mmap = null, munmap = null, open = null, close = null, ofAddress = null, asSlice = null,
+            asByteBuffer = null, segmentAddress = null, ofAuto = null, allocate = null;
         Method reinterpret = null;
         if (Constants.LINUX == false || Constants.JRE_IS_64BIT == false || O_DIRECT == 0) {
             unavailable = "needs 64-bit Linux on x86_64 or aarch64";
@@ -93,6 +96,12 @@ final class NativeIo {
                     descriptorOf.invoke(null, javaLong, layouts(layoutClass, javaLong, javaLong, javaInt, javaInt, javaInt, javaLong)),
                     noOptions
                 );
+                munmap = (MethodHandle) downcall.invoke(
+                    linker,
+                    ((Optional<?>) find.invoke(libc, "munmap")).orElseThrow(),
+                    descriptorOf.invoke(null, javaInt, layouts(layoutClass, javaLong, javaLong)),
+                    noOptions
+                );
                 open = (MethodHandle) downcall.invoke(
                     linker,
                     ((Optional<?>) find.invoke(libc, "open")).orElseThrow(),
@@ -128,6 +137,7 @@ final class NativeIo {
         UNAVAILABLE = unavailable;
         SYSCALL = syscall;
         MMAP = mmap;
+        MUNMAP = munmap;
         OPEN = open;
         CLOSE = close;
         OF_ADDRESS = ofAddress;
@@ -196,7 +206,40 @@ final class NativeIo {
         }
     }
 
-    /** Zeroed, page-aligned off-heap memory, freed by the GC once unreachable. */
+    private static final Cleaner CLEANER = Cleaner.create();
+    private static final int PROT_READ_WRITE = 0x3;
+    private static final int MAP_PRIVATE_ANONYMOUS = 0x02 | 0x20; // same on x86_64 and aarch64
+
+    /**
+     * Zeroed anonymous memory from {@code mmap}, outside the JVM's direct memory limit, and committed only as it is
+     * touched. It is unmapped once the returned {@link Memory} is unreachable.
+     *
+     * @throws IOException if the mapping fails
+     */
+    static Memory mapAnonymous(final long size) throws IOException {
+        final long address = mmap(size, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
+        if (address == -1L) {
+            throw new IOException("mmap of " + size + " anonymous bytes failed");
+        }
+        try {
+            final Memory memory = new Memory(REINTERPRET.invoke((Object) OF_ADDRESS.invokeExact(address), size), address);
+            CLEANER.register(memory, () -> unmap(address, size));
+            return memory;
+        } catch (Throwable t) {
+            unmap(address, size);
+            throw new IOException("Could not map " + size + " anonymous bytes", t);
+        }
+    }
+
+    private static void unmap(final long address, final long size) {
+        try {
+            final int ignored = (int) MUNMAP.invokeExact(address, size);
+        } catch (Throwable t) {
+            log.warn("munmap of {} bytes failed", size, t);
+        }
+    }
+
+    /** Zeroed, page-aligned off-heap memory, freed by the GC once unreachable. Counts against direct memory. */
     static Memory allocate(final long size) {
         try {
             final Object segment = (Object) ALLOCATE.invokeExact((Object) OF_AUTO.invokeExact(), size, (long) PAGE);

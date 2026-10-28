@@ -90,7 +90,7 @@ final class IoUring {
             sq.putInt(sqArray + i * Integer.BYTES, i);
         }
         this.tail = (int) INT.getAcquire(sq, sqTail);
-        this.staging = NativeIo.allocate((long) entries * STAGING_BYTES);
+        this.staging = NativeIo.mapAnonymous((long) entries * STAGING_BYTES);
         this.stagingBuffers = new ByteBuffer[entries];
         this.completions = new Completion[entries];
         this.freeIds = new ArrayBlockingQueue<>(entries);

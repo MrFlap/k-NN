@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.util.ThreadInterruptedException;
 
 import java.io.IOException;
+import java.lang.ref.Reference;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicIntegerArray;
@@ -60,10 +61,14 @@ final class BlockCache {
     private final LongAdder ioBytes = new LongAdder();
     private final AtomicLong usedPages = new AtomicLong();
 
-    BlockCache(final long capacityBytes, final IoUring ring) {
+    /**
+     * @throws IOException if the memory cannot be mapped; the memory is outside the direct memory limit and unmapped
+     *                     once this cache is unreachable
+     */
+    BlockCache(final long capacityBytes, final IoUring ring) throws IOException {
         this.numSlots = Math.toIntExact(Math.max(MAX_IO_PAGES, capacityBytes / PAGE));
         this.capacityBytes = (long) numSlots * PAGE;
-        this.memory = NativeIo.allocate(this.capacityBytes);
+        this.memory = NativeIo.mapAnonymous(this.capacityBytes);
         this.chunks = new ByteBuffer[(numSlots + CHUNK_PAGES - 1) / CHUNK_PAGES];
         for (int c = 0; c < chunks.length; c++) {
             final int pages = Math.min(CHUNK_PAGES, numSlots - c * CHUNK_PAGES);
@@ -138,6 +143,7 @@ final class BlockCache {
             }
             referenced[s] = 1;
             (submitted ? misses : hits).increment();
+            Reference.reachabilityFence(this); // keeps the mapping alive through the copy
             return;
         }
         throw new IOException("Could not read page " + page + " of " + file.name + " through the block cache");

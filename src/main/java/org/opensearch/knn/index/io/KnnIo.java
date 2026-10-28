@@ -59,6 +59,14 @@ public final class KnnIo {
     private static volatile IoUring ring;
     private static volatile String unavailable;
     private static volatile BlockCache cache;
+    // A target capacity whose allocation failed; not retried until the target changes.
+    private static volatile long failedTarget = -1;
+
+    interface CacheFactory {
+        BlockCache create(long capacityBytes, IoUring ring) throws IOException;
+    }
+
+    private static volatile CacheFactory cacheFactory = BlockCache::new;
     private static volatile Boolean availableForTesting;
 
     private KnnIo() {}
@@ -161,7 +169,8 @@ public final class KnnIo {
 
     /**
      * The block cache, allocated on first use and reallocated when its target capacity moves by more than 10%; null
-     * when io_uring is unavailable.
+     * when io_uring is unavailable or the allocation failed. One thread allocates at a time; a replaced cache is
+     * unmapped once the searches still reading it finish and it becomes unreachable.
      */
     static BlockCache blockCache() {
         final IoUring r = ring();
@@ -175,8 +184,11 @@ public final class KnnIo {
         if (current != null && Math.abs(current.capacityBytes - target) <= current.capacityBytes / 10) {
             return current;
         }
+        if (target == failedTarget) {
+            return current;
+        }
         synchronized (KnnIo.class) {
-            if (cache == null || Math.abs(cache.capacityBytes - target) > cache.capacityBytes / 10) {
+            if (target != failedTarget && (cache == null || Math.abs(cache.capacityBytes - target) > cache.capacityBytes / 10)) {
                 // shortcut: a resize drops the cache and starts a new one; inputs opened before keep the old one until
                 // their search ends, and the GC frees it. Fine for benchmark sweeps; warm a resized cache before measuring.
                 if (requested(percent, vectorData) > ramLimit(PHYSICAL_BYTES, MAX_HEAP_BYTES)) {
@@ -187,7 +199,13 @@ public final class KnnIo {
                     );
                 }
                 log.info("Allocating a [{}] byte k-NN block cache for [{}] bytes of vector data", target, vectorData);
-                cache = new BlockCache(target, r);
+                try {
+                    cache = cacheFactory.create(target, r);
+                } catch (Throwable t) {
+                    // Never let a failed allocation take the node down: keep the old cache, or none (mmap reads).
+                    failedTarget = target;
+                    log.error("Could not allocate a [{}] byte k-NN block cache; keeping the previous one or mmap reads", target, t);
+                }
             }
             return cache;
         }
@@ -216,6 +234,14 @@ public final class KnnIo {
             }
             return ring;
         }
+    }
+
+    /** Replaces how caches are allocated, and drops the current cache; null restores the default. */
+    @VisibleForTesting
+    static synchronized void setCacheFactoryForTesting(final CacheFactory factory) {
+        cacheFactory = factory == null ? BlockCache::new : factory;
+        cache = null;
+        failedTarget = -1;
     }
 
     /** Forces io_uring unavailable ({@code false}), or back to probing ({@code null}). */

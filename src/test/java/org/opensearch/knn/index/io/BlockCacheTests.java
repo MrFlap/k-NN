@@ -214,6 +214,7 @@ public class BlockCacheTests extends KNNTestCase {
 
     public void testBlockCache_whenPercentChanges_thenReallocated() {
         ring();
+        KnnIo.setCacheFactoryForTesting(null);
         final long vectorData = 4L << 30;
         KnnIo.addVectorData(vectorData);
         try (MockedStatic<KNNSettings> settings = Mockito.mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)) {
@@ -229,6 +230,94 @@ public class BlockCacheTests extends KNNTestCase {
         } finally {
             KnnIo.addVectorData(-vectorData);
         }
+    }
+
+    public void testBlockCache_whenLargerThanDirectMemoryLimit_thenMappedOutsideIt() throws IOException {
+        final java.lang.management.BufferPoolMXBean direct = java.lang.management.ManagementFactory.getPlatformMXBeans(
+            java.lang.management.BufferPoolMXBean.class
+        ).stream().filter(pool -> pool.getName().equals("direct")).findFirst().orElseThrow();
+        // The default MaxDirectMemorySize is the max heap; ask for twice that.
+        final long capacity = 2 * Runtime.getRuntime().maxMemory();
+        final long directBefore = direct.getMemoryUsed();
+        try (FSDirectory dir = directoryWithFile("f", 10 * PAGE); DirectFile file = DirectFile.open(dir, "f")) {
+            final BlockCache cache = new BlockCache(capacity, ring());
+            assertEquals(capacity, cache.capacityBytes);
+            assertTrue("cache must not use direct memory", direct.getMemoryUsed() - directBefore < capacity / 4);
+            final byte[] buffer = new byte[10 * PAGE];
+            cache.read(file, 0, buffer, 0, buffer.length);
+            assertBytes(buffer, 0, buffer.length);
+        }
+    }
+
+    public void testBlockCache_whenAllocationFails_thenNoErrorAndNoRetryForSameTarget() {
+        ring();
+        final java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        KnnIo.setCacheFactoryForTesting((capacity, r) -> {
+            attempts.incrementAndGet();
+            throw new OutOfMemoryError("Cannot reserve " + capacity + " bytes of direct buffer memory");
+        });
+        try (MockedStatic<KNNSettings> settings = Mockito.mockStatic(KNNSettings.class, Mockito.CALLS_REAL_METHODS)) {
+            settings.when(KNNSettings::getIoBackend).thenReturn(KnnIo.IO_URING);
+            assertNull(KnnIo.blockCache());
+            assertFalse("reads fall back to mmap", KnnIo.useIoUring());
+            assertEquals(1, attempts.get());
+        } finally {
+            KnnIo.setCacheFactoryForTesting(null);
+        }
+    }
+
+    public void testBlockCache_whenConcurrentFirstUseAndResize_thenOneAllocationPerTarget() throws Exception {
+        final IoUring r = ring();
+        final java.util.concurrent.atomic.AtomicInteger allocations = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger maxInFlight = new java.util.concurrent.atomic.AtomicInteger();
+        KnnIo.setCacheFactoryForTesting((capacity, ring) -> {
+            maxInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+            try {
+                allocations.incrementAndGet();
+                Thread.sleep(50); // widen the race
+                return new BlockCache(capacity, ring);
+            } catch (InterruptedException e) {
+                throw new IOException(e);
+            } finally {
+                inFlight.decrementAndGet();
+            }
+        });
+        final long gb = 1L << 30;
+        KnnIo.addVectorData(gb);
+        final ExecutorService pool = Executors.newFixedThreadPool(16);
+        try {
+            final BlockCache first = allConcurrently(pool);
+            assertEquals(1, allocations.get());
+            KnnIo.addVectorData(gb); // the target doubles: one resize
+            final BlockCache second = allConcurrently(pool);
+            assertNotSame(first, second);
+            assertEquals(2, allocations.get());
+            assertEquals(1, maxInFlight.get());
+            assertSame(second, KnnIo.blockCache());
+        } finally {
+            pool.shutdownNow();
+            KnnIo.addVectorData(-2 * gb);
+            KnnIo.setCacheFactoryForTesting(null);
+        }
+    }
+
+    /** Calls {@link KnnIo#blockCache()} from 16 threads at once and checks they all got the same cache. */
+    private static BlockCache allConcurrently(final ExecutorService pool) throws Exception {
+        final java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(16);
+        final List<Future<BlockCache>> futures = new ArrayList<>();
+        for (int t = 0; t < 16; t++) {
+            futures.add(pool.submit(() -> {
+                start.await();
+                return KnnIo.blockCache();
+            }));
+        }
+        final BlockCache cache = futures.get(0).get();
+        assertNotNull(cache);
+        for (Future<BlockCache> future : futures) {
+            assertSame(cache, future.get());
+        }
+        return cache;
     }
 
     public void testUseIoUring_whenUnavailable_thenFallsBackToMMap() throws IOException {
