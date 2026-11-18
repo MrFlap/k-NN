@@ -126,6 +126,7 @@ if (${CONFIG_FAISS} STREQUAL ON OR ${CONFIG_ALL} STREQUAL ON OR ${CONFIG_TEST} S
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_wrapper.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_util.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_index_service.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_hashprune.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/faiss_methods.cpp
     )
     target_link_libraries(${TARGET_LIB_FAISS} ${TARGET_LINK_FAISS_LIB} ${TARGET_LIB_UTIL} OpenMP::OpenMP_CXX)
@@ -216,6 +217,7 @@ if ("${WIN32}" STREQUAL "")
                 tests/commons_test.cpp
                 tests/faiss_stream_support_test.cpp
                 tests/faiss_index_service_test.cpp
+                tests/faiss_hashprune_test.cpp
                 tests/nmslib_stream_support_test.cpp
                 tests/faiss_index_bq_unit_test.cpp
                 tests/faiss_sq_distance_computer_test.cpp

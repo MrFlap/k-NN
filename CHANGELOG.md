@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * Add SQ 2-bit and 4-bit for half_float [#3603](https://github.com/opensearch-project/k-NN/pull/3603)
 * Validate the remote index build artifact extension against the destination engine's extension instead of hardcoding Faiss, so non-Faiss engines (e.g. cuVS) are not rejected [#3662](https://github.com/opensearch-project/k-NN/pull/3662)
 * Add bulk SIMD scoring for SQ 2-bit and 4-bit HNSW search with runtime-dispatched kernels [#3669](https://github.com/opensearch-project/k-NN/pull/3669)
+* Add `build_algorithm: hashprune` Faiss HNSW method parameter that builds the graph PiPNN-style (partitioned leaf kNN merged with HashPrune) instead of incremental insertion
 
 ### Maintenance
 * Establish a separate Mend dependency baseline for the 2.19 maintenance branch [#3665](https://github.com/opensearch-project/k-NN/pull/3665).

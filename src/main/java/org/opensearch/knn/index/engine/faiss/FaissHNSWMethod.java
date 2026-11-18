@@ -27,16 +27,20 @@ import org.opensearch.remoteindexbuild.model.RemoteIndexParameters;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.opensearch.knn.common.KNNConstants.BUILD_ALGORITHM_HASHPRUNE;
+import static org.opensearch.knn.common.KNNConstants.BUILD_ALGORITHM_HNSW;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.FAISS_HNSW_DESCRIPTION;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
+import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_BUILD_ALGORITHM;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_EF_CONSTRUCTION;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_EF_SEARCH;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_M;
@@ -95,6 +99,18 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
 
     @Override
     public ValidationException validate(KNNMethodContext knnMethodContext, KNNMethodConfigContext knnMethodConfigContext) {
+        if (usesHashPrune(knnMethodContext) && supportsHashPrune(knnMethodContext, knnMethodConfigContext) == false) {
+            ValidationException validationException = new ValidationException();
+            validationException.addValidationError(
+                String.format(
+                    Locale.ROOT,
+                    "\"%s\": \"%s\" is only supported for float vectors with the flat encoder or the sq encoder with 1, 2 or 4 bits",
+                    METHOD_PARAMETER_BUILD_ALGORITHM,
+                    BUILD_ALGORITHM_HASHPRUNE
+                )
+            );
+            return validationException;
+        }
         if (knnMethodConfigContext.getVectorDataType() == VectorDataType.HALF_FLOAT && resolvesToSqFp16(knnMethodContext)) {
             ValidationException validationException = new ValidationException();
             validationException.addValidationError(
@@ -105,6 +121,29 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
             return validationException;
         }
         return super.validate(knnMethodContext, knnMethodConfigContext);
+    }
+
+    private static boolean usesHashPrune(KNNMethodContext knnMethodContext) {
+        return knnMethodContext != null
+            && knnMethodContext.getMethodComponentContext() != null
+            && BUILD_ALGORITHM_HASHPRUNE.equals(
+                knnMethodContext.getMethodComponentContext().getParameters().get(METHOD_PARAMETER_BUILD_ALGORITHM)
+            );
+    }
+
+    // The native HashPrune builder covers float vectors stored flat (any space type) or as Lucene scalar-quantized codes
+    // with 1, 2 or 4 bits; fp16 SQ, PQ and the binary quantization framework build through other index types.
+    private boolean supportsHashPrune(KNNMethodContext knnMethodContext, KNNMethodConfigContext knnMethodConfigContext) {
+        if (knnMethodConfigContext.getVectorDataType() != VectorDataType.FLOAT) {
+            return false;
+        }
+        MethodComponentContext encoderContext = getEncoderComponentContext(knnMethodContext);
+        if (encoderContext == null || ENCODER_FLAT.equals(encoderContext.getName())) {
+            return true;
+        }
+        return ENCODER_SQ.equals(encoderContext.getName())
+            && encoderContext.getParameters().get(SQ_BITS) instanceof Integer bits
+            && (bits == 1 || bits == 2 || bits == 4);
     }
 
     private boolean resolvesToSqFp16(KNNMethodContext knnMethodContext) {
@@ -137,6 +176,15 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
                     METHOD_PARAMETER_EF_SEARCH,
                     KNNSettings.INDEX_KNN_DEFAULT_ALGO_PARAM_EF_SEARCH,
                     (v, context) -> v > 0
+                )
+            )
+            .addParameter(
+                METHOD_PARAMETER_BUILD_ALGORITHM,
+                // no default: unset keeps mappings unchanged and builds with regular HNSW insertion
+                new Parameter.StringParameter(
+                    METHOD_PARAMETER_BUILD_ALGORITHM,
+                    null,
+                    (v, context) -> BUILD_ALGORITHM_HNSW.equals(v) || BUILD_ALGORITHM_HASHPRUNE.equals(v)
                 )
             )
             .addParameter(METHOD_ENCODER_PARAMETER, initEncoderParameter())

@@ -27,6 +27,8 @@
 #include <arm_neon.h>
 #if defined(__linux__)
 #include <sys/auxv.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 #endif
 
@@ -456,6 +458,10 @@ namespace knn_jni {
 #endif
 #elif defined(__aarch64__) && defined(__linux__)
             f.neonDotProd = (getauxval(AT_HWCAP) & KNN_SQ_HWCAP_ASIMDDP) != 0;
+#elif defined(__aarch64__) && defined(__APPLE__)
+            int dotProd = 0;
+            size_t size = sizeof(dotProd);
+            f.neonDotProd = sysctlbyname("hw.optional.arm.FEAT_DotProd", &dotProd, &size, nullptr, 0) == 0 && dotProd != 0;
 #endif
             return f;
         }();
@@ -881,7 +887,7 @@ namespace knn_jni {
 
     // B=4 with the Armv8.2 dot-product extension: udot sums four u8 x u8 products into each u32
     // lane, so a 16-byte block is two udot instructions (low nibbles, high nibbles). Compiled for
-    // armv8.2-a+dotprod at function level and only selected when HWCAP_ASIMDDP is set.
+    // armv8.2-a+dotprod at function level and only selected when HWCAP_ASIMDDP (Linux) or FEAT_DotProd (macOS) is set.
 #define KNN_SQ_DOTPROD_TARGET __attribute__((target("arch=armv8.2-a+dotprod")))
     KNN_SQ_DOTPROD_TARGET static inline uint32_t sqNibbleDpNeonDotProd(const uint8_t* a, const uint8_t* b, uint64_t n) {
         const uint8x16_t mask = vdupq_n_u8(0x0F);

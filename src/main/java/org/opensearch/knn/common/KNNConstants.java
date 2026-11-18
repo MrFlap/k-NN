@@ -35,6 +35,9 @@ public class KNNConstants {
     public static final String METHOD_PARAMETER = "method_parameters";
     public static final String METHOD_PARAMETER_EF_SEARCH = "ef_search";
     public static final String METHOD_PARAMETER_EF_CONSTRUCTION = "ef_construction";
+    public static final String METHOD_PARAMETER_BUILD_ALGORITHM = "build_algorithm";
+    public static final String BUILD_ALGORITHM_HNSW = "hnsw";
+    public static final String BUILD_ALGORITHM_HASHPRUNE = "hashprune";
     public static final String METHOD_PARAMETER_M = "m";
     public static final String METHOD_IVF = "ivf";
     public static final String METHOD_PARAMETER_NLIST = "nlist";
