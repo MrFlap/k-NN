@@ -166,6 +166,28 @@ TEST(FaissHashPruneTest, IndexServiceUsesHashPruneWhenRequested) {
     ASSERT_EQ(70, labels[0]);
 }
 
+TEST(FaissHashPruneTest, IndexServiceDefaultsToHashPruneWhereSupported) {
+    JNIEnv* jniEnv = nullptr;
+    NiceMock<test_util::MockJNIUtil> mockJNIUtil;
+    knn_jni::faiss_wrapper::IndexService indexService(std::make_unique<knn_jni::faiss_wrapper::FaissMethods>());
+    auto init = [&](const std::string& description, const std::unordered_map<std::string, jobject>& parameters) {
+        return std::unique_ptr<faiss::IndexIDMap>(reinterpret_cast<faiss::IndexIDMap*>(
+            indexService.initIndex(&mockJNIUtil, jniEnv, faiss::METRIC_L2, description, 8, 10, 1, parameters)));
+    };
+
+    // unset: HashPrune for HNSW,Flat, the index type's own build otherwise
+    ASSERT_NE(nullptr, dynamic_cast<IndexHNSWFlatHashPrune*>(init("HNSW16,Flat", {})->index));
+    auto sq = init("HNSW16,SQfp16", {});
+    ASSERT_EQ(nullptr, dynamic_cast<IndexHNSWFlatHashPrune*>(sq->index));
+    ASSERT_NE(nullptr, dynamic_cast<faiss::IndexHNSW*>(sq->index));
+
+    // explicit hnsw opts out
+    std::string hnsw = knn_jni::BUILD_ALGORITHM_HNSW;
+    auto plain = init("HNSW16,Flat", {{knn_jni::BUILD_ALGORITHM, reinterpret_cast<jobject>(&hnsw)}});
+    ASSERT_EQ(nullptr, dynamic_cast<IndexHNSWFlatHashPrune*>(plain->index));
+    ASSERT_NE(nullptr, dynamic_cast<faiss::IndexHNSWFlat*>(plain->index));
+}
+
 TEST(FaissHashPruneTest, IndexServiceRejectsUnsupportedConfigurations) {
     JNIEnv* jniEnv = nullptr;
     NiceMock<test_util::MockJNIUtil> mockJNIUtil;

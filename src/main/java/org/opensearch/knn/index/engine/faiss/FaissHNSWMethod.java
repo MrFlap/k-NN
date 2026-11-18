@@ -180,7 +180,8 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
             )
             .addParameter(
                 METHOD_PARAMETER_BUILD_ALGORITHM,
-                // no default: unset keeps mappings unchanged and builds with regular HNSW insertion
+                // No mapping default, so existing mappings are unchanged. When unset, the native build uses HashPrune
+                // wherever it is supported and regular HNSW insertion otherwise; "hnsw" opts out explicitly.
                 new Parameter.StringParameter(
                     METHOD_PARAMETER_BUILD_ALGORITHM,
                     null,

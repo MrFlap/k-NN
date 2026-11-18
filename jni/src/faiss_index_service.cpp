@@ -56,33 +56,40 @@ void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
     }
 }
 
-// True when build_algorithm=hashprune; absent or "hnsw" keeps incremental HNSW insertion.
-bool UsesHashPrune(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
-                   const std::unordered_map<std::string, jobject>& parametersCpp) {
+enum class BuildAlgorithm { Default, Hnsw, HashPrune };
+
+// build_algorithm: "hnsw" (incremental insertion) or "hashprune"; unset means HashPrune wherever it is supported.
+BuildAlgorithm ParseBuildAlgorithm(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
+                                   const std::unordered_map<std::string, jobject>& parametersCpp) {
     auto value = parametersCpp.find(knn_jni::BUILD_ALGORITHM);
     if (value == parametersCpp.end()) {
-        return false;
+        return BuildAlgorithm::Default;
     }
     const std::string algorithm = jniUtil->ConvertJavaObjectToCppString(env, value->second);
     if (algorithm == knn_jni::BUILD_ALGORITHM_HNSW) {
-        return false;
+        return BuildAlgorithm::Hnsw;
     }
-    if (algorithm != knn_jni::BUILD_ALGORITHM_HASHPRUNE) {
-        throw std::runtime_error("Unsupported " + knn_jni::BUILD_ALGORITHM + ": " + algorithm);
+    if (algorithm == knn_jni::BUILD_ALGORITHM_HASHPRUNE) {
+        return BuildAlgorithm::HashPrune;
     }
-    return true;
+    throw std::runtime_error("Unsupported " + knn_jni::BUILD_ALGORITHM + ": " + algorithm);
 }
 
-// Replaces a factory-built HNSW,Flat with one whose graph is built by HashPrune when build_algorithm=hashprune.
+// Replaces a factory-built HNSW,Flat with one whose graph is built by HashPrune, unless build_algorithm=hnsw. Other
+// index types keep their own build, and an explicit hashprune request for them is an error.
 std::unique_ptr<faiss::Index> ApplyBuildAlgorithm(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
                                                   const std::unordered_map<std::string, jobject>& parametersCpp,
                                                   std::unique_ptr<faiss::Index> index) {
-    if (!UsesHashPrune(jniUtil, env, parametersCpp)) {
+    const BuildAlgorithm algorithm = ParseBuildAlgorithm(jniUtil, env, parametersCpp);
+    if (algorithm == BuildAlgorithm::Hnsw) {
         return index;
     }
     auto * hnswFlat = dynamic_cast<faiss::IndexHNSWFlat *>(index.get());
     if (hnswFlat == nullptr) {
-        throw std::runtime_error(knn_jni::BUILD_ALGORITHM + "=" + knn_jni::BUILD_ALGORITHM_HASHPRUNE + " requires an HNSW,Flat index");
+        if (algorithm == BuildAlgorithm::HashPrune) {
+            throw std::runtime_error(knn_jni::BUILD_ALGORITHM + "=" + knn_jni::BUILD_ALGORITHM_HASHPRUNE + " requires an HNSW,Flat index");
+        }
+        return index;
     }
     return std::make_unique<IndexHNSWFlatHashPrune>(index->d, hnswFlat->hnsw.nb_neighbors(1), index->metric_type);
 }
@@ -265,7 +272,7 @@ jlong BinaryIndexService::initFaissSQIndex(knn_jni::JNIUtilInterface *jniUtil, J
 
     // Add extra parameters that cant be configured with the index factory
     SetExtraParameters<faiss::IndexBinary, faiss::IndexBinaryIVF, faiss::IndexBinaryHNSW>(jniUtil, env, parameters, faissSQHnsw.get());
-    faissSQHnsw->deferGraphBuild = UsesHashPrune(jniUtil, env, parameters);
+    faissSQHnsw->deferGraphBuild = ParseBuildAlgorithm(jniUtil, env, parameters) != BuildAlgorithm::Hnsw;
 
     // Creating id-mapping top layer
     std::unique_ptr<faiss::IndexBinaryIDMap> idMap (faissMethods->indexBinaryIdMap(faissSQHnsw.release()));
