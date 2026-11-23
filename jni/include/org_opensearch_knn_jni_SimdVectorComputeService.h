@@ -52,6 +52,23 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_save
 JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_scoreSimilarityInBulkFromFp16Bytes
   (JNIEnv *, jclass, jbyteArray, jint, jintArray, jfloatArray);
 
+/*
+ * Class:     org_opensearch_knn_jni_SimdVectorComputeService
+ * Method:    rabitqCoarseDots
+ * Signature: ([B[BII[I)V
+ */
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_rabitqCoarseDots
+  (JNIEnv *, jclass, jbyteArray, jbyteArray, jint, jint, jintArray);
+
+/*
+ * Class:     org_opensearch_knn_jni_SimdVectorComputeService
+ * Method:    rabitqRefineDots
+ * Signature: ([BIII[B[I)V
+ */
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_rabitqRefineDots
+  (JNIEnv *, jclass, jbyteArray, jint, jint, jint, jbyteArray, jintArray);
+
+
 #ifdef __cplusplus
 }
 #endif

@@ -34,5 +34,10 @@ public enum LuceneVectorsFormatType {
     /**
      * Flat vector format (e.g., SQ flat via Lucene, or half-float flat).
      */
-    FLAT
+    FLAT,
+
+    /**
+     * HNSW over tiered RaBitQ records (POC, {@code index.knn.lucene.rabitq}).
+     */
+    RABITQ
 }

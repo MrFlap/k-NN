@@ -9,6 +9,7 @@
 #include "org_opensearch_knn_jni_SimdVectorComputeService.h"
 #include "jni_util.h"
 #include "simd/similarity_function/similarity_function.h"
+#include "simd/similarity_function/clusterann_rabitq.h"
 
 static knn_jni::JNIUtil JNI_UTIL;
 static constexpr jint KNN_SIMD_COMPUTE_JNI_VERSION = JNI_VERSION_1_1;
@@ -203,6 +204,88 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_save
       correctionPtr[2] = additionalCorrection;
       std::memcpy(&correctionPtr[3], &quantizedComponentSum, sizeof(int32_t));
       correctionPtr[4] = centroidDp;
+    } catch (...) {
+      JNI_UTIL.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
+// ClusterANN tiered RaBitQ: one call per cluster. All lengths are checked before any array is pinned; the kernels make
+// no JNI calls, so the critical regions hold only the arithmetic.
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_rabitqCoarseDots
+  (JNIEnv *env, jclass clazz, jbyteArray jplanes, jbyteArray jbits, const jint bitBytes, const jint n, jintArray jout) {
+    if (n <= 0) {
+      return;
+    }
+    try {
+      if (bitBytes <= 0) {
+          throw std::runtime_error("bitBytes must be positive, got " + std::to_string(bitBytes));
+      }
+      if (JNI_UTIL.GetJavaBytesArrayLength(env, jplanes) < 4LL * bitBytes) {
+          throw std::runtime_error("query planes need " + std::to_string(4LL * bitBytes) + " bytes");
+      }
+      if (JNI_UTIL.GetJavaBytesArrayLength(env, jbits) < static_cast<int64_t>(n) * bitBytes) {
+          throw std::runtime_error("bits need " + std::to_string(static_cast<int64_t>(n) * bitBytes) + " bytes");
+      }
+      if (JNI_UTIL.GetJavaIntArrayLength(env, jout) < n) {
+          throw std::runtime_error("out needs " + std::to_string(n) + " ints");
+      }
+      auto* planes = static_cast<uint8_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jplanes, nullptr));
+      if (planes == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releasePlanes {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jplanes, planes, JNI_ABORT); }};
+      auto* bits = static_cast<uint8_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jbits, nullptr));
+      if (bits == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releaseBits {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jbits, bits, JNI_ABORT); }};
+      auto* out = static_cast<int32_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jout, nullptr));
+      if (out == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releaseOut {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jout, out, 0); }};
+      knn_jni::simd::clusterann::rabitqCoarseDots(planes, bits, bitBytes, n, out);
+    } catch (...) {
+      JNI_UTIL.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_SimdVectorComputeService_rabitqRefineDots
+  (JNIEnv *env, jclass clazz, jbyteArray jrecs, const jint stride, const jint m, const jint dim, jbyteArray jq,
+   jintArray jout) {
+    if (m <= 0) {
+      return;
+    }
+    try {
+      if (dim <= 0 || stride < dim) {
+          throw std::runtime_error("need 0 < dim <= stride, got dim=" + std::to_string(dim)
+                                   + " stride=" + std::to_string(stride));
+      }
+      if (JNI_UTIL.GetJavaBytesArrayLength(env, jrecs) < static_cast<int64_t>(m - 1) * stride + dim) {
+          throw std::runtime_error("records too short for " + std::to_string(m) + " rows");
+      }
+      if (JNI_UTIL.GetJavaBytesArrayLength(env, jq) < dim) {
+          throw std::runtime_error("query needs " + std::to_string(dim) + " bytes");
+      }
+      if (JNI_UTIL.GetJavaIntArrayLength(env, jout) < m) {
+          throw std::runtime_error("out needs " + std::to_string(m) + " ints");
+      }
+      auto* recs = static_cast<int8_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jrecs, nullptr));
+      if (recs == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releaseRecs {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jrecs, recs, JNI_ABORT); }};
+      auto* q = static_cast<int8_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jq, nullptr));
+      if (q == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releaseQ {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jq, q, JNI_ABORT); }};
+      auto* out = static_cast<int32_t*>(JNI_UTIL.GetPrimitiveArrayCritical(env, jout, nullptr));
+      if (out == nullptr) {
+          return;
+      }
+      knn_jni::JNIReleaseElements releaseOut {[=]{ JNI_UTIL.ReleasePrimitiveArrayCritical(env, jout, out, 0); }};
+      knn_jni::simd::clusterann::rabitqRefineDots(recs, stride, m, dim, q, out);
     } catch (...) {
       JNI_UTIL.CatchCppExceptionAndThrowJava(env);
     }

@@ -139,4 +139,18 @@ public class SimdVectorComputeService {
         int[] internalVectorIds,
         float[] scores
     );
+
+    /**
+     * Tiered RaBitQ coarse tier: {@code out[i] = sum_{j<4} 2^j * popcount(planes[j] & bits[i])}.
+     *
+     * @param planes the query's four bit planes, {@code bitBytes} each
+     * @param bits {@code n} rows of {@code bitBytes}
+     */
+    public static native void rabitqCoarseDots(byte[] planes, byte[] bits, int bitBytes, int n, int[] out);
+
+    /**
+     * Tiered RaBitQ refine tier: {@code out[i] = sum_d recs[i * stride + d] * q[d]}, codes in
+     * {@code [0, 127]}, {@code q} in {@code [-127, 127]}.
+     */
+    public static native void rabitqRefineDots(byte[] recs, int stride, int m, int dim, byte[] q, int[] out);
 }

@@ -12,6 +12,7 @@ import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.opensearch.common.Nullable;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.codec.KnnVectorsFormatContext;
 import org.opensearch.knn.index.codec.LuceneVectorsFormatType;
@@ -147,6 +148,11 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
             }
         }
 
+        if (vectorDataType == VectorDataType.FLOAT && methodContext.getSpaceType() != SpaceType.HAMMING && isRaBitQEnabled()) {
+            log.debug("Initialize KNN vector format for field [{}] with tiered RaBitQ", field);
+            return LuceneVectorsFormatType.RABITQ;
+        }
+
         log.debug(
             "Initialize KNN vector format for field [{}] with params [{}] = \"{}\" and [{}] = \"{}\"",
             field,
@@ -156,5 +162,12 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
             defaultBeamWidth
         );
         return LuceneVectorsFormatType.HNSW;
+    }
+
+    private boolean isRaBitQEnabled() {
+        if (mapperService == null || mapperService.getIndexSettings() == null || mapperService.getIndexSettings().getSettings() == null) {
+            return false;
+        }
+        return KNNSettings.KNN_LUCENE_RABITQ_SETTING.get(mapperService.getIndexSettings().getSettings());
     }
 }

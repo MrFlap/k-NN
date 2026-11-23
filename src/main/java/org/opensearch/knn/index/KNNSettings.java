@@ -108,6 +108,8 @@ public class KNNSettings {
     public static final String KNN_FAISS_AVX512_SPR_DISABLED = "knn.faiss.avx512_spr.disabled";
     public static final String KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED = "index.knn.disk.vector.shard_level_rescoring_disabled";
     public static final String KNN_DERIVED_SOURCE_ENABLED = "index.knn.derived_source.enabled";
+    /** POC: Lucene-engine float HNSW fields without an encoder use tiered RaBitQ (1-bit traversal, 7-bit rescore). */
+    public static final String KNN_LUCENE_RABITQ = "index.knn.lucene.rabitq";
     // Remote index build index settings
     public static final String KNN_INDEX_REMOTE_VECTOR_BUILD = "index.knn.remote_index_build.enabled";
     public static final String KNN_INDEX_REMOTE_VECTOR_BUILD_SIZE_MIN = "index.knn.remote_index_build.size.min";
@@ -289,6 +291,8 @@ public class KNNSettings {
         Final,
         UnmodifiableOnRestore
     );
+
+    public static final Setting<Boolean> KNN_LUCENE_RABITQ_SETTING = Setting.boolSetting(KNN_LUCENE_RABITQ, false, IndexScope, Final);
 
     public static final Setting<Boolean> KNN_DERIVED_SOURCE_ENABLED_SETTING = new Setting<>(
         KNN_DERIVED_SOURCE_ENABLED,
@@ -778,6 +782,7 @@ public class KNNSettings {
             QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING,
             KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING,
             KNN_DERIVED_SOURCE_ENABLED_SETTING,
+            KNN_LUCENE_RABITQ_SETTING,
             MEMORY_OPTIMIZED_KNN_SEARCH_MODE_SETTING,
             // Index level remote vector build settings
             KNN_INDEX_REMOTE_VECTOR_BUILD_SETTING,

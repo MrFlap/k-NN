@@ -20,3 +20,4 @@ org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswScalarQuantizedVectorsFor
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswHalfFloatScalarQuantizedVectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HalfFloatFlatVectorsFormat
 org.opensearch.knn.index.codec.KNN1040Codec.KNN1040HnswHalfFloatVectorsFormat
+org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040HnswRaBitQVectorsFormat

@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
+import org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040HnswRaBitQVectorsFormat;
 import org.apache.lucene.backward_codecs.lucene99.Lucene99RWHnswScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
@@ -158,6 +159,21 @@ public class KNN1040PerFieldKnnVectorsFormat extends KNN1040BasePerFieldKnnVecto
                 return new KNN1040HalfFloatFlatVectorsFormat();
             }
             return new KNN1040ScalarQuantizedVectorsFormat(resolveFlatScalarEncoding(ctx.getCompressionLevel(), VectorDataType.FLOAT));
+        }, LuceneVectorsFormatType.RABITQ, ctx -> {
+            final KNNVectorsFormatParams p = new KNNVectorsFormatParams(
+                ctx.getParams(),
+                ctx.getDefaultMaxConnections(),
+                ctx.getDefaultBeamWidth(),
+                ctx.getMethodContext().getSpaceType()
+            );
+            final Tuple<Integer, ExecutorService> merge = getMergeThreadCountAndExecutorService();
+            return new KNN1040HnswRaBitQVectorsFormat(
+                p.getMaxConnections(),
+                p.getBeamWidth(),
+                merge.v1(),
+                merge.v2(),
+                toTinySegmentsThreshold(ctx.getApproximateThreshold())
+            );
         });
     }
 
