@@ -139,12 +139,19 @@ public final class KNN1040RaBitQFlatVectorsWriter extends FlatVectorsWriter {
         final int dimension = fieldInfo.getVectorDimension();
         final boolean cosine = fieldInfo.getVectorSimilarityFunction() == VectorSimilarityFunction.COSINE;
         final float[] scratch = new float[dimension];
+        final float[] rotated = new float[dimension];
+        // As the ClusterANN data-blind int8 (tiered RaBitQ) backend: Hadamard-rotate every vector, for every metric.
+        final HadamardRotation rotation = HadamardRotation.create(dimension, HadamardRotation.DEFAULT_SEED);
+        final java.util.function.Function<float[], float[]> prepare = x -> {
+            rotation.rotate(cosine ? normalized(x, scratch) : x, rotated);
+            return rotated;
+        };
 
-        // Pass 1: the segment centroid, the one "cluster" every vector's residual is taken against.
+        // Pass 1: the segment centroid (in the rotated space), the one "cluster" every residual is taken against.
         final double[] sum = new double[dimension];
         final int[] count = { 0 };
         vectors.forEach(x -> {
-            final float[] v = cosine ? normalized(x, scratch) : x;
+            final float[] v = prepare.apply(x);
             for (int d = 0; d < dimension; d++) {
                 sum[d] += v[d];
             }
@@ -161,11 +168,12 @@ public final class KNN1040RaBitQFlatVectorsWriter extends FlatVectorsWriter {
         final long coarseOffset = coarse.getFilePointer();
         final long refineOffset = refine.getFilePointer();
         final TieredRaBitQRecords.Encoder encoder = new TieredRaBitQRecords.Encoder(centroid);
-        vectors.forEach(x -> encoder.write(cosine ? normalized(x, scratch) : x, coarse, refine));
+        vectors.forEach(x -> encoder.write(prepare.apply(x), coarse, refine));
 
         meta.writeInt(fieldInfo.number);
         meta.writeVInt(dimension);
         meta.writeInt(count[0]);
+        meta.writeLong(rotation.seed());
         for (float c : centroid) {
             meta.writeInt(Float.floatToIntBits(c));
         }

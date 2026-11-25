@@ -42,6 +42,7 @@ import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFl
 import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFlatVectorsFormat.REFINE_CODEC_NAME;
 import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFlatVectorsFormat.REFINE_EXTENSION;
 import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFlatVectorsFormat.VERSION_CURRENT;
+import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFlatVectorsFormat.VERSION_ROTATION;
 import static org.opensearch.knn.index.codec.KNN1040Codec.rabitq.KNN1040RaBitQFlatVectorsFormat.VERSION_START;
 
 /**
@@ -61,8 +62,8 @@ public final class KNN1040RaBitQFlatVectorsReader extends FlatVectorsReader {
     private final IndexInput refine;
     private final Map<String, Entry> fields = new HashMap<>();
 
-    private record Entry(int dimension, int size, VectorSimilarityFunction similarity, float[] centroid, long coarseOffset,
-        long coarseLength, long refineOffset, long refineLength) {
+    private record Entry(int dimension, int size, VectorSimilarityFunction similarity, HadamardRotation rotation, float[] centroid,
+        long coarseOffset, long coarseLength, long refineOffset, long refineLength) {
     }
 
     KNN1040RaBitQFlatVectorsReader(SegmentReadState state, FlatVectorsReader raw) throws IOException {
@@ -89,7 +90,7 @@ public final class KNN1040RaBitQFlatVectorsReader extends FlatVectorsReader {
         try (ChecksumIndexInput meta = state.directory.openChecksumInput(name)) {
             Throwable priorE = null;
             try {
-                CodecUtil.checkIndexHeader(
+                final int version = CodecUtil.checkIndexHeader(
                     meta,
                     META_CODEC_NAME,
                     VERSION_START,
@@ -104,6 +105,9 @@ public final class KNN1040RaBitQFlatVectorsReader extends FlatVectorsReader {
                     }
                     final int dimension = meta.readVInt();
                     final int size = meta.readInt();
+                    final HadamardRotation rotation = version >= VERSION_ROTATION
+                        ? HadamardRotation.create(dimension, meta.readLong())
+                        : null;
                     final float[] centroid = new float[dimension];
                     for (int d = 0; d < dimension; d++) {
                         centroid[d] = Float.intBitsToFloat(meta.readInt());
@@ -114,6 +118,7 @@ public final class KNN1040RaBitQFlatVectorsReader extends FlatVectorsReader {
                             dimension,
                             size,
                             info.getVectorSimilarityFunction(),
+                            rotation,
                             centroid,
                             meta.readVLong(),
                             meta.readVLong(),
@@ -147,9 +152,14 @@ public final class KNN1040RaBitQFlatVectorsReader extends FlatVectorsReader {
     }
 
     private TieredRaBitQQuery query(Entry entry, float[] target) {
-        final float[] q = entry.similarity() == VectorSimilarityFunction.COSINE
+        float[] q = entry.similarity() == VectorSimilarityFunction.COSINE
             ? KNN1040RaBitQFlatVectorsWriter.normalized(target, new float[target.length])
             : target;
+        if (entry.rotation() != null) {
+            final float[] rotated = new float[q.length];
+            entry.rotation().rotate(q, rotated);
+            q = rotated;
+        }
         return new TieredRaBitQQuery(q, entry.centroid(), entry.similarity());
     }
 

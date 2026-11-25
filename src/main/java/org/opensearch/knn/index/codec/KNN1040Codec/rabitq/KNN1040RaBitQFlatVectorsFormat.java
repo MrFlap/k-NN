@@ -33,7 +33,9 @@ public class KNN1040RaBitQFlatVectorsFormat extends FlatVectorsFormat {
     static final String COARSE_EXTENSION = "rbqc";
     static final String REFINE_EXTENSION = "rbqr";
     static final int VERSION_START = 0;
-    static final int VERSION_CURRENT = VERSION_START;
+    /** Adds the Hadamard rotation seed per field; version 0 fields are unrotated. */
+    static final int VERSION_ROTATION = 1;
+    static final int VERSION_CURRENT = VERSION_ROTATION;
 
     private static final FlatVectorsScorer RAW_SCORER = FlatVectorScorerUtil.getLucene99FlatVectorsScorer();
     private static final FlatVectorsFormat RAW_FORMAT = new Lucene99FlatVectorsFormat(RAW_SCORER);
